@@ -1,0 +1,1279 @@
+/**
+ * The Vale — pixel rasteriser and sprite factories.
+ *
+ * Every routine here paints into a *world-resolution* buffer where one unit is
+ * one art pixel. The camera blits that buffer to the screen at an integer
+ * magnification with `imageSmoothingEnabled = false`, so nothing below may use
+ * `arc`, `stroke` or a gradient: filled shapes go through `poly()`, a scanline
+ * rasteriser that snaps every span to whole pixels, which is what keeps the 2:1
+ * isometric edges as hard stair-steps instead of a grey fringe.
+ *
+ * Static art is baked once into small offscreen canvases ("sprites") and, for
+ * the countryside, pooled — a hundred oaks share six canvases.
+ *
+ * This module is the only one in the design that touches the DOM. World *data*
+ * lives in `worldstate.ts` and is deliberately renderer-free.
+ */
+
+export type Ctx = CanvasRenderingContext2D;
+export type Pt = [number, number];
+
+/** Isometric tile footprint, in art pixels. The 2:1 ratio gives clean slopes. */
+export const TW = 32;
+export const TH = 16;
+/** Height of one building storey, in art pixels. */
+export const STORY = 12;
+
+export interface Sprite {
+  c: HTMLCanvasElement;
+  /** Anchor offset: the sprite's ground-centre sits at (ox, oy) inside it. */
+  ox: number;
+  oy: number;
+}
+
+/* ------------------------------- palette ------------------------------- */
+
+export const PAL = {
+  /* land — one base tint per biome; the renderer blends between them */
+  biome: {
+    meadow: '#8ed09f',
+    forest: '#5fa47e',
+    farm: '#a9cf86',
+    wetland: '#7cc9ab',
+    moor: '#a7b98f',
+  } as Record<string, string>,
+  grassEdge: '#66ab7d',
+  moss: '#5fa87c',
+
+  dirt: '#d6ac7d',
+  dirtAlt: '#cda172',
+  dirtPale: '#e0b98c',
+  dirtEdge: '#b98b5f',
+
+  till: '#c9a274',
+  tillDark: '#b1885c',
+
+  water: '#6fb8d6',
+  waterDeep: '#4d99bb',
+  waterLight: '#95d3e6',
+  waterFoam: '#cdeef7',
+  sand: '#e2cda0',
+
+  /* structures */
+  wall: '#fdf3e2',
+  wallShade: '#e6d3b7',
+  wallDark: '#cdb694',
+  stone: '#cec7ba',
+  stoneDark: '#a49d90',
+  stoneLight: '#e2ddd2',
+  wood: '#b3855b',
+  woodDark: '#8a6340',
+  woodLight: '#d8b688',
+  thatch: '#d9b263',
+
+  glass: '#a5dcef',
+  glassDark: '#7fc2da',
+  glassLit: '#ffd98a',
+  forge: '#ff9a4d',
+
+  ink: '#413a55',
+  shadow: 'rgba(65, 58, 85, 0.18)',
+  shadowSoft: 'rgba(65, 58, 85, 0.10)',
+
+  leaf: ['#57bd97', '#48ac86', '#6fcfa8', '#3f9d79'],
+  leafDark: '#3a8f6f',
+  leafAut: ['#e0a35a', '#d98b4c', '#c9743f'],
+  blossom: '#f2a8c0',
+
+  flower: ['#ef7f93', '#f0c75e', '#ffffff', '#9b8fe8', '#6cc4d9'],
+  crop: ['#5fc4a1', '#8fcf6a', '#d9c05e'],
+
+  chalk: '#f4efe2',
+} as const;
+
+/* ------------------------------ utilities ------------------------------ */
+
+/** Deterministic PRNG — the vale must look identical on every load. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a += 0x6d2b79f5;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Lighten (amt > 0) or darken (amt < 0) a hex colour. */
+export function shade(hex: string, amt: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255;
+  let g = (n >> 8) & 255;
+  let b = n & 255;
+  if (amt >= 0) {
+    r += (255 - r) * amt;
+    g += (255 - g) * amt;
+    b += (255 - b) * amt;
+  } else {
+    const k = 1 + amt;
+    r *= k;
+    g *= k;
+    b *= k;
+  }
+  const v = (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(b);
+  return `#${(v | 0x1000000).toString(16).slice(1)}`;
+}
+
+export function mix(a: string, b: string, t: number): string {
+  const pa = parseInt(a.slice(1), 16);
+  const pb = parseInt(b.slice(1), 16);
+  const ch = (sh: number) => Math.round((((pa >> sh) & 255) * (1 - t) + ((pb >> sh) & 255) * t));
+  const v = (ch(16) << 16) | (ch(8) << 8) | ch(0);
+  return `#${(v | 0x1000000).toString(16).slice(1)}`;
+}
+
+export function rect(ctx: Ctx, x: number, y: number, w: number, h: number, color: string): void {
+  if (w <= 0 || h <= 0) return;
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+}
+
+/** Scanline polygon fill with whole-pixel spans — the workhorse. */
+export function poly(ctx: Ctx, pts: Pt[], color: string): void {
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  if (!isFinite(minY)) return;
+  ctx.fillStyle = color;
+  const xs: number[] = [];
+  const y0 = Math.floor(minY);
+  const y1 = Math.ceil(maxY);
+  for (let y = y0; y < y1; y++) {
+    const sy = y + 0.5;
+    xs.length = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+      if ((a[1] <= sy && b[1] > sy) || (b[1] <= sy && a[1] > sy)) {
+        xs.push(a[0] + ((sy - a[1]) / (b[1] - a[1])) * (b[0] - a[0]));
+      }
+    }
+    if (xs.length < 2) continue;
+    xs.sort((p, q) => p - q);
+    for (let i = 0; i + 1 < xs.length; i += 2) {
+      const xa = Math.round(xs[i]);
+      const xb = Math.round(xs[i + 1]);
+      if (xb > xa) ctx.fillRect(xa, y, xb - xa, 1);
+    }
+  }
+}
+
+/** An isometric ground tile centred on (cx, cy). Hand-unrolled for speed. */
+export function isoTile(ctx: Ctx, cx: number, cy: number, color: string): void {
+  ctx.fillStyle = color;
+  const left = cx - 16;
+  const top = cy - 8;
+  for (let i = 0; i < 16; i++) {
+    const w = i < 8 ? 4 * (i + 1) : 4 * (16 - i);
+    ctx.fillRect(left + (32 - w) / 2, top + i, w, 1);
+  }
+}
+
+/** Corner points of a diamond of on-screen width `w`, centred at (cx, cy). */
+export function diamond(cx: number, cy: number, w: number): Pt[] {
+  const h = w / 2;
+  return [
+    [cx, cy - h / 2],
+    [cx + w / 2, cy],
+    [cx, cy + h / 2],
+    [cx - w / 2, cy],
+  ];
+}
+
+export function makeSprite(
+  w: number,
+  h: number,
+  ox: number,
+  oy: number,
+  draw: (ctx: Ctx) => void
+): Sprite {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w));
+  c.height = Math.max(1, Math.ceil(h));
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  const rx = Math.round(ox);
+  const ry = Math.round(oy);
+  ctx.translate(rx, ry);
+  draw(ctx);
+  return { c, ox: rx, oy: ry };
+}
+
+/** Rounded pixel blob: `widths` are per-row widths, top row first. */
+function blob(ctx: Ctx, cx: number, cy: number, widths: number[], color: string): void {
+  ctx.fillStyle = color;
+  for (let i = 0; i < widths.length; i++) {
+    const w = widths[i];
+    if (w <= 0) continue;
+    ctx.fillRect(Math.round(cx - w / 2), Math.round(cy + i), Math.round(w), 1);
+  }
+}
+
+/* ------------------------------ structures ------------------------------ */
+
+export type RoofStyle = 'hip' | 'gable' | 'flat' | 'thatch';
+
+export type StructureRole =
+  | 'cottage'
+  | 'house'
+  | 'hall'
+  | 'barn'
+  | 'workshop'
+  | 'store'
+  | 'chapel'
+  | 'tower'
+  | 'mill'
+  | 'granary'
+  | 'smithy'
+  | 'shed'
+  | 'homestead';
+
+export interface StructureSpec {
+  role: StructureRole;
+  accent: string;
+  /** Footprint width on screen, in art pixels. Rounded to a multiple of 4. */
+  w: number;
+  floors: number;
+  roof: RoofStyle;
+  /** 0 → surveyed plot, 1 → finished. Everything between is a build stage. */
+  progress: number;
+  /** 0 → derelict, 1 → freshly painted. Weathers the roof and walls. */
+  condition: number;
+  chimney?: boolean;
+  cupola?: boolean;
+  antenna?: boolean;
+  awning?: boolean;
+  banner?: boolean;
+  lit?: boolean;
+  seed: number;
+}
+
+export interface StructureSprite extends Sprite {
+  /** Chimney mouth, relative to the ground-centre anchor. */
+  smoke: Pt | null;
+  /** Watermill wheel hub, relative to the ground-centre anchor. */
+  wheel: Pt | null;
+}
+
+/* Face parameterisation: t runs corner→corner, hh is height above ground. */
+function leftPt(W: number, t: number, hh: number): Pt {
+  return [-W / 2 + (t * W) / 2, (t * W) / 4 - hh];
+}
+function rightPt(W: number, t: number, hh: number): Pt {
+  return [(t * W) / 2, W / 4 - (t * W) / 4 - hh];
+}
+function qL(W: number, t0: number, t1: number, h0: number, h1: number): Pt[] {
+  return [leftPt(W, t0, h1), leftPt(W, t1, h1), leftPt(W, t1, h0), leftPt(W, t0, h0)];
+}
+function qR(W: number, t0: number, t1: number, h0: number, h1: number): Pt[] {
+  return [rightPt(W, t0, h1), rightPt(W, t1, h1), rightPt(W, t1, h0), rightPt(W, t0, h0)];
+}
+
+function drawWindow(ctx: Ctx, W: number, side: 'l' | 'r', tc: number, hc: number, lit: boolean): void {
+  const q = side === 'l' ? qL : qR;
+  const dt = 6 / W;
+  poly(ctx, q(W, tc - dt, tc + dt, hc - 3.5, hc + 3.5), PAL.woodDark);
+  const inner = q(W, tc - dt * 0.68, tc + dt * 0.68, hc - 2.6, hc + 2.6);
+  poly(ctx, inner, lit ? PAL.glassLit : side === 'l' ? PAL.glass : PAL.glassDark);
+  const glint = q(W, tc - dt * 0.68, tc - dt * 0.08, hc + 0.5, hc + 2.6);
+  poly(ctx, glint, lit ? shade(PAL.glassLit, 0.35) : shade(PAL.glass, 0.4));
+}
+
+/** Stacked-box scaffolding drawn against the front-left face. */
+function drawScaffold(ctx: Ctx, W: number, h: number): void {
+  const lifts = Math.max(2, Math.round(h / 11));
+  for (let i = 1; i <= lifts; i++) {
+    const hh = (h / lifts) * i;
+    // Each lift is a plank with its own shadow line: against a cream wall a
+    // single pale band all but disappears.
+    poly(ctx, qL(W, 0.05, 0.95, hh - 2.1, hh - 1.3), PAL.woodDark);
+    poly(ctx, qL(W, 0.05, 0.95, hh - 1.3, hh + 1.3), PAL.woodLight);
+  }
+  for (const t of [0.08, 0.5, 0.92]) {
+    poly(ctx, qL(W, t - 1.2 / W, t + 1.2 / W, 0, h + 3), PAL.wood);
+  }
+  const a = leftPt(W, 0.1, 1);
+  const b = leftPt(W, 0.9, h);
+  poly(ctx, [a, [a[0] + 1.5, a[1] + 1], [b[0] + 1.5, b[1] + 1], b], PAL.woodDark);
+}
+
+/** Roof geometry shared by the finished and half-built passes. */
+function drawRoof(
+  ctx: Ctx,
+  W: number,
+  wallH: number,
+  style: RoofStyle,
+  accent: string,
+  condition: number
+): number {
+  const eave = 4;
+  const RW = W + eave * 2;
+  const ry = -wallH;
+  const base = style === 'thatch' ? PAL.thatch : accent;
+  const col = mix(base, '#8d9a86', (1 - condition) * 0.45);
+  const dark = shade(col, -0.3);
+  const mid = shade(col, -0.14);
+  const light = shade(col, 0.22);
+  const roofH = style === 'flat' ? 5 : Math.round(W * (style === 'thatch' ? 0.34 : 0.3));
+
+  if (style === 'flat') {
+    poly(ctx, qL(W, 0, 1, wallH, wallH + 5), mid);
+    poly(ctx, qR(W, 0, 1, wallH, wallH + 5), dark);
+    poly(ctx, diamond(0, ry - 5, W), light);
+    poly(ctx, diamond(0, ry - 3, W - 12), '#8e8aa0');
+    const tk = -W / 6;
+    rect(ctx, tk - 3, ry - 16, 7, 8, PAL.stone);
+    rect(ctx, tk - 3, ry - 17, 7, 2, PAL.stoneDark);
+    rect(ctx, W / 6, ry - 12, 5, 5, shade(PAL.stone, -0.2));
+    return roofH;
+  }
+
+  const N: Pt = [0, ry - RW / 4];
+  const E: Pt = [RW / 2, ry];
+  const S: Pt = [0, ry + RW / 4];
+  const Wc: Pt = [-RW / 2, ry];
+
+  if (style === 'hip') {
+    const apex: Pt = [0, ry - roofH];
+    poly(ctx, [N, Wc, apex], shade(col, -0.42));
+    poly(ctx, [N, E, apex], shade(col, -0.36));
+    poly(ctx, [Wc, S, apex], col);
+    poly(ctx, [S, E, apex], dark);
+    poly(ctx, [Wc, S, [S[0], S[1] + 2.4], [Wc[0], Wc[1] + 2.4]], shade(col, -0.5));
+    poly(ctx, [S, E, [E[0], E[1] + 2.4], [S[0], S[1] + 2.4]], shade(col, -0.55));
+    poly(ctx, [
+      [Wc[0] * 0.5, (Wc[1] + apex[1]) / 2],
+      apex,
+      [apex[0], apex[1] + 2],
+      [Wc[0] * 0.5 + 1, (Wc[1] + apex[1]) / 2 + 2],
+    ], light);
+    return roofH;
+  }
+
+  // gable / thatch share a ridge
+  const R1: Pt = [-RW / 4, ry - RW / 8 - roofH];
+  const R2: Pt = [RW / 4, ry + RW / 8 - roofH];
+  poly(ctx, [N, Wc, R1], shade(col, -0.45));
+  poly(ctx, [N, E, R2, R1], shade(col, -0.38));
+  poly(ctx, [E, S, R2], mid);
+  poly(ctx, [Wc, S, R2, R1], col);
+  poly(ctx, [Wc, S, [S[0], S[1] + 2.4], [Wc[0], Wc[1] + 2.4]], shade(col, -0.5));
+  poly(ctx, [R1, R2, [R2[0], R2[1] + 2], [R1[0], R1[1] + 2]], light);
+  if (style === 'thatch') {
+    // straw courses: horizontal bands stepping down the near slope
+    for (let k = 1; k <= 3; k++) {
+      const f = k / 4;
+      const a: Pt = [Wc[0] + (R1[0] - Wc[0]) * f, Wc[1] + (R1[1] - Wc[1]) * f];
+      const b: Pt = [S[0] + (R2[0] - S[0]) * f, S[1] + (R2[1] - S[1]) * f];
+      poly(ctx, [a, b, [b[0], b[1] + 1], [a[0], a[1] + 1]], shade(col, -0.16));
+    }
+  } else {
+    rect(ctx, RW / 4 - 1, ry - roofH + 2, 2, 4, shade(col, -0.55));
+  }
+  return roofH;
+}
+
+/**
+ * A building that exists only on paper: a scraped plot, a dashed chalk outline,
+ * a dug footing trench and four ribboned survey stakes. This has to read at a
+ * glance — it is the whole point of the frontier.
+ */
+function drawPlot(ctx: Ctx, W: number, accent: string, seed: number): void {
+  const rng = mulberry32(seed);
+  const RW = W + 6;
+  const corners: Pt[] = [
+    [0, -RW / 4],
+    [RW / 2, 0],
+    [0, RW / 4],
+    [-RW / 2, 0],
+  ];
+  // scraped ground
+  poly(ctx, diamond(0, 1, RW + 6), shade(PAL.till, -0.06));
+  poly(ctx, diamond(0, 0, RW), shade(PAL.till, 0.1));
+  // footing trench, one course of stone already laid on two sides
+  for (let i = 0; i < 4; i++) {
+    const a = corners[i];
+    const b = corners[(i + 1) % 4];
+    poly(ctx, [a, b, [b[0], b[1] + 2.4], [a[0], a[1] + 2.4]], i < 2 ? PAL.tillDark : PAL.stone);
+  }
+  // dashed chalk line just outside the trench
+  for (let i = 0; i < 4; i++) {
+    const a = corners[i];
+    const b = corners[(i + 1) % 4];
+    const steps = Math.max(5, Math.round(Math.hypot(b[0] - a[0], b[1] - a[1]) / 4));
+    for (let k = 0; k < steps; k++) {
+      if (k % 2) continue;
+      const t = k / steps;
+      rect(ctx, a[0] + (b[0] - a[0]) * t - 1, a[1] + (b[1] - a[1]) * t - 3, 3, 1, PAL.chalk);
+    }
+  }
+  // survey stakes with ribbons
+  for (const c of corners) {
+    rect(ctx, c[0] - 0.5, c[1] - 14, 1, 14, PAL.woodLight);
+    rect(ctx, c[0] - 1, c[1] - 15, 2, 1, PAL.woodDark);
+    poly(ctx, [[c[0] + 0.5, c[1] - 14], [c[0] + 8, c[1] - 11.5], [c[0] + 0.5, c[1] - 9]], accent);
+  }
+  // a peg or two knocked in where the posts will go
+  for (let i = 0; i < 3; i++) {
+    const x = (rng() - 0.5) * W * 0.6;
+    const y = (rng() - 0.5) * W * 0.3;
+    rect(ctx, x, y - 4, 1, 4, PAL.wood);
+  }
+}
+
+export function buildStructure(spec: StructureSpec): StructureSprite {
+  const { role, accent, floors, roof, seed, condition } = spec;
+  const rng = mulberry32(seed);
+  const W = Math.max(16, Math.round(spec.w / 4) * 4);
+  const H = W / 2;
+  const p = spec.progress;
+  const wallH = floors * STORY;
+
+  const towerH = role === 'tower' ? Math.round(wallH * 0.5) + 16 : 0;
+  const siloH = role === 'granary' ? wallH + 12 : 0;
+  const sailR = role === 'mill' ? 22 : 0;
+
+  const padX = 12 + (sailR ? 12 : 0);
+  const padTop = 34 + towerH + siloH + sailR + (spec.cupola ? 22 : 0);
+  const padBottom = 8;
+  const spriteW = W + padX * 2;
+  const spriteH = padTop + Math.round(W * 0.4) + wallH + H + padBottom + 20;
+
+  let smoke: Pt | null = null;
+  let wheel: Pt | null = null;
+
+  const sp = makeSprite(spriteW, spriteH, padX + W / 2, spriteH - H / 2 - padBottom, (ctx) => {
+    /* ---- surveyed plot only ---------------------------------------- */
+    if (p < 0.12) {
+      drawPlot(ctx, W, accent, seed);
+      return;
+    }
+
+    poly(ctx, diamond(3, 2, W + 6), PAL.shadow);
+
+    /* ---- foundations ------------------------------------------------ */
+    const footH = 3;
+    poly(ctx, qL(W, 0, 1, 0, footH), PAL.stone);
+    poly(ctx, qR(W, 0, 1, 0, footH), PAL.stoneDark);
+
+    if (p < 0.45) {
+      // Bare timber frame on a finished footing: posts already stand near their
+      // full height, because a frame that only reaches ankle height reads as
+      // nothing at all from the road.
+      const frameH = Math.round(wallH * (0.62 + ((p - 0.12) / 0.33) * 0.58));
+      for (const t of [0.02, 0.34, 0.66, 0.98]) {
+        poly(ctx, qL(W, t - 1.6 / W, t + 1.6 / W, footH, frameH), PAL.wood);
+        poly(ctx, qR(W, t - 1.6 / W, t + 1.6 / W, footH, frameH), PAL.woodDark);
+      }
+      poly(ctx, qL(W, 0, 1, frameH - 2.4, frameH), PAL.woodLight);
+      poly(ctx, qR(W, 0, 1, frameH - 2.4, frameH), PAL.wood);
+      const a = leftPt(W, 0.04, footH);
+      const b = leftPt(W, 0.5, frameH - 2);
+      poly(ctx, [a, [a[0] + 1.6, a[1] + 1], [b[0] + 1.6, b[1] + 1], b], PAL.woodDark);
+      // stake + accent ribbon so the plot still carries the project colour
+      rect(ctx, -W / 2 + 1, -frameH - 8, 1, 9, PAL.woodLight);
+      poly(ctx, [
+        [-W / 2 + 2, -frameH - 8],
+        [-W / 2 + 12, -frameH - 5.5],
+        [-W / 2 + 2, -frameH - 2],
+      ], accent);
+      return;
+    }
+
+    /* ---- walls ------------------------------------------------------ */
+    const woody = role === 'barn' || role === 'shed' || role === 'granary';
+    const baseL = woody ? PAL.woodLight : PAL.wall;
+    const baseR = woody ? PAL.wood : PAL.wallShade;
+    const wl = mix(baseL, '#b9b2a4', (1 - condition) * 0.4);
+    const wr = mix(baseR, '#a49d90', (1 - condition) * 0.4);
+    const built = p >= 0.62 ? wallH : Math.round(wallH * (0.52 + (p - 0.45) * 2.82));
+    poly(ctx, qL(W, 0, 1, footH, built), wl);
+    poly(ctx, qR(W, 0, 1, footH, built), wr);
+
+    if (role === 'barn') {
+      // plank seams
+      for (let t = 0.12; t < 1; t += 0.16) {
+        poly(ctx, qL(W, t, t + 0.012, footH, built), shade(wl, -0.16));
+        poly(ctx, qR(W, t, t + 0.012, footH, built), shade(wr, -0.16));
+      }
+    }
+    for (let f = 1; f < floors; f++) {
+      const hh = f * STORY;
+      if (hh > built) break;
+      poly(ctx, qL(W, 0, 1, hh - 1, hh + 0.6), PAL.wallDark);
+      poly(ctx, qR(W, 0, 1, hh - 1, hh + 0.6), shade(PAL.wallDark, -0.12));
+    }
+    rect(ctx, 0, H / 2 - built, 1, built, shade(wl, 0.1));
+
+    const finished = p >= 0.985;
+
+    // Walls short of plate height show their studwork, and the posts carry on
+    // bare above the infill to the height the house will finish at. A part-built
+    // house then reads as a timber frame being filled in — and keeps the
+    // silhouette of the building it is going to be, instead of squatting in the
+    // field as an anonymous cream box a third of its eventual size.
+    if (p < 0.62) {
+      for (const t of [0.02, 0.34, 0.66, 0.98]) {
+        poly(ctx, qL(W, t - 1.4 / W, t + 1.4 / W, footH, built), PAL.wood);
+        poly(ctx, qR(W, t - 1.4 / W, t + 1.4 / W, footH, built), PAL.woodDark);
+      }
+      poly(ctx, qL(W, 0, 1, built * 0.52 - 1, built * 0.52 + 0.8), PAL.wood);
+      poly(ctx, qR(W, 0, 1, built * 0.52 - 1, built * 0.52 + 0.8), PAL.woodDark);
+      for (const t of [0.02, 0.5, 0.98]) {
+        poly(ctx, qL(W, t - 1.4 / W, t + 1.4 / W, built, wallH), PAL.wood);
+        poly(ctx, qR(W, t - 1.4 / W, t + 1.4 / W, built, wallH), PAL.woodDark);
+      }
+    }
+
+    if (p >= 0.62) {
+      /* ---- openings ------------------------------------------------- */
+      const cols = Math.max(1, Math.floor(W / 22));
+      for (let f = 0; f < floors; f++) {
+        const hc = f * STORY + STORY * 0.6;
+        for (let i = 0; i < cols; i++) {
+          const t = cols === 1 ? 0.5 : 0.18 + (0.64 * i) / (cols - 1);
+          const doorSlot = f === 0 && Math.abs(t - 0.5) < 0.16;
+          const lit = spec.lit || rng() < 0.2;
+          if (!doorSlot) drawWindow(ctx, W, 'l', t, hc, lit);
+          if (role !== 'barn' || f > 0) drawWindow(ctx, W, 'r', t, hc, spec.lit || rng() < 0.16);
+        }
+      }
+
+      /* ---- door ------------------------------------------------------ */
+      const dw = role === 'barn' ? 9 : 5;
+      const dh = role === 'barn' ? 13 : 10.5;
+      const dt = dw / W;
+      poly(ctx, qL(W, 0.5 - dt * 1.3, 0.5 + dt * 1.3, 0, dh + 1), PAL.woodDark);
+      poly(ctx, qL(W, 0.5 - dt, 0.5 + dt, 0, dh), role === 'smithy' ? PAL.forge : PAL.wood);
+      if (role !== 'smithy') {
+        poly(ctx, qL(W, 0.5 - dt, 0.5 - dt * 0.32, 0, dh), PAL.woodLight);
+        const knob = leftPt(W, 0.5 + dt * 0.5, dh * 0.5);
+        rect(ctx, knob[0], knob[1], 1, 1, PAL.glassLit);
+      }
+      poly(ctx, qL(W, 0.5 - dt * 1.6, 0.5 + dt * 1.6, -1.5, 0.4), PAL.stone);
+
+      if (spec.awning) {
+        const a0 = leftPt(W, 0.5 - dt * 2.4, 13);
+        const a1 = leftPt(W, 0.5 + dt * 2.4, 13);
+        const px = -8;
+        const py = 4;
+        const lerp = (t: number): Pt => [a0[0] + (a1[0] - a0[0]) * t, a0[1] + (a1[1] - a0[1]) * t];
+        const canopy = (t0: number, t1: number, color: string) => {
+          const q0 = lerp(t0);
+          const q1 = lerp(t1);
+          poly(ctx, [q0, q1, [q1[0] + px, q1[1] + py], [q0[0] + px, q0[1] + py]], color);
+        };
+        canopy(0, 1, accent);
+        canopy(0.28, 0.48, PAL.wall);
+        canopy(0.68, 0.88, PAL.wall);
+        const f0 = lerp(0);
+        const f1 = lerp(1);
+        poly(ctx, [
+          [f0[0] + px, f0[1] + py],
+          [f1[0] + px, f1[1] + py],
+          [f1[0] + px, f1[1] + py + 3],
+          [f0[0] + px, f0[1] + py + 3],
+        ], shade(accent, -0.32));
+      }
+    }
+
+    /* ---- roof ------------------------------------------------------- */
+    let roofH = 0;
+    if (p >= 0.62) {
+      roofH = drawRoof(ctx, W, wallH, roof, accent, condition);
+    } else {
+      // Ring beam and bare rafters, sitting on the frame at its final plate
+      // height — the roof is what is missing, not the storey.
+      poly(ctx, qL(W, 0, 1, wallH - 2.5, wallH), PAL.woodLight);
+      poly(ctx, qR(W, 0, 1, wallH - 2.5, wallH), PAL.wood);
+      for (const t of [0.06, 0.5, 0.94]) {
+        poly(ctx, qL(W, t - 1.4 / W, t + 1.4 / W, wallH, wallH + 9), PAL.wood);
+      }
+    }
+
+    /* ---- role furniture --------------------------------------------- */
+    if (role === 'tower') {
+      const tw = 15;
+      const th = wallH + towerH;
+      const tx = -W / 2 + 9;
+      const ty = -H / 4 + 2;
+      ctx.save();
+      ctx.translate(tx, ty);
+      poly(ctx, [[-tw / 2, 0], [0, tw / 4], [0, tw / 4 - th], [-tw / 2, -th]], PAL.wall);
+      poly(ctx, [[0, tw / 4], [tw / 2, 0], [tw / 2, -th], [0, tw / 4 - th]], PAL.wallShade);
+      poly(ctx, [
+        [-tw / 2 + 2, -th + 11],
+        [-2, -th + 13],
+        [-2, -th + 5],
+        [-tw / 2 + 2, -th + 3],
+      ], shade(PAL.glassLit, 0.12));
+      rect(ctx, -tw / 2 + 4, -th + 6, 1, 4, PAL.ink);
+      rect(ctx, -tw / 2 + 4, -th + 9, 3, 1, PAL.ink);
+      poly(ctx, [[-tw / 2 - 2, -th], [0, -th + tw / 4 + 1], [0, -th - 16]], shade(accent, -0.14));
+      poly(ctx, [[0, -th + tw / 4 + 1], [tw / 2 + 2, -th], [0, -th - 16]], shade(accent, -0.34));
+      rect(ctx, 0, -th - 21, 1, 6, PAL.ink);
+      poly(ctx, [[1, -th - 21], [7, -th - 19], [1, -th - 17]], accent);
+      ctx.restore();
+    }
+
+    if (role === 'granary') {
+      const sw = 14;
+      const sx = W / 2 - 10;
+      const sy = W / 4 - (W / 2 - 10) / 2;
+      ctx.save();
+      ctx.translate(sx, sy);
+      poly(ctx, [[-sw / 2, 0], [0, sw / 4], [0, sw / 4 - siloH], [-sw / 2, -siloH]], PAL.stoneLight);
+      poly(ctx, [[0, sw / 4], [sw / 2, 0], [sw / 2, -siloH], [0, sw / 4 - siloH]], PAL.stone);
+      for (let k = 6; k < siloH; k += 7) {
+        poly(ctx, [[-sw / 2, -k], [0, sw / 4 - k], [0, sw / 4 - k + 1], [-sw / 2, -k + 1]], shade(PAL.stoneLight, -0.12));
+      }
+      poly(ctx, diamond(0, -siloH + sw / 4, sw + 4), shade(accent, -0.2));
+      poly(ctx, [[-sw / 2 - 2, -siloH + sw / 4], [sw / 2 + 2, -siloH + sw / 4], [0, -siloH - 8]], accent);
+      ctx.restore();
+    }
+
+    if (role === 'mill') {
+      // Waterwheel housing on the right-hand face; the wheel itself is drawn
+      // per-frame by the renderer so it can turn.
+      const wx = W / 2 + 5;
+      const wy = -6;
+      rect(ctx, wx - 2, wy - 12, 4, 14, PAL.woodDark);
+      wheel = [wx + 5, wy - 4];
+    }
+
+    if (role === 'smithy') {
+      poly(ctx, qL(W, 0.16, 0.3, 2, 7), PAL.forge);
+      rect(ctx, -W / 4 - 3, -4, 7, 4, PAL.stoneDark);
+    }
+
+    if (spec.cupola && p >= 0.62) {
+      const cy = -wallH - roofH - 2;
+      rect(ctx, -5, cy - 9, 10, 9, PAL.wall);
+      rect(ctx, 0, cy - 9, 5, 9, PAL.wallShade);
+      rect(ctx, -3, cy - 7, 6, 5, PAL.ink);
+      poly(ctx, [[-2, cy - 3], [2, cy - 3], [1, cy - 7], [-1, cy - 7]], PAL.glassLit);
+      poly(ctx, [[-7, cy - 9], [7, cy - 9], [0, cy - 17]], accent);
+      rect(ctx, 0, cy - 21, 1, 4, PAL.ink);
+    }
+
+    if (spec.antenna && p >= 0.62) {
+      rect(ctx, W / 5, -wallH - 22, 1, 14, PAL.ink);
+      rect(ctx, W / 5 - 3, -wallH - 20, 7, 1, PAL.ink);
+      rect(ctx, W / 5 - 2, -wallH - 17, 5, 1, PAL.ink);
+      rect(ctx, W / 5, -wallH - 24, 1, 2, PAL.flower[0]);
+    }
+
+    if (spec.chimney && p >= 0.62) {
+      const cx = W / 4;
+      const cy = -wallH - roofH * 0.42;
+      rect(ctx, cx - 3, cy - 13, 6, 14, PAL.stone);
+      rect(ctx, cx, cy - 13, 3, 14, PAL.stoneDark);
+      rect(ctx, cx - 4, cy - 15, 8, 2, shade(PAL.stone, -0.25));
+      smoke = [cx, cy - 16];
+    }
+
+    /* ---- still working on it ---------------------------------------- */
+    if (!finished) {
+      drawScaffold(ctx, W, wallH + (p >= 0.62 ? roofH * 0.5 : 0) + 4);
+      // Site marker: a ribboned stake in the village's own colour, clearing the
+      // scaffold, so every plot still going up is spottable from the road — and
+      // from the fitted overview, where the scaffold itself is three pixels.
+      const mh = Math.round(wallH + (p >= 0.62 ? roofH : 12) + 17);
+      rect(ctx, -W / 2 - 1, -mh, 1, mh + 1, PAL.woodLight);
+      rect(ctx, -W / 2 - 2, -mh - 1, 3, 1, PAL.woodDark);
+      poly(ctx, [
+        [-W / 2, -mh],
+        [-W / 2 + 10, -mh + 3],
+        [-W / 2, -mh + 6],
+      ], accent);
+    }
+
+    /* ---- banner: the project's gem colour, readable from a distance --- */
+    if (spec.banner && finished) {
+      const bx = -W / 4;
+      const by = -wallH - roofH - (roof === 'flat' ? 5 : 0);
+      rect(ctx, bx, by - 19, 2, 20, PAL.ink);
+      poly(ctx, [[bx + 1, by - 20], [bx + 14, by - 16.5], [bx + 1, by - 12]], PAL.ink);
+      poly(ctx, [[bx + 2, by - 19], [bx + 12, by - 16.5], [bx + 2, by - 13.5]], accent);
+    }
+  });
+
+  return { ...sp, smoke, wheel };
+}
+
+/* ------------------------------- scenery ------------------------------- */
+
+export function buildTree(kind: 0 | 1 | 2 | 3, seed: number): Sprite {
+  const rng = mulberry32(seed);
+  if (kind === 0) {
+    const leaf = PAL.leaf[Math.floor(rng() * PAL.leaf.length)];
+    return makeSprite(30, 38, 15, 34, (ctx) => {
+      poly(ctx, diamond(1, 1, 18), PAL.shadow);
+      rect(ctx, -2, -20, 4, 20, PAL.wood);
+      rect(ctx, 0, -20, 2, 20, PAL.woodDark);
+      blob(ctx, 0, -32, [6, 10, 14, 18, 20, 22, 22, 22, 20, 18, 14, 10, 7, 4], leaf);
+      blob(ctx, -4, -31, [6, 10, 12, 12, 10, 8, 6], shade(leaf, 0.26));
+      blob(ctx, 4, -24, [8, 10, 10, 8, 5], shade(leaf, -0.2));
+    });
+  }
+  if (kind === 1) {
+    const leaf = PAL.leaf[Math.floor(rng() * PAL.leaf.length)];
+    const h = 42;
+    return makeSprite(26, h + 8, 13, h + 3, (ctx) => {
+      poly(ctx, diamond(1, 1, 16), PAL.shadow);
+      rect(ctx, -1, -8, 3, 8, PAL.woodDark);
+      for (let i = 0; i < 3; i++) {
+        const y = -8 - i * 9;
+        const w = 20 - i * 5;
+        poly(ctx, [[-w / 2, y], [w / 2, y], [0, y - 16]], i === 0 ? shade(leaf, -0.16) : leaf);
+        poly(ctx, [[0, y], [w / 2, y], [0, y - 16]], shade(leaf, -0.3));
+      }
+    });
+  }
+  if (kind === 2) {
+    return makeSprite(26, 38, 13, 34, (ctx) => {
+      poly(ctx, diamond(1, 1, 16), PAL.shadow);
+      rect(ctx, -2, -16, 3, 16, PAL.wood);
+      blob(ctx, 0, -27, [6, 12, 16, 20, 20, 20, 18, 14, 10, 6], PAL.blossom);
+      blob(ctx, -4, -26, [6, 10, 10, 8, 5], shade(PAL.blossom, 0.3));
+      blob(ctx, 4, -20, [7, 8, 6], shade(PAL.blossom, -0.16));
+    });
+  }
+  // autumn / hedgerow tree
+  const leaf = PAL.leafAut[Math.floor(rng() * PAL.leafAut.length)];
+  return makeSprite(28, 36, 14, 32, (ctx) => {
+    poly(ctx, diamond(1, 1, 17), PAL.shadow);
+    rect(ctx, -2, -18, 4, 18, PAL.woodDark);
+    blob(ctx, 0, -29, [7, 12, 16, 19, 20, 20, 18, 15, 11, 7, 4], leaf);
+    blob(ctx, -4, -28, [5, 8, 9, 7], shade(leaf, 0.28));
+  });
+}
+
+export function buildStump(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const w = 8 + Math.floor(rng() * 4);
+  return makeSprite(w + 10, 18, (w + 10) / 2, 13, (ctx) => {
+    poly(ctx, diamond(1, 1, w + 6), PAL.shadow);
+    poly(ctx, qL(w, 0, 1, 0, 5), PAL.wood);
+    poly(ctx, qR(w, 0, 1, 0, 5), PAL.woodDark);
+    poly(ctx, diamond(0, -5, w), PAL.woodLight);
+    poly(ctx, diamond(0, -5, w * 0.45), shade(PAL.woodLight, -0.18));
+    if (rng() < 0.5) rect(ctx, w / 2 - 2, -3, 3, 1, PAL.moss);
+  });
+}
+
+export function buildBush(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const leaf = PAL.leaf[Math.floor(rng() * PAL.leaf.length)];
+  return makeSprite(20, 16, 10, 13, (ctx) => {
+    poly(ctx, diamond(1, 1, 14), PAL.shadow);
+    blob(ctx, 0, -8, [7, 11, 14, 15, 15, 14, 12, 9, 5], leaf);
+    blob(ctx, -3, -7, [5, 7, 6], shade(leaf, 0.28));
+    if (rng() < 0.5) rect(ctx, 3, -5, 1, 1, PAL.flower[0]);
+  });
+}
+
+export function buildRock(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const w = 9 + Math.floor(rng() * 6);
+  return makeSprite(w + 6, 15, (w + 6) / 2, 11, (ctx) => {
+    poly(ctx, diamond(1, 1, w + 3), PAL.shadow);
+    blob(ctx, 0, -6, [w - 5, w - 2, w, w, w - 1, w - 3], PAL.stone);
+    blob(ctx, -1, -6, [w - 7, w - 6], shade(PAL.stone, 0.22));
+    if (rng() < 0.4) rect(ctx, -2, -2, 3, 1, PAL.moss);
+  });
+}
+
+export function buildFlowerPatch(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(26, 16, 13, 10, (ctx) => {
+    for (let i = 0; i < 10; i++) {
+      const a = rng() * Math.PI * 2;
+      const r = rng();
+      const x = Math.cos(a) * r * 10;
+      const y = (Math.sin(a) * r * 10) / 2;
+      rect(ctx, x, y - 2, 1, 2, PAL.leafDark);
+      rect(ctx, x, y - 3, 1, 1, PAL.flower[Math.floor(rng() * PAL.flower.length)]);
+    }
+  });
+}
+
+export function buildReeds(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(20, 20, 10, 15, (ctx) => {
+    for (let i = 0; i < 7; i++) {
+      const x = Math.round((rng() - 0.5) * 14);
+      const h = 6 + Math.round(rng() * 6);
+      rect(ctx, x, -h, 1, h, PAL.leafDark);
+      if (rng() < 0.5) rect(ctx, x, -h - 3, 1, 3, '#a97e4f');
+    }
+  });
+}
+
+/** A short run of picket fence along the screen-x axis. */
+export function buildFence(dir: 'l' | 'r'): Sprite {
+  const w = 34;
+  return makeSprite(w + 4, 32, (w + 4) / 2, 21, (ctx) => {
+    const s = dir === 'l' ? 1 : -1;
+    for (let i = 0; i <= 4; i++) {
+      const x = -w / 2 + (i * w) / 4;
+      const y = (s * x) / 2;
+      rect(ctx, x, y - 9, 2, 10, PAL.woodLight);
+      rect(ctx, x, y - 10, 2, 1, PAL.wall);
+    }
+    poly(ctx, [
+      [-w / 2, (s * -w) / 4 - 6],
+      [w / 2, (s * w) / 4 - 6],
+      [w / 2, (s * w) / 4 - 4.4],
+      [-w / 2, (s * -w) / 4 - 4.4],
+    ], PAL.wood);
+  });
+}
+
+/** A tilled 2×2-tile plot with rows of seedlings. */
+export function buildCropRow(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const crop = PAL.crop[Math.floor(rng() * PAL.crop.length)];
+  return makeSprite(76, 48, 38, 36, (ctx) => {
+    poly(ctx, diamond(0, 1, 66), PAL.tillDark);
+    poly(ctx, diamond(0, 0, 60), PAL.till);
+    poly(ctx, diamond(0, -1, 52), shade(PAL.till, 0.14));
+    for (let r = 0; r < 4; r++) {
+      const gy = -0.62 + r * 0.41;
+      for (let i = 0; i < 7; i++) {
+        const gx = -0.78 + i * 0.26;
+        const x = Math.round((gx - gy) * 16);
+        const y = Math.round((gx + gy) * 8);
+        rect(ctx, x, y - 4, 1, 4, crop);
+        rect(ctx, x - 1, y - 5, 3, 1, crop);
+        rect(ctx, x - 1, y - 3, 1, 1, shade(crop, -0.2));
+      }
+    }
+  });
+}
+
+export function buildHaystack(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const w = 20 + Math.floor(rng() * 6);
+  return makeSprite(w + 8, 30, (w + 8) / 2, 25, (ctx) => {
+    poly(ctx, diamond(1, 1, w + 4), PAL.shadow);
+    blob(ctx, 0, -17, [4, 8, 12, 15, 17, 19, w - 4, w - 2, w, w, w - 1, w - 3, w - 6, 4], '#e9c073');
+    blob(ctx, -3, -16, [3, 6, 8, 9, 8, 6], '#f4d492');
+    for (let i = 0; i < 5; i++) rect(ctx, -w / 2 + 3 + i * 4, -6 - (i % 2), 2, 1, '#c99b4e');
+    rect(ctx, 0, -21, 1, 4, PAL.woodDark);
+  });
+}
+
+export function buildShed(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const W = 20;
+  const wallH = 10;
+  const roofH = 8;
+  const accent = rng() < 0.5 ? '#c98f6a' : '#a8a2b8';
+  return makeSprite(W + 16, 42, (W + 16) / 2, 32, (ctx) => {
+    poly(ctx, diamond(2, 2, W + 6), PAL.shadow);
+    poly(ctx, qL(W, 0, 1, 0, wallH), PAL.woodLight);
+    poly(ctx, qR(W, 0, 1, 0, wallH), PAL.wood);
+    poly(ctx, qL(W, 0.36, 0.64, 0, 8), PAL.woodDark);
+    const RW = W + 6;
+    const ry = -wallH;
+    const N: Pt = [0, ry - RW / 4];
+    const E: Pt = [RW / 2, ry];
+    const S: Pt = [0, ry + RW / 4];
+    const Wc: Pt = [-RW / 2, ry];
+    const R1: Pt = [-RW / 4, ry - RW / 8 - roofH];
+    const R2: Pt = [RW / 4, ry + RW / 8 - roofH];
+    poly(ctx, [N, E, R2, R1], shade(accent, -0.32));
+    poly(ctx, [E, S, R2], shade(accent, -0.14));
+    poly(ctx, [Wc, S, R2, R1], accent);
+    poly(ctx, [Wc, S, [S[0], S[1] + 2], [Wc[0], Wc[1] + 2]], shade(accent, -0.45));
+  });
+}
+
+export function buildCart(loaded: boolean): Sprite {
+  return makeSprite(30, 28, 15, 22, (ctx) => {
+    poly(ctx, diamond(1, 1, 22), PAL.shadow);
+    poly(ctx, [[-11, -6], [0, -1], [11, -6], [11, -11], [0, -6], [-11, -11]], PAL.woodLight);
+    poly(ctx, [[-11, -11], [0, -6], [0, -1], [-11, -6]], PAL.wood);
+    rect(ctx, -8, -6, 2, 6, PAL.woodDark);
+    rect(ctx, 5, -6, 2, 6, PAL.woodDark);
+    rect(ctx, -10, -4, 5, 5, PAL.ink);
+    rect(ctx, 6, -4, 5, 5, PAL.ink);
+    if (loaded) rect(ctx, -3, -15, 8, 5, '#e9c073');
+  });
+}
+
+export function buildCrates(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(26, 26, 13, 22, (ctx) => {
+    poly(ctx, diamond(1, 1, 20), PAL.shadow);
+    const box = (x: number, y: number, s: number) => {
+      poly(ctx, [[x - s, y], [x, y + s / 2], [x, y + s / 2 - s], [x - s, y - s]], PAL.woodLight);
+      poly(ctx, [[x, y + s / 2], [x + s, y], [x + s, y - s], [x, y + s / 2 - s]], PAL.wood);
+      poly(ctx, diamond(x, y - s, s * 2), shade(PAL.woodLight, 0.16));
+    };
+    box(-4, 0, 7);
+    box(6, -2, 6);
+    if (rng() < 0.6) box(-3, -14, 5);
+  });
+}
+
+export function buildLumber(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(28, 27, 14, 22, (ctx) => {
+    poly(ctx, diamond(1, 1, 24), PAL.shadow);
+    for (let i = 0; i < 4; i++) {
+      const y = -3 - i * 3;
+      const x = -9 + i * 1.5;
+      poly(ctx, [[x, y], [x + 17, y - 8], [x + 17, y - 5], [x, y + 3]], i % 2 ? PAL.woodLight : PAL.wood);
+      poly(ctx, [[x, y], [x, y + 3], [x + 2, y + 4], [x + 2, y + 1]], PAL.woodDark);
+    }
+    if (rng() < 0.5) {
+      rect(ctx, 8, -6, 5, 6, PAL.stoneDark);
+      rect(ctx, 8, -7, 5, 1, PAL.stone);
+    }
+  });
+}
+
+export function buildWell(): Sprite {
+  return makeSprite(30, 40, 15, 33, (ctx) => {
+    poly(ctx, diamond(1, 1, 24), PAL.shadow);
+    poly(ctx, diamond(0, 0, 22), PAL.stoneDark);
+    poly(ctx, [[-11, 0], [0, 5.5], [0, -1.5], [-11, -7]], PAL.stone);
+    poly(ctx, [[0, 5.5], [11, 0], [11, -7], [0, -1.5]], shade(PAL.stone, -0.14));
+    poly(ctx, diamond(0, -7, 22), '#5f7f96');
+    poly(ctx, diamond(0, -7, 14), '#7fb6cd');
+    rect(ctx, -8, -22, 2, 15, PAL.wood);
+    rect(ctx, 6, -22, 2, 15, PAL.wood);
+    poly(ctx, [[-11, -22], [0, -30], [11, -22], [11, -20], [0, -28], [-11, -20]], PAL.leafDark);
+    rect(ctx, -1, -21, 1, 6, PAL.woodDark);
+    rect(ctx, -3, -15, 5, 4, PAL.wood);
+  });
+}
+
+export function buildLamp(): Sprite {
+  return makeSprite(16, 42, 8, 37, (ctx) => {
+    poly(ctx, diamond(1, 1, 12), PAL.shadow);
+    poly(ctx, diamond(0, 0, 10), PAL.stoneDark);
+    rect(ctx, -1, -26, 2, 26, PAL.ink);
+    rect(ctx, -3, -32, 6, 6, shade(PAL.glassLit, -0.05));
+    rect(ctx, -4, -33, 8, 1, PAL.ink);
+    rect(ctx, -4, -26, 8, 1, PAL.ink);
+    rect(ctx, -1, -35, 1, 2, PAL.ink);
+  });
+}
+
+/** Road-side finger post. The lettering is HTML; this is just the timber. */
+export function buildSignpost(accent: string): Sprite {
+  return makeSprite(26, 32, 13, 27, (ctx) => {
+    poly(ctx, diamond(1, 1, 14), PAL.shadow);
+    rect(ctx, -1, -23, 2, 23, PAL.wood);
+    poly(ctx, [[-9, -21], [7, -18], [7, -12], [-9, -15]], PAL.woodLight);
+    poly(ctx, [[-9, -21], [7, -18], [7, -17], [-9, -20]], accent);
+    rect(ctx, -6, -18, 8, 1, PAL.woodDark);
+    rect(ctx, -6, -16, 5, 1, PAL.woodDark);
+  });
+}
+
+/** Village name board: two posts and a painted plank in the gem colour. */
+export function buildNameBoard(accent: string): Sprite {
+  return makeSprite(44, 34, 22, 29, (ctx) => {
+    poly(ctx, diamond(1, 1, 26), PAL.shadow);
+    rect(ctx, -15, -20, 2, 21, PAL.wood);
+    rect(ctx, 13, -14, 2, 15, PAL.wood);
+    poly(ctx, [[-16, -22], [16, -16], [16, -6], [-16, -12]], PAL.woodDark);
+    poly(ctx, [[-15, -21], [15, -15.4], [15, -7.4], [-15, -13]], PAL.woodLight);
+    poly(ctx, [[-15, -21], [15, -15.4], [15, -14.2], [-15, -19.8]], accent);
+    poly(ctx, [[-15, -9.6], [15, -8.6], [15, -7.4], [-15, -13 + 4.6]], accent);
+  });
+}
+
+/** Surveyor stake with a ribbon — the frontier's calling card. */
+export function buildStake(accent: string, seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(14, 24, 7, 20, (ctx) => {
+    poly(ctx, diamond(1, 1, 8), PAL.shadowSoft);
+    rect(ctx, 0, -13, 1, 13, PAL.woodLight);
+    poly(ctx, [[1, -13], [7, -11.5], [1, -9.5]], accent);
+    if (rng() < 0.5) rect(ctx, -2, -1, 5, 1, PAL.chalk);
+  });
+}
+
+export function buildCampfire(): Sprite {
+  return makeSprite(22, 22, 11, 17, (ctx) => {
+    poly(ctx, diamond(1, 1, 16), PAL.shadowSoft);
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      rect(ctx, Math.cos(a) * 7, (Math.sin(a) * 7) / 2 - 1, 2, 2, PAL.stone);
+    }
+    poly(ctx, [[-4, -1], [4, -3], [3, -1], [-3, 1]], PAL.woodDark);
+    poly(ctx, [[-3, -1], [3, -4], [2, -1], [-2, 1]], PAL.wood);
+    poly(ctx, [[-3, -2], [3, -2], [0, -9]], '#ff9a4d');
+    poly(ctx, [[-2, -2], [2, -2], [0, -6]], '#ffd98a');
+  });
+}
+
+export function buildBarrels(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(24, 24, 12, 19, (ctx) => {
+    poly(ctx, diamond(1, 1, 18), PAL.shadow);
+    const barrel = (x: number, y: number) => {
+      rect(ctx, x - 4, y - 11, 8, 11, PAL.wood);
+      rect(ctx, x - 4, y - 11, 3, 11, PAL.woodLight);
+      rect(ctx, x - 4, y - 9, 8, 1, PAL.stoneDark);
+      rect(ctx, x - 4, y - 4, 8, 1, PAL.stoneDark);
+      poly(ctx, diamond(x, y - 11, 8), shade(PAL.woodLight, 0.2));
+    };
+    barrel(-4, 1);
+    barrel(5, -2);
+    if (rng() < 0.5) barrel(0, -12);
+  });
+}
+
+/** Grazing animal: reads as a sheep at 1× and a white speck on the map. */
+export function buildSheep(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const flip = rng() < 0.5 ? 1 : -1;
+  return makeSprite(18, 16, 9, 12, (ctx) => {
+    poly(ctx, diamond(1, 1, 12), PAL.shadowSoft);
+    rect(ctx, -4 * flip, -3, 1, 3, PAL.ink);
+    rect(ctx, 2 * flip, -3, 1, 3, PAL.ink);
+    blob(ctx, 0, -9, [7, 10, 11, 10, 8], '#f4efe6');
+    blob(ctx, -1, -9, [4, 5], '#ffffff');
+    rect(ctx, 5 * flip, -9, 3, 3, '#4c4658');
+  });
+}
+
+/**
+ * A tileable patch of the deep woodland that surrounds the vale. Painting the
+ * area outside the map with this instead of a flat colour means panning past
+ * the edge — or viewing a wide map on a narrow phone — reads as endless forest
+ * rather than as empty canvas.
+ */
+export function buildForestPattern(size = 96): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = size;
+  c.height = size;
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = '#3f7f66';
+  ctx.fillRect(0, 0, size, size);
+  const rng = mulberry32(9001);
+  // Wrapped drawing: every blob is stamped in all nine offsets so the tile seams.
+  const stamp = (draw: (dx: number, dy: number) => void, x: number, y: number) => {
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oy = -1; oy <= 1; oy++) draw(x + ox * size, y + oy * size);
+    }
+  };
+  for (let i = 0; i < 70; i++) {
+    const x = rng() * size;
+    const y = rng() * size;
+    const r = 3 + rng() * 5;
+    const col = rng() < 0.42 ? '#377059' : rng() < 0.7 ? '#4a8d72' : '#2f6650';
+    stamp((dx, dy) => {
+      for (let k = -Math.round(r); k <= Math.round(r); k++) {
+        const w = Math.round(Math.sqrt(Math.max(0, r * r - k * k)) * 2);
+        if (w > 0) ctx.fillRect(Math.round(dx - w / 2), Math.round(dy + k * 0.55), w, 1);
+      }
+    }, x, y);
+  }
+  for (let i = 0; i < 40; i++) {
+    const x = rng() * size;
+    const y = rng() * size;
+    stamp((dx, dy) => {
+      ctx.fillStyle = '#2c6149';
+      ctx.fillRect(Math.round(dx), Math.round(dy), 1, 2 + Math.round(rng() * 2));
+    }, x, y);
+  }
+  return c;
+}
+
+/** Crane: mast + jib. The hook and its load are animated by the renderer. */
+export function buildCrane(accent: string): Sprite {
+  const mastH = 48;
+  return makeSprite(72, mastH + 26, 26, mastH + 20, (ctx) => {
+    poly(ctx, diamond(1, 1, 22), PAL.shadow);
+    poly(ctx, diamond(0, 0, 20), PAL.stoneDark);
+    poly(ctx, diamond(0, -2, 18), PAL.stone);
+    for (let y = 0; y < mastH; y += 6) {
+      rect(ctx, -4, -2 - y, 1, 6, PAL.wood);
+      rect(ctx, 3, -2 - y, 1, 6, PAL.woodDark);
+      rect(ctx, -4, -2 - y, 8, 1, PAL.woodLight);
+      poly(ctx, [[-3, -2 - y], [-2, -2 - y], [4, -8 - y], [3, -8 - y]], shade(PAL.wood, 0.1));
+    }
+    const top = -mastH - 2;
+    rect(ctx, -18, top, 44, 2, PAL.wood);
+    rect(ctx, -18, top + 2, 44, 1, PAL.woodDark);
+    for (let x = -16; x < 24; x += 6) {
+      poly(ctx, [[x, top + 2], [x + 1, top + 2], [x + 5, top - 4], [x + 4, top - 4]], PAL.woodLight);
+    }
+    rect(ctx, -18, top - 5, 44, 1, PAL.woodLight);
+    rect(ctx, -6, top + 3, 9, 7, accent);
+    rect(ctx, -4, top + 5, 4, 3, PAL.glass);
+    rect(ctx, -19, top - 2, 5, 8, PAL.stoneDark);
+    rect(ctx, 25, top - 8, 2, 3, PAL.flower[0]);
+  });
+}
+
+/* ------------------------------- dynamics ------------------------------- */
+
+export type BotAction = 'walk' | 'idle' | 'work' | 'carry';
+
+/** A villager, ~14px tall, drawn straight into the frame buffer. */
+export function drawBot(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  color: string,
+  faceRight: boolean,
+  action: BotAction,
+  phase: number
+): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const s = faceRight ? 1 : -1;
+  const dark = shade(color, -0.28);
+  const light = shade(color, 0.24);
+
+  ctx.fillStyle = PAL.shadow;
+  ctx.fillRect(px - 4, py - 1, 8, 2);
+  ctx.fillRect(px - 5, py, 10, 1);
+
+  const step = action === 'walk' || action === 'carry' ? Math.sin(phase * 9) : 0;
+  const bob = step !== 0 && Math.abs(step) > 0.6 ? -1 : 0;
+  const top = py + bob;
+
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px - 2, top - 3, 2, 3 + (step > 0 ? -1 : 0));
+  ctx.fillRect(px + 1, top - 3, 2, 3 + (step < 0 ? -1 : 0));
+
+  ctx.fillStyle = color;
+  ctx.fillRect(px - 3, top - 9, 6, 6);
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + (faceRight ? 2 : -3), top - 9, 1, 6);
+  ctx.fillStyle = light;
+  ctx.fillRect(px - 3 + (faceRight ? 0 : 5), top - 9, 1, 3);
+
+  ctx.fillStyle = shade(color, -0.14);
+  if (action === 'work') {
+    const swing = Math.sin(phase * 11) > 0 ? 0 : 3;
+    ctx.fillRect(px + s * 3 - (faceRight ? 0 : 1), top - 9 + swing, 1, 3);
+    ctx.fillRect(px - s * 3 - (faceRight ? 1 : 0), top - 8, 1, 3);
+    ctx.fillStyle = PAL.stoneDark;
+    ctx.fillRect(px + s * 4 - (faceRight ? 0 : 2), top - 11 + swing * 2, 3, 2);
+  } else if (action === 'carry') {
+    ctx.fillRect(px - 4, top - 10, 1, 3);
+    ctx.fillRect(px + 3, top - 10, 1, 3);
+    ctx.fillStyle = PAL.woodLight;
+    ctx.fillRect(px - 5, top - 13, 10, 3);
+    ctx.fillStyle = PAL.wood;
+    ctx.fillRect(px - 5, top - 11, 10, 1);
+  } else {
+    ctx.fillRect(px - 4, top - 8 + (step > 0 ? 1 : 0), 1, 3);
+    ctx.fillRect(px + 3, top - 8 + (step < 0 ? 1 : 0), 1, 3);
+  }
+
+  ctx.fillStyle = '#f7e2c8';
+  ctx.fillRect(px - 2, top - 14, 5, 5);
+  ctx.fillStyle = '#e8cba9';
+  ctx.fillRect(px + (faceRight ? 2 : -2), top - 14, 1, 5);
+  ctx.fillStyle = dark;
+  ctx.fillRect(px - 3, top - 16, 7, 2);
+  ctx.fillRect(px - 2, top - 17, 5, 1);
+  ctx.fillStyle = PAL.ink;
+  if (action !== 'work') {
+    ctx.fillRect(px + (faceRight ? 1 : -2), top - 12, 1, 1);
+    ctx.fillRect(px + (faceRight ? -1 : 0), top - 12, 1, 1);
+  }
+}
+
+/** A hand cart being pulled along a road, with its carter in front. */
+export function drawCart(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  color: string,
+  faceRight: boolean,
+  phase: number,
+  cargo: string
+): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const s = faceRight ? 1 : -1;
+
+  ctx.fillStyle = PAL.shadow;
+  ctx.fillRect(px - 11, py - 1, 22, 2);
+
+  const bx = px - s * 9;
+  // bed
+  ctx.fillStyle = PAL.wood;
+  ctx.fillRect(bx - 7, py - 9, 14, 5);
+  ctx.fillStyle = PAL.woodLight;
+  ctx.fillRect(bx - 7, py - 9, 14, 1);
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(bx - 7, py - 5, 14, 1);
+  // cargo
+  ctx.fillStyle = cargo;
+  ctx.fillRect(bx - 5, py - 13, 10, 4);
+  ctx.fillStyle = shade(cargo, 0.25);
+  ctx.fillRect(bx - 5, py - 13, 10, 1);
+  // wheels
+  const spin = Math.floor(phase * 8) % 2;
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(bx - 6, py - 5, 5, 5);
+  ctx.fillRect(bx + 2, py - 5, 5, 5);
+  ctx.fillStyle = PAL.woodLight;
+  ctx.fillRect(bx - 4 + spin, py - 3, 1, 1);
+  ctx.fillRect(bx + 4 - spin, py - 3, 1, 1);
+  // shafts
+  ctx.fillStyle = PAL.wood;
+  ctx.fillRect(Math.min(px, bx) + (faceRight ? 7 : 0), py - 8, 6, 1);
+
+  drawBot(ctx, px, py, color, faceRight, 'walk', phase);
+}
+
+/** Waterwheel: turns with the clock, so it lives outside the baked layer. */
+export function drawWheel(ctx: Ctx, x: number, y: number, t: number): void {
+  const cx = Math.round(x);
+  const cy = Math.round(y);
+  const r = 10;
+  const a0 = t * 1.05;
+  // rim
+  ctx.fillStyle = PAL.woodDark;
+  for (let i = 0; i < 28; i++) {
+    const a = a0 + (i / 28) * Math.PI * 2;
+    ctx.fillRect(cx + Math.round(Math.cos(a) * r) - 1, cy + Math.round(Math.sin(a) * r) - 1, 2, 2);
+  }
+  // spokes
+  for (let i = 0; i < 8; i++) {
+    const a = a0 + (i / 8) * Math.PI * 2;
+    ctx.fillStyle = i % 2 ? PAL.wood : PAL.woodDark;
+    for (let k = 2; k <= r; k++) {
+      ctx.fillRect(cx + Math.round(Math.cos(a) * k), cy + Math.round(Math.sin(a) * k), 1, 1);
+    }
+  }
+  // paddles, catching the light on the way down
+  for (let i = 0; i < 8; i++) {
+    const a = a0 + (i / 8) * Math.PI * 2;
+    ctx.fillStyle = Math.sin(a) > 0 ? PAL.woodLight : PAL.wood;
+    ctx.fillRect(cx + Math.round(Math.cos(a) * r) - 2, cy + Math.round(Math.sin(a) * r) - 2, 4, 4);
+  }
+  ctx.fillStyle = PAL.stoneDark;
+  ctx.fillRect(cx - 2, cy - 2, 4, 4);
+  ctx.fillStyle = PAL.stone;
+  ctx.fillRect(cx - 1, cy - 1, 2, 2);
+}
