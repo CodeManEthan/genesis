@@ -1,0 +1,591 @@
+// Genesis timeline test harness.
+//
+// Exercises src/components/designs/genesis/timeline.ts against real generated
+// maps when gen.ts exists, and against hand-written fixtures either way (the
+// fixtures cover shapes the generator may not produce: a road that founds
+// nothing, a site with a single building, a bridge near the start of a road).
+//
+// Node 22 strips the types, same trick as build-world.mjs.
+//
+// Usage: node scripts/genesis-timeline-stats.mjs
+
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const gdir = join(root, 'src/components/designs/genesis');
+
+const { mulberry32, hashSeed } = await import(join(gdir, 'types.ts'));
+const { buildTimeline, emptySnapshot, snapshotAt, advance } = await import(
+  join(gdir, 'timeline.ts')
+);
+
+let generateMap = null;
+try {
+  ({ generateMap } = await import(join(gdir, 'gen.ts')));
+} catch {
+  generateMap = null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* fixtures                                                                   */
+/* -------------------------------------------------------------------------- */
+
+const TOWNS = ['Ashfold', 'Merrow', 'Stillwater', 'Byrehollow', 'Thornlea', 'Coldharbour'];
+const ROLES = ['cottage', 'hall', 'barn', 'workshop', 'store', 'chapel', 'smithy', 'mill'];
+const LABELS = ['The Cottage', 'The Long Hall', 'The Barn', 'The Workshop', 'The Store', 'The Chapel', 'The Smithy', 'The Mill'];
+
+/**
+ * A small hand-shaped map: `plan` sites strung along a line, one road between
+ * each pair, a bridge on the first road, a wild forest of which only some
+ * trees are ever cleared.
+ */
+function makeFixture(seed, opts) {
+  const rng = mulberry32(seed);
+  const pick = (a) => a[Math.floor(rng() * a.length)];
+  const counts = opts.buildings;
+  const nSites = counts.length;
+
+  const trees = [];
+  for (let i = 0; i < opts.trees; i++) {
+    trees.push({
+      id: `tr${i}`,
+      kind: pick(['oak', 'pine', 'blossom', 'hedgerow']),
+      gx: Math.round(rng() * 90),
+      gy: Math.round(rng() * 90),
+      seed: Math.floor(rng() * 1e9),
+    });
+  }
+
+  // only these trees are ever allowed to be felled
+  const clearable = trees.slice(0, Math.floor(opts.trees * 0.55)).map((t) => t.id);
+  let cursor = 0;
+
+  const sites = [];
+  for (let s = 0; s < nSites; s++) {
+    const cx = 20 + s * 22;
+    const cy = 20 + s * 10;
+    const buildings = [];
+    for (let b = 0; b < counts[s]; b++) {
+      const ri = Math.floor(rng() * ROLES.length);
+      const clears = [];
+      if (!(s === 0 && b === 0)) {
+        const n = Math.floor(rng() * 3); // 0..2 trees per plot
+        for (let k = 0; k < n && cursor < clearable.length; k++) clears.push(clearable[cursor++]);
+      }
+      buildings.push({
+        id: `s${s}-b${b}`,
+        siteId: `s${s}`,
+        gx: cx + (b % 3) * 2,
+        gy: cy + Math.floor(b / 3) * 2,
+        role: ROLES[ri],
+        label: LABELS[ri],
+        w: 24 + Math.floor(rng() * 8) * 4,
+        floors: 1 + Math.floor(rng() * 3),
+        roof: 'gable',
+        chimney: true,
+        awning: false,
+        banner: false,
+        cupola: false,
+        accent: '#c8a24a',
+        seed: Math.floor(rng() * 1e9),
+        clears,
+      });
+    }
+    const props = [
+      { id: `s${s}-well`, kind: 'well', gx: cx - 2, gy: cy, seed: 1 },
+      { id: `s${s}-board`, kind: 'nameboard', gx: cx - 3, gy: cy + 1, seed: 2 },
+      { id: `s${s}-crates`, kind: 'crates', gx: cx + 1, gy: cy - 2, seed: 3 },
+      { id: `s${s}-lamp0`, kind: 'lamp', gx: cx, gy: cy + 3, seed: 4 },
+      { id: `s${s}-lamp1`, kind: 'lamp', gx: cx + 3, gy: cy + 3, seed: 5 },
+      { id: `s${s}-sheep`, kind: 'sheep', gx: cx + 5, gy: cy + 5, seed: 6 },
+    ];
+    sites.push({
+      id: `s${s}`,
+      name: TOWNS[s % TOWNS.length],
+      gx: cx,
+      gy: cy,
+      radius: 6,
+      accent: '#c8a24a',
+      buildings,
+      props,
+    });
+  }
+
+  const roads = [];
+  for (let s = 1; s < nSites; s++) {
+    const a = sites[s - 1];
+    const b = sites[s];
+    const pts = [];
+    const n = 6;
+    for (let i = 0; i <= n; i++) {
+      const u = i / n;
+      pts.push([
+        a.gx + (b.gx - a.gx) * u + Math.sin(u * 3) * 2,
+        a.gy + (b.gy - a.gy) * u + Math.cos(u * 2) * 2,
+      ]);
+    }
+    roads.push({ id: `r${s - 1}`, kind: 'lane', pts, width: 0.5, from: a.id, to: b.id });
+  }
+  if (opts.loopRoad && nSites >= 3) {
+    // a link road that founds nothing
+    const a = sites[nSites - 1];
+    const b = sites[0];
+    roads.push({
+      id: `r-loop`,
+      kind: 'track',
+      pts: [
+        [a.gx, a.gy],
+        [(a.gx + b.gx) / 2, a.gy + 14],
+        [b.gx, b.gy],
+      ],
+      width: 0.4,
+      from: a.id,
+      to: b.id,
+    });
+  }
+
+  const bridges = [];
+  if (roads.length) {
+    const pts = roads[0].pts;
+    const at = opts.bridgeAt ?? 0.45;
+    const i = Math.min(pts.length - 2, Math.floor(at * (pts.length - 1)));
+    const f = at * (pts.length - 1) - i;
+    bridges.push({
+      id: 'br0',
+      roadId: roads[0].id,
+      gx: pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f,
+      gy: pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f,
+      span: 4,
+    });
+  }
+
+  const scatter = [];
+  for (let i = 0; i < 12; i++) {
+    scatter.push({
+      id: `pr${i}`,
+      kind: 'rock',
+      gx: Math.round(rng() * 90),
+      gy: Math.round(rng() * 90),
+      seed: i,
+    });
+  }
+
+  return {
+    version: 1,
+    seed,
+    bounds: { u0: -80, v0: 0, u1: 80, v1: 200 },
+    content: { u0: -60, v0: 10, u1: 60, v1: 180 },
+    chunks: [],
+    river: [
+      [0, 60],
+      [40, 40],
+      [90, 30],
+    ],
+    riverWidth: 0.95,
+    sites,
+    roads,
+    bridges,
+    trees,
+    scatter,
+    valleyName: 'Ashmere Vale',
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* geometry (independent reimplementation, for checking road/bridge fracs)    */
+/* -------------------------------------------------------------------------- */
+
+function arclen(pts) {
+  const cum = [0];
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    total += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    cum.push(total);
+  }
+  return { cum, total };
+}
+
+function fracOf(pts, gx, gy) {
+  const { cum, total } = arclen(pts);
+  if (!(total > 0)) return 0;
+  let best = Infinity;
+  let f = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const ax = pts[i - 1][0];
+    const ay = pts[i - 1][1];
+    const dx = pts[i][0] - ax;
+    const dy = pts[i][1] - ay;
+    const l2 = dx * dx + dy * dy;
+    let u = l2 > 0 ? ((gx - ax) * dx + (gy - ay) * dy) / l2 : 0;
+    u = Math.max(0, Math.min(1, u));
+    const d = (ax + dx * u - gx) ** 2 + (ay + dy * u - gy) ** 2;
+    if (d < best) {
+      best = d;
+      f = (cum[i - 1] + u * Math.sqrt(l2)) / total;
+    }
+  }
+  return f;
+}
+
+/* -------------------------------------------------------------------------- */
+/* checks                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const hhmm = (t) => {
+  const h = Math.floor(t);
+  const m = Math.round((t - h) * 60);
+  return `${String(m === 60 ? h + 1 : h).padStart(2, '0')}:${String(m === 60 ? 0 : m).padStart(2, '0')}`;
+};
+
+function serialize(snap) {
+  const m = (x) => [...x.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  const s = (x) => [...x].sort();
+  return JSON.stringify({
+    t: snap.t,
+    trees: m(snap.trees),
+    buildings: m(snap.buildings),
+    roads: m(snap.roads),
+    bridges: m(snap.bridges),
+    props: s(snap.props),
+    founded: s(snap.founded),
+    population: m(snap.population),
+    log: snap.log,
+  });
+}
+
+function run(label, map) {
+  const fails = [];
+  const bad = (msg) => fails.push(msg);
+
+  const tl = buildTimeline(map);
+  const ev = tl.events;
+
+  const siteIds = new Set(map.sites.map((s) => s.id));
+  const buildingById = new Map();
+  const clearsOf = new Map();
+  for (const s of map.sites)
+    for (const b of s.buildings) {
+      buildingById.set(b.id, b);
+      clearsOf.set(b.id, b.clears);
+    }
+  const treeIds = new Set(map.trees.map((t) => t.id));
+  const roadById = new Map(map.roads.map((r) => [r.id, r]));
+  const bridgeById = new Map(map.bridges.map((b) => [b.id, b]));
+  const propIds = new Set();
+  for (const s of map.sites) for (const p of s.props) propIds.add(p.id);
+  const clearable = new Set();
+  for (const s of map.sites) for (const b of s.buildings) for (const id of b.clears) clearable.add(id);
+
+  /* (a) sorted, in range */
+  for (let i = 0; i < ev.length; i++) {
+    const e = ev[i];
+    if (!(e.t >= 0 && e.t < 24)) bad(`(a) event ${i} t=${e.t} out of [0,24)`);
+    if (i && ev[i - 1].t > e.t + 1e-12) bad(`(a) not sorted at ${i}: ${ev[i - 1].t} > ${e.t}`);
+  }
+
+  /* (b) referenced ids exist + no wild tree felled */
+  for (const e of ev) {
+    if (e.type === 'found' || e.type === 'arrive' || e.type === 'prop') {
+      if (e.siteId && !siteIds.has(e.siteId)) bad(`(b) unknown siteId ${e.siteId}`);
+    }
+    if (e.type === 'log' && e.siteId && !siteIds.has(e.siteId)) bad(`(b) unknown log siteId ${e.siteId}`);
+    if (e.type === 'chop-start' || e.type === 'chop-done') {
+      if (!treeIds.has(e.treeId)) bad(`(b) unknown treeId ${e.treeId}`);
+      else if (!clearable.has(e.treeId)) bad(`(b) felled wild tree ${e.treeId}`);
+    }
+    if ((e.type === 'survey' || e.type === 'build') && !buildingById.has(e.buildingId))
+      bad(`(b) unknown buildingId ${e.buildingId}`);
+    if (e.type === 'road' && !roadById.has(e.roadId)) bad(`(b) unknown roadId ${e.roadId}`);
+    if (e.type === 'bridge' && !bridgeById.has(e.bridgeId)) bad(`(b) unknown bridgeId ${e.bridgeId}`);
+    if (e.type === 'prop' && !propIds.has(e.propId)) bad(`(b) unknown propId ${e.propId}`);
+  }
+
+  /* (c) per building: chops -> survey -> monotonic builds ending at 1 */
+  const chopDone = new Map();
+  for (const e of ev) if (e.type === 'chop-done') chopDone.set(e.treeId, e.t);
+  const chopStart = new Map();
+  for (const e of ev) if (e.type === 'chop-start' && !chopStart.has(e.treeId)) chopStart.set(e.treeId, e.t);
+  for (const [id, t] of chopDone) {
+    if (!chopStart.has(id)) bad(`(c) chop-done without chop-start: ${id}`);
+    else if (chopStart.get(id) > t) bad(`(c) chop-done before chop-start: ${id}`);
+  }
+
+  const founding = map.sites[0]?.buildings[0]?.id;
+  const surveyT = new Map();
+  const buildsOf = new Map();
+  for (const e of ev) {
+    if (e.type === 'survey') {
+      if (surveyT.has(e.buildingId)) bad(`(c) two surveys for ${e.buildingId}`);
+      surveyT.set(e.buildingId, e.t);
+    }
+    if (e.type === 'build') {
+      if (!buildsOf.has(e.buildingId)) buildsOf.set(e.buildingId, []);
+      buildsOf.get(e.buildingId).push(e);
+    }
+  }
+  for (const [id, b] of buildingById) {
+    if (id === founding) {
+      if (surveyT.has(id) || buildsOf.has(id)) bad(`(c) founding house ${id} should have no events`);
+      continue;
+    }
+    if (!surveyT.has(id)) {
+      bad(`(c) no survey for ${id}`);
+      continue;
+    }
+    const sT = surveyT.get(id);
+    for (const treeId of b.clears) {
+      if (!treeIds.has(treeId)) continue;
+      if (!chopDone.has(treeId)) bad(`(c) ${id}: clears tree ${treeId} never felled`);
+      else if (chopDone.get(treeId) > sT + 1e-9)
+        bad(`(c) ${id}: tree ${treeId} felled at ${chopDone.get(treeId)} after survey ${sT}`);
+    }
+    const list = buildsOf.get(id) ?? [];
+    if (!list.length) {
+      bad(`(c) no build events for ${id}`);
+      continue;
+    }
+    if (list[0].t < sT - 1e-9) bad(`(c) ${id}: build before survey`);
+    let prev = 0.05;
+    for (const e of list) {
+      if (!(e.progress > prev)) bad(`(c) ${id}: progress not strictly monotonic (${prev} -> ${e.progress})`);
+      prev = e.progress;
+    }
+    if (list[list.length - 1].progress !== 1) bad(`(c) ${id}: last progress ${prev} !== 1`);
+  }
+
+  /* (d) roads monotonic, end at 1 */
+  const roadEv = new Map();
+  for (const e of ev) {
+    if (e.type !== 'road') continue;
+    if (!roadEv.has(e.roadId)) roadEv.set(e.roadId, []);
+    roadEv.get(e.roadId).push(e);
+  }
+  for (const r of map.roads) {
+    const list = roadEv.get(r.id) ?? [];
+    if (!list.length) {
+      bad(`(d) road ${r.id} never built`);
+      continue;
+    }
+    let prev = 0;
+    for (const e of list) {
+      if (!(e.frac > prev)) bad(`(d) ${r.id}: frac not monotonic (${prev} -> ${e.frac})`);
+      prev = e.frac;
+    }
+    if (Math.abs(prev - 1) > 1e-9) bad(`(d) ${r.id}: last frac ${prev} !== 1`);
+  }
+
+  /* (e) bridge stages 1,2,3 in order, stage 3 gates the road */
+  for (const br of map.bridges) {
+    const stages = ev.filter((e) => e.type === 'bridge' && e.bridgeId === br.id);
+    const nums = stages.map((s) => s.stage);
+    if (nums.join(',') !== '1,2,3') bad(`(e) ${br.id}: stages [${nums}] !== 1,2,3`);
+    const t3 = stages.length ? stages[stages.length - 1].t : Infinity;
+    const road = roadById.get(br.roadId);
+    if (!road) continue;
+    const bf = fracOf(road.pts, br.gx, br.gy);
+    const past = (roadEv.get(road.id) ?? []).filter((e) => e.frac > bf + 0.05);
+    if (past.length && past[0].t < t3 - 1e-9)
+      bad(`(e) ${br.id}: road passed frac ${past[0].frac.toFixed(3)} at ${past[0].t.toFixed(2)} before stage 3 at ${t3.toFixed(2)} (bridgeFrac ${bf.toFixed(3)})`);
+  }
+
+  /* (f) non-s0 sites founded after their road arrives, before their buildings */
+  const foundT = new Map();
+  for (const e of ev) if (e.type === 'found' && !foundT.has(e.siteId)) foundT.set(e.siteId, e.t);
+  for (let i = 1; i < map.sites.length; i++) {
+    const s = map.sites[i];
+    if (!foundT.has(s.id)) {
+      bad(`(f) site ${s.id} never founded`);
+      continue;
+    }
+    const fT = foundT.get(s.id);
+    for (const b of s.buildings) {
+      const es = [
+        ...(buildsOf.get(b.id) ?? []),
+        ...(surveyT.has(b.id) ? [{ t: surveyT.get(b.id) }] : []),
+      ];
+      for (const e of es) if (e.t < fT - 1e-9) bad(`(f) ${b.id} event at ${e.t} before found ${fT}`);
+    }
+    const touching = map.roads.filter((r) => r.from === s.id || r.to === s.id);
+    if (touching.length) {
+      const ok = touching.some((r) =>
+        (roadEv.get(r.id) ?? []).some((e) => e.frac >= 0.95 && e.t <= fT + 1e-9),
+      );
+      if (!ok) bad(`(f) ${s.id} founded at ${fT.toFixed(2)} with no road at frac>=0.95 yet`);
+    }
+  }
+  if (map.sites.length && foundT.has(map.sites[0].id))
+    bad(`(f) sites[0] should not emit a found event (it exists at t=0)`);
+
+  /* (g) the last roof lands in the evening window */
+  const builds = ev.filter((e) => e.type === 'build');
+  const lastBuild = builds.length ? builds[builds.length - 1].t : 0;
+  if (builds.length && !(lastBuild >= 19.5 && lastBuild <= 22.5))
+    bad(`(g) last build at ${hhmm(lastBuild)} outside 19:30..22:30`);
+
+  /* (h) determinism */
+  const again = buildTimeline(map);
+  if (JSON.stringify(again.events) !== JSON.stringify(ev)) bad(`(h) buildTimeline not deterministic`);
+
+  /* (i) end state complete */
+  const end = snapshotAt(map, tl, 24);
+  for (const [id] of buildingById) {
+    const st = end.buildings.get(id);
+    if (!st || st.status !== 'done' || st.progress !== 1)
+      bad(`(i) ${id} not done at t=24 (${st ? st.status + ' ' + st.progress : 'missing'})`);
+  }
+  for (const r of map.roads) if (end.roads.get(r.id) !== 1) bad(`(i) road ${r.id} frac ${end.roads.get(r.id)} !== 1`);
+  for (const b of map.bridges) if (end.bridges.get(b.id) !== 3) bad(`(i) bridge ${b.id} stage ${end.bridges.get(b.id)} !== 3`);
+  for (const s of map.sites) if (!end.founded.has(s.id)) bad(`(i) site ${s.id} never founded`);
+  for (const id of propIds) if (!end.props.has(id)) bad(`(i) prop ${id} never appeared`);
+
+  /* (j) incremental advance == full recompute */
+  const hop = emptySnapshot(map);
+  advance(hop, tl, 8);
+  advance(hop, tl, 24);
+  if (serialize(hop) !== serialize(end)) bad(`(j) two-hop advance != snapshotAt(24)`);
+
+  const hop3 = emptySnapshot(map);
+  for (let t = 0.5; t <= 24.0001; t += 0.5) advance(hop3, tl, Math.min(t, 24));
+  if (serialize(hop3) !== serialize(end)) bad(`(j) 48-hop advance != snapshotAt(24)`);
+
+  /* (k) day arc: first road mid-morning, ledger well spread, quiet close */
+  const roadEvents = ev.filter((e) => e.type === 'road');
+  const firstRoad = roadEvents.length ? roadEvents[0].t : null;
+  if (firstRoad !== null && firstRoad < 6)
+    bad(`(k) first road at ${hhmm(firstRoad)} — too early for a mid-morning push`);
+  const logs = ev.filter((e) => e.type === 'log');
+  if (logs.length < 25 || logs.length > 45) bad(`(k) ${logs.length} log lines, want 25..45`);
+  if (!logs.some((l) => l.t > 22)) bad(`(k) nothing in the ledger after 22:00`);
+  // no six-hour dead patch in the ledger
+  let prevLog = 0;
+  for (const l of logs) {
+    if (l.t - prevLog > 4.5) bad(`(k) ledger gap ${hhmm(prevLog)} -> ${hhmm(l.t)}`);
+    prevLog = l.t;
+  }
+
+  /* --- report ----------------------------------------------------------- */
+  const byType = {};
+  for (const e of ev) byType[e.type] = (byType[e.type] ?? 0) + 1;
+
+  // how often is there visibly something happening?
+  let live = 0;
+  const probe = emptySnapshot(map);
+  const SAMPLES = 96;
+  for (let i = 1; i <= SAMPLES; i++) {
+    advance(probe, tl, (i / SAMPLES) * 24);
+    const busy =
+      [...probe.buildings.values()].some((b) => b.status === 'building') ||
+      [...probe.trees.values()].some((v) => v === 'felling');
+    if (busy) live++;
+  }
+
+  console.log(`\n${'='.repeat(72)}`);
+  console.log(`${fails.length ? 'FAIL' : 'PASS'}  ${label}`);
+  console.log(
+    `  sites ${map.sites.length}  buildings ${buildingById.size}  roads ${map.roads.length}  ` +
+      `bridges ${map.bridges.length}  trees ${map.trees.length} (clearable ${clearable.size})`,
+  );
+  console.log(
+    `  events ${ev.length}   first road ${firstRoad === null ? '--' : hhmm(firstRoad)}   ` +
+      `last build ${hhmm(lastBuild)}   last event ${hhmm(ev[ev.length - 1]?.t ?? 0)}   ` +
+      `something-underway ${Math.round((live / SAMPLES) * 100)}% of the day`,
+  );
+  console.log(
+    '  by type: ' +
+      Object.entries(byType)
+        .sort()
+        .map(([k, v]) => `${k}=${v}`)
+        .join(' '),
+  );
+  const foundLine = [...foundT.entries()].map(([k, v]) => `${k}@${hhmm(v)}`).join(' ');
+  if (foundLine) console.log(`  foundings: ${foundLine}`);
+  for (const m of fails) console.log(`  ! ${m}`);
+  return { fails, ev, tl, map };
+}
+
+function sampleLogs(ev, n = 8) {
+  const logs = ev.filter((e) => e.type === 'log');
+  const out = [];
+  for (let i = 0; i < n && logs.length; i++) {
+    const idx = Math.min(logs.length - 1, Math.round(((i + 0.5) / n) * logs.length));
+    out.push(logs[idx]);
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* main                                                                       */
+/* -------------------------------------------------------------------------- */
+
+const cases = [];
+
+cases.push([
+  'fixture: 3 sites / 1 bridge / loop road',
+  makeFixture(hashSeed('2026-08-02'), { buildings: [4, 3, 3], trees: 22, loopRoad: true }),
+]);
+cases.push(['fixture: 2 sites, tiny', makeFixture(1234, { buildings: [2, 1], trees: 20 })]);
+cases.push([
+  'fixture: 3 sites, bridge right at the start of the road',
+  makeFixture(99, { buildings: [3, 4, 2], trees: 24, bridgeAt: 0.05 }),
+]);
+cases.push([
+  'fixture: 3 sites, bridge right at the end of the road',
+  makeFixture(777, { buildings: [3, 3, 4], trees: 24, bridgeAt: 0.97 }),
+]);
+cases.push([
+  'fixture: big — 5 sites, 30 buildings',
+  makeFixture(5150, { buildings: [7, 6, 6, 6, 5], trees: 60, loopRoad: true }),
+]);
+cases.push(['fixture: one site only', makeFixture(31337, { buildings: [5], trees: 18 })]);
+
+if (generateMap) {
+  for (const day of ['2026-08-02', '2026-08-03', '2026-12-25', '2027-01-01']) {
+    try {
+      cases.push([`gen.ts seed ${day}`, generateMap(hashSeed(day))]);
+    } catch (err) {
+      console.log(`  (gen.ts threw for ${day}: ${err.message})`);
+    }
+  }
+} else {
+  console.log('gen.ts not present yet — running fixtures only.');
+}
+
+let failed = 0;
+let showcase = null;
+let showcaseIsReal = false;
+for (const [label, map] of cases) {
+  const r = run(label, map);
+  if (r.fails.length) failed++;
+  // prefer a real generated map for the flavour sample
+  const real = label.startsWith('gen.ts');
+  if (!showcase || (real && !showcaseIsReal)) {
+    showcase = r;
+    showcaseIsReal = real;
+  }
+}
+
+if (showcase) {
+  console.log(`\n${'='.repeat(72)}`);
+  console.log('sample ledger — ' + showcase.map.valleyName);
+  const snap0 = emptySnapshot(showcase.map);
+  console.log(`  00:00  ${snap0.log[0].text}`);
+  for (const l of sampleLogs(showcase.ev)) console.log(`  ${hhmm(l.t)}  ${l.text}`);
+
+  console.log('\nfounding-event texts:');
+  for (const e of showcase.ev) if (e.type === 'found') console.log(`  ${hhmm(e.t)}  ${e.text}`);
+
+  console.log('\nsnapshot at 12:00:');
+  const mid = snapshotAt(showcase.map, showcase.tl, 12);
+  const done = [...mid.buildings.values()].filter((b) => b.status === 'done').length;
+  const going = [...mid.buildings.values()].filter((b) => b.status === 'building').length;
+  console.log(
+    `  founded ${[...mid.founded].join(',')}  buildings done ${done} building ${going}  ` +
+      `pop ${[...mid.population.entries()].map(([k, v]) => k + ':' + v).join(' ')}  ` +
+      `stumps ${[...mid.trees.values()].filter((v) => v === 'stump').length}  ` +
+      `props ${mid.props.size}  log ${mid.log.length}`,
+  );
+}
+
+console.log(`\n${failed ? `${failed}/${cases.length} CASES FAILED` : `all ${cases.length} cases PASS`}`);
+process.exit(failed ? 1 : 0);
