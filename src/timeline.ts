@@ -179,6 +179,8 @@ interface Plan {
   /** site ids in founding order */
   order: string[];
   bridgeDone: { t: number; bridgeId: string; siteId: string | null }[];
+  /** roads that had to be cut through standing forest, worth a ledger line */
+  roadCuts: { t: number; roadId: string; kind: string; siteId: string | null; n: number }[];
   lastBuildT: number;
 }
 
@@ -203,9 +205,18 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
   const ev: GenesisEvent[] = [];
   const runs = new Map<string, SiteRun>();
   const order: string[] = [];
-  const bridgeDone: { t: number; bridgeId: string; siteId: string | null }[] = [];
+  const bridgeDone: Plan['bridgeDone'] = [];
+  const roadCuts: Plan['roadCuts'] = [];
   const treeIds = new Set(map.trees.map((t) => t.id));
+  /** claimed — nobody fells a tree twice */
   const felled = new Set<string>();
+  /** when each felled tree actually came down */
+  const felledAt = new Map<string, number>();
+  /** Trees standing on a planned route. Road crews get first refusal on these:
+   * a tree left standing on finished road surface looks broken, whereas one
+   * left a moment too long on a surveyed plot merely looks like a Tuesday. */
+  const roadClaimed = new Set<string>();
+  for (const r of map.roads) for (const c of r.clears ?? []) roadClaimed.add(c.tree);
   let lastBuildT = 0;
 
   const bridgesByRoad = new Map<string, BridgeSpec[]>();
@@ -224,7 +235,10 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     let pop = founding ? 2 : 0;
     let settlers = 0;
     const crew: number[] = [startT];
-    const axes: number[] = [startT, startT];
+    // plots can carry a dozen trees now, so put more axes on the biggest one —
+    // otherwise clearing swallows the whole day
+    const biggest = list.reduce((n, b) => Math.max(n, b.clears.length), 0);
+    const axes: number[] = new Array(clamp(2 + Math.floor(biggest / 4), 2, 4)).fill(startT);
     const finishes: { b: BuildingSpec; t: number }[] = [];
 
     if (!founding) {
@@ -259,15 +273,26 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
       for (let k = 1; k < crew.length; k++) if (crew[k] < crew[ci]) ci = k;
       const t0 = crew[ci];
 
-      // clear the plot — up to two axes swinging at once per site
+      // clear the plot — two to four axes swinging at once per site
       let cleared = t0;
       for (const treeId of b.clears) {
-        if (!treeIds.has(treeId) || felled.has(treeId)) continue;
+        if (!treeIds.has(treeId)) continue;
+        const down = felledAt.get(treeId);
+        if (down !== undefined) {
+          // somebody already took it — the plot is not clear until they did
+          if (down > cleared) cleared = down;
+          continue;
+        }
+        if (felled.has(treeId)) continue;
+        // a tree the road is going to have to take down anyway: leave it
+        if (roadClaimed.has(treeId)) continue;
         felled.add(treeId);
-        const k = axes[0] <= axes[1] ? 0 : 1;
+        let k = 0;
+        for (let j = 1; j < axes.length; j++) if (axes[j] < axes[k]) k = j;
         const cs = Math.max(axes[k], t0);
         const cd = cs + range(10, 25) * MIN * dm;
         axes[k] = cd;
+        felledAt.set(treeId, cd);
         ev.push({ t: cs, type: 'chop-start', treeId });
         ev.push({ t: cd, type: 'chop-done', treeId });
         if (cd > cleared) cleared = cd;
@@ -326,6 +351,13 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     let dur = clamp(24 + total * 2.0, 30, 90) * MIN * dm;
     if (budget !== undefined) dur = Math.min(dur, Math.max(0.25, budget));
 
+    // trees standing on the route, in the order the head will meet them
+    const cut = (road.clears ?? [])
+      .filter((c) => treeIds.has(c.tree) && !felled.has(c.tree))
+      .map((c) => ({ tree: c.tree, frac: clamp(c.frac, 0, 1) }))
+      .sort((a, b) => a.frac - b.frac);
+    for (const c of cut) felled.add(c.tree);
+
     const brs = (bridgesByRoad.get(road.id) ?? [])
       .map((b) => ({ spec: b, gate: clamp(nearestFrac(road.pts, b.gx, b.gy), 0.06, 0.9) }))
       .sort((a, b) => a.gate - b.gate);
@@ -357,11 +389,24 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     else if (last.frac < 1) items.push({ frac: 1, br: null });
     else last.frac = 1;
 
-    let acc = 0; // hours lost to bridge work so far
+    // Walk the construction head. Each stop records when the head arrived, so
+    // that the felling pass below can work backwards from it. Dense stretches
+    // cost extra: cutting a line through wood is slower than laying stone.
+    const bounds: { f: number; t: number }[] = [{ f: 0, t: startT }];
+    let t = startT;
+    let prevF = 0;
+    let ci = 0;
     let endT = startT;
     for (const it of items) {
-      const t = startT + it.frac * dur + acc;
+      let slog = 0;
+      while (ci < cut.length && cut[ci].frac <= it.frac) {
+        slog += range(4, 10) * MIN * dm;
+        ci++;
+      }
+      t += (it.frac - prevF) * dur + slog;
       ev.push({ t, type: 'road', roadId: road.id, frac: it.frac });
+      bounds.push({ f: it.frac, t });
+      prevF = it.frac;
       endT = t;
       if (it.br) {
         // the road stops dead at the water until the crossing is finished
@@ -370,16 +415,62 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
         ev.push({ t: t + pause * 0.62, type: 'bridge', bridgeId: it.br.id, stage: 2 });
         ev.push({ t: t + pause, type: 'bridge', bridgeId: it.br.id, stage: 3 });
         bridgeDone.push({ t: t + pause, bridgeId: it.br.id, siteId });
-        acc += pause + range(2, 9) * MIN * gm;
         endT = t + pause;
+        t = endT + range(2, 9) * MIN * gm;
       }
     }
+
+    /* the axe gang, working just ahead of the head ------------------------- */
+    if (cut.length) {
+      /** when the head reaches `f` — never later than the road event that
+       * carries the road past it, which is what makes the invariant hold */
+      const headAt = (f: number): number => {
+        if (f <= bounds[0].f) return bounds[0].t;
+        for (let i = 1; i < bounds.length; i++) {
+          if (f <= bounds[i].f) {
+            const a = bounds[i - 1];
+            const b = bounds[i];
+            const span = b.f - a.f;
+            return span > 0 ? a.t + ((f - a.f) / span) * (b.t - a.t) : b.t;
+          }
+        }
+        return bounds[bounds.length - 1].t;
+      };
+
+      // three axes in flight per road crew
+      const gang = [-Infinity, -Infinity, -Infinity];
+      let firstCut = Infinity;
+      for (const c of cut) {
+        const lead = range(0.03, 0.05);
+        const d = range(10, 25) * MIN * dm;
+        // it MUST be down before the head gets there
+        const deadline = headAt(c.frac) - 0.5 * MIN;
+        let k = 0;
+        for (let j = 1; j < gang.length; j++) if (gang[j] < gang[k]) k = j;
+        let cs = Math.max(0.02, gang[k], Math.min(headAt(Math.max(0, c.frac - lead)), deadline - d));
+        let cd = Math.min(cs + d, deadline);
+        if (!(cd > cs)) {
+          // crews saturated right up against the deadline: they hurry
+          cd = deadline;
+          cs = Math.max(0.01, deadline - 0.4 * MIN);
+        }
+        gang[k] = cd;
+        felledAt.set(c.tree, cd);
+        ev.push({ t: cs, type: 'chop-start', treeId: c.tree });
+        ev.push({ t: cd, type: 'chop-done', treeId: c.tree });
+        if (cs < firstCut) firstCut = cs;
+      }
+      if (cut.length >= 4) {
+        roadCuts.push({ t: firstCut, roadId: road.id, kind: road.kind, siteId, n: cut.length });
+      }
+    }
+
     return endT;
   }
 
   /* ------------------------------ the day itself -------------------------- */
 
-  if (!map.sites.length) return { events: ev, runs, order, bridgeDone, lastBuildT };
+  if (!map.sites.length) return { events: ev, runs, order, bridgeDone, roadCuts, lastBuildT };
 
   const r0 = scheduleSite(map.sites[0], 0.05, true);
 
@@ -444,7 +535,7 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     bridgeDone.push({ t: t + 26 * MIN, bridgeId: br.id, siteId: null });
   }
 
-  return { events: ev, runs, order, bridgeDone, lastBuildT };
+  return { events: ev, runs, order, bridgeDone, roadCuts, lastBuildT };
 }
 
 /** uniform time correction — preserves ordering and every monotonic chain */
@@ -458,6 +549,7 @@ function scalePlan(pl: Plan, s: number): void {
     for (const f of run.finishes) f.t *= s;
   }
   for (const b of pl.bridgeDone) b.t *= s;
+  for (const c of pl.roadCuts) c.t *= s;
   pl.lastBuildT *= s;
 }
 
@@ -492,6 +584,13 @@ const BRIDGE_LOG = [
   'Bridge finished. Somebody jumps on it, twice, to be sure.',
   'Pilings, deck, rails — and the river stops being an argument.',
   'The bridge holds. The road remembers where it was going.',
+];
+
+const ROAD_CUT_LOG = [
+  'Axes go out ahead of the {kind}: they are cutting a line through the wood toward {town}.',
+  'The {kind} to {town} runs into the trees. Progress is measured in stumps.',
+  '{n} trees have to come down before the {kind} can get any nearer {town}.',
+  'The wood between here and {town} does not want a {kind} through it. It is getting one.',
 ];
 
 const LANDMARK_LOG = [
@@ -529,6 +628,7 @@ const POOL_MORNING = [
   'Nails counted twice at {town}. The two counts disagree.',
   'Bees found in a hollow oak. The oak is spared.',
   'A heron on the river watches the pilings go in, unimpressed.',
+  'Sawyers follow the road crew, squaring up what the axes put down.',
 ];
 
 const POOL_MIDDAY = [
@@ -538,6 +638,7 @@ const POOL_MIDDAY = [
   'Rooks move into the tallest tree the axes missed.',
   'Rain crosses {valley} sideways and is gone in ten minutes.',
   'Two riders pass through {town} without stopping. This is noted.',
+  'The smell of cut pine carries all the way back to {town}.',
 ];
 
 const POOL_EVENING = [
@@ -658,6 +759,21 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
     key.push(line);
   }
 
+  for (const c of pl.roadCuts) {
+    const run = c.siteId ? pl.runs.get(c.siteId) : undefined;
+    const line: Line = {
+      t: c.t,
+      text: fill(draw(ROAD_CUT_LOG), {
+        kind: c.kind,
+        n: c.n,
+        town: run ? run.site.name : valley,
+        valley,
+      }),
+    };
+    if (c.siteId) line.siteId = c.siteId;
+    key.push(line);
+  }
+
   for (const sid of pl.order) {
     const run = pl.runs.get(sid)!;
     for (const f of run.finishes) {
@@ -686,7 +802,7 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
 
   // keep the ledger readable on very large maps: thin landmark lines first
   let keptLandmarks = landmarks;
-  const room = 40 - key.length;
+  const room = 33 - key.length;
   if (landmarks.length > Math.max(2, room)) {
     const stride = Math.ceil(landmarks.length / Math.max(2, room));
     keptLandmarks = landmarks.filter((_, i) => i % stride === 0);

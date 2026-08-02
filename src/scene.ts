@@ -10,10 +10,26 @@
  *
  *   baked once per map   ground tiles (biome tint + jitter) and the river —
  *                        the only two things that never change during a day.
+ *   baked, patched       the standing wood: every tree still on its feet plus
+ *                        the wild scatter, on a second transparent layer the
+ *                        size of the terrain bake. A day fells a couple of
+ *                        hundred trees out of two thousand, so this layer is
+ *                        *patched* — the handful of sprite rectangles that
+ *                        changed are cleared and their neighbourhood redrawn —
+ *                        rather than rebuilt. Dynamic entities that walk in
+ *                        front of it get the Vale's occlusion repair: the few
+ *                        baked sprites standing in front of a mover are drawn
+ *                        again, in the moving pass, at exactly the pixel the
+ *                        bake put them.
  *   rebuilt every frame  roads clipped to their built fraction, bridges by
- *                        stage, and one depth-sorted sprite pass over trees,
- *                        stumps, scatter, site dressing and buildings at their
- *                        current progress.
+ *                        stage, and one depth-sorted sprite pass over the trees
+ *                        that are *changing* (under the axe, or already stumps),
+ *                        site dressing and buildings at their current progress.
+ *
+ * Over the top of the finished frame goes the sky: one multiply fill that takes
+ * the valley from noon through gold, dusk, indigo and near-black, and back up
+ * through a grey-blue pre-dawn. Lamps and lit windows get additive halos once
+ * it is dark enough to want them.
  *
  * Sprites are still cached hard: scenery comes out of small pools, and each
  * building keeps one baked canvas keyed by `id:progress`, rebuilt only when the
@@ -184,12 +200,42 @@ interface RoadGeo {
   len: number;
 }
 
+/** One sprite that lives on the standing-wood layer. */
+interface VegItem {
+  sprite: Sprite;
+  depth: number;
+  bx: number;
+  by: number;
+  bw: number;
+  bh: number;
+  /** Set for trees; undefined for wild scatter, which never changes state. */
+  treeId?: string;
+}
+
+export interface VegLayer {
+  c: HTMLCanvasElement;
+  ctx: Ctx;
+  items: VegItem[];
+  /** Item indexes by 96px cell, for occlusion repair and for patching. */
+  grid: Map<number, number[]>;
+  /** Parallel to `items`: is this sprite currently painted on the layer? */
+  on: boolean[];
+  /** `snap.trees.size` the layer was last reconciled against; -1 = never. */
+  size: number;
+}
+
+/** The cell size of the vegetation index, in world pixels. */
+const VCELL = 96;
+const vkey = (cx: number, cy: number) => cx * 4096 + cy;
+
 export interface GenesisScene {
   map: GenesisMap;
   /** Baked terrain + river, and where its top-left sits in world pixels. */
   layer: HTMLCanvasElement;
   lx: number;
   ly: number;
+  /** Standing trees + wild scatter, same size and origin as `layer`. */
+  veg: VegLayer;
   surround: HTMLCanvasElement;
   frame: HTMLCanvasElement;
   pools: Record<string, Sprite[]>;
@@ -203,6 +249,12 @@ export interface GenesisScene {
   y0: number;
   x1: number;
   y1: number;
+  /** Soft warm halo, baked on first nightfall. */
+  glow: HTMLCanvasElement | null;
+  /** Are windows lit? Flipped by the sky curve; part of the structure cache key. */
+  lit: boolean;
+  /** How many structures may be re-baked for a lit/unlit flip this frame. */
+  relight: number;
 }
 
 export interface GView {
@@ -429,11 +481,12 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
   const siteProps = new Map<string, { p: PropSpec; accent: string }>();
   for (const s of map.sites) for (const p of s.props) siteProps.set(p.id, { p, accent: s.accent });
 
-  return {
+  const scene: GenesisScene = {
     map,
     layer,
     lx,
     ly,
+    veg: null as unknown as VegLayer,
     surround: buildForestPattern(),
     frame: document.createElement('canvas'),
     pools: makePools(),
@@ -446,7 +499,154 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
     y0,
     x1,
     y1,
+    glow: null,
+    lit: false,
+    relight: 0,
   };
+  scene.veg = buildVeg(scene, W, H);
+  return scene;
+}
+
+/* --------------------------- the standing wood --------------------------- */
+
+/**
+ * Every tree (drawn as if standing) and every wild prop, sorted into one
+ * depth-ordered list, indexed by cell, and painted onto a transparent layer that
+ * sits exactly on top of the terrain bake. Whether an entry is actually painted
+ * is tracked in `on`, so a chopped tree can be lifted off with a small patch.
+ */
+function buildVeg(scene: GenesisScene, W: number, H: number): VegLayer {
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.translate(-scene.lx, -scene.ly);
+
+  const items: VegItem[] = [];
+  const add = (sprite: Sprite, gx: number, gy: number, treeId?: string) => {
+    const x = isoX(gx, gy);
+    const y = isoY(gx, gy);
+    items.push({
+      sprite,
+      depth: y,
+      bx: x - sprite.ox,
+      by: y - sprite.oy,
+      bw: sprite.c.width,
+      bh: sprite.c.height,
+      treeId,
+    });
+  };
+
+  for (const tr of scene.map.trees) {
+    const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
+    add(p[Math.abs(tr.seed) % p.length], tr.gx, tr.gy, tr.id);
+  }
+  for (const p of scene.map.scatter) {
+    const sp = propSprite(scene, p.kind, p.seed, '#63c9a8');
+    if (sp) add(sp, p.gx, p.gy);
+  }
+
+  items.sort((a, b) => a.depth - b.depth || a.bx - b.bx);
+
+  const grid = new Map<number, number[]>();
+  items.forEach((it, i) => {
+    const cx0 = Math.floor(it.bx / VCELL);
+    const cx1 = Math.floor((it.bx + it.bw) / VCELL);
+    const cy0 = Math.floor(it.by / VCELL);
+    const cy1 = Math.floor((it.by + it.bh) / VCELL);
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const k = vkey(cx, cy);
+        const arr = grid.get(k);
+        if (arr) arr.push(i);
+        else grid.set(k, [i]);
+      }
+    }
+  });
+
+  const veg: VegLayer = {
+    c,
+    ctx,
+    items,
+    grid,
+    on: items.map(() => true),
+    size: -1,
+  };
+  bakeVeg(scene, veg);
+  return veg;
+}
+
+/** Always at the same rounded pixel, so a repair copy lands on the bake. */
+function paintVeg(c: Ctx, it: VegItem): void {
+  c.drawImage(it.sprite.c, Math.round(it.bx), Math.round(it.by));
+}
+
+function bakeVeg(scene: GenesisScene, veg: VegLayer): void {
+  veg.ctx.clearRect(scene.lx, scene.ly, veg.c.width, veg.c.height);
+  // `items` is already in depth order, so array order is paint order.
+  for (let i = 0; i < veg.items.length; i++) if (veg.on[i]) paintVeg(veg.ctx, veg.items[i]);
+}
+
+/** Repaint one sprite-sized window of the layer from scratch. */
+function patchVeg(veg: VegLayer, r: VegItem): void {
+  const { ctx } = veg;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(r.bx, r.by, r.bw, r.bh);
+  ctx.clip();
+  ctx.clearRect(r.bx, r.by, r.bw, r.bh);
+  const seen = new Set<number>();
+  const hits: number[] = [];
+  const cx0 = Math.floor(r.bx / VCELL);
+  const cx1 = Math.floor((r.bx + r.bw) / VCELL);
+  const cy0 = Math.floor(r.by / VCELL);
+  const cy1 = Math.floor((r.by + r.bh) / VCELL);
+  for (let cy = cy0; cy <= cy1; cy++) {
+    for (let cx = cx0; cx <= cx1; cx++) {
+      const arr = veg.grid.get(vkey(cx, cy));
+      if (!arr) continue;
+      for (const idx of arr) {
+        if (!veg.on[idx] || seen.has(idx)) continue;
+        const s = veg.items[idx];
+        if (s.bx > r.bx + r.bw || s.bx + s.bw < r.bx) continue;
+        if (s.by > r.by + r.bh || s.by + s.bh < r.by) continue;
+        seen.add(idx);
+        hits.push(idx);
+      }
+    }
+  }
+  // Item indexes ascend with depth, so a numeric sort is a depth sort.
+  hits.sort((a, b) => a - b);
+  for (const idx of hits) paintVeg(ctx, veg.items[idx]);
+  ctx.restore();
+}
+
+/**
+ * Reconcile the standing-wood layer with the snapshot. A tree only leaves the
+ * layer when the timeline puts it under the axe, so the entry count of
+ * `snap.trees` is a complete fingerprint: the felled set is always a prefix of
+ * the chop-start events, forwards or backwards.
+ */
+export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
+  const veg = scene.veg;
+  if (veg.size === snap.trees.size) return;
+  veg.size = snap.trees.size;
+
+  const changed: number[] = [];
+  for (let i = 0; i < veg.items.length; i++) {
+    const id = veg.items[i].treeId;
+    if (id === undefined) continue;
+    const want = (snap.trees.get(id) ?? 'standing') === 'standing';
+    if (want !== veg.on[i]) changed.push(i);
+  }
+  if (!changed.length) return;
+
+  for (const i of changed) veg.on[i] = !veg.on[i];
+  // A scrub can move hundreds of trees at once; past a few dozen patches a
+  // straight re-bake of the whole layer is the cheaper of the two.
+  if (changed.length > 40) bakeVeg(scene, veg);
+  else for (const i of changed) patchVeg(veg, veg.items[i]);
 }
 
 function hexRGB(hex: string): [number, number, number] {
@@ -461,7 +661,12 @@ function rgbHex(rgb: [number, number, number]): string {
 
 /* ------------------------------ sprite lookup ---------------------------- */
 
-function propSprite(scene: GenesisScene, kind: string, seed: number, accent: string): Sprite | null {
+function propSprite(
+  scene: GenesisScene,
+  kind: string,
+  seed: number,
+  accent: string
+): Sprite | null {
   switch (kind) {
     case 'nameboard':
       return cached(scene, `nb:${accent}`, () => buildNameBoard(accent));
@@ -488,9 +693,19 @@ function cached(scene: GenesisScene, key: string, make: () => Sprite): Sprite {
 }
 
 function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): StructureSprite {
-  const key = `${b.id}:${progress.toFixed(2)}`;
+  // Only a finished house lights its windows, and only after dark.
+  const lit = scene.lit && progress >= 0.999;
+  const stem = `${b.id}:${progress.toFixed(2)}`;
+  const key = `${stem}:${lit ? 1 : 0}`;
   const hit = scene.structs.get(b.id);
   if (hit && hit.key === key) return hit.sp;
+  if (hit && hit.key.startsWith(`${stem}:`)) {
+    // Nothing changed but the lights. Rebaking every house on the one frame
+    // dusk tips over would be a visible hitch, so the valley lights up over a
+    // few frames instead — which is roughly how a valley lights up anyway.
+    if (scene.relight <= 0) return hit.sp;
+    scene.relight--;
+  }
   const sp = buildStructure({
     role: b.role,
     accent: b.accent,
@@ -503,7 +718,7 @@ function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): Stru
     cupola: b.cupola,
     awning: b.awning,
     banner: b.banner,
-    lit: false,
+    lit,
     seed: b.seed,
   });
   // One entry per building: the old progress step is never coming back except
@@ -587,7 +802,14 @@ function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Ta
     for (const id of b.clears) {
       if (snap.trees.get(id) !== 'felling') continue;
       const tr = scene.treeById.get(id);
-      if (tr) out.push({ gx: tr.gx, gy: tr.gy, action: 'work', ygx: tr.gx, ygy: tr.gy });
+      if (tr)
+        out.push({
+          gx: tr.gx,
+          gy: tr.gy,
+          action: 'work',
+          ygx: tr.gx,
+          ygy: tr.gy,
+        });
     }
   }
   for (const b of site.buildings) {
@@ -837,11 +1059,114 @@ export function settleAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   for (let i = 0; i < 120; i++) stepAmbient(scene, amb, snap, 1 / 12);
 }
 
+/* ---------------------------------- sky ---------------------------------- */
+
+/**
+ * The light of the day, as one multiply colour and one strength.
+ *
+ * Multiply is the whole trick: it can only ever take light *away*, so a warm
+ * fill pulls the blue out of the afternoon and an indigo fill drops the valley
+ * into night, and in both cases the pixels underneath keep their edges. The
+ * curve is authored, not physical — the interesting hours are the ones the day
+ * changes in, so gold, dusk and the pre-dawn get most of the keyframes.
+ *
+ * The two ends meet: t=0 and t=24 are the same near-black, which is what lets a
+ * world roll over into the next one without a seam.
+ */
+const SKY: [t: number, r: number, g: number, b: number, a: number, lift: number][] = [
+  [0.0, 10, 11, 28, 0.96, 0.0], // midnight — the swap happens in here
+  [0.15, 13, 16, 48, 0.93, 0.02],
+  [0.55, 35, 48, 94, 0.86, 0.05],
+  [1.0, 53, 71, 111, 0.78, 0.07],
+  [2.0, 74, 95, 132, 0.62, 0.06], // pre-dawn: the founding house reads clearly
+  [3.5, 100, 118, 152, 0.55, 0.07],
+  [5.0, 140, 133, 155, 0.43, 0.08], // still the small hours, not yet morning
+  [6.0, 214, 163, 128, 0.27, 0.07],
+  [7.0, 255, 255, 255, 0.0, 0.0], // full daylight
+  [17.5, 255, 255, 255, 0.0, 0.0],
+  [18.3, 255, 197, 132, 0.34, 0.1], // golden
+  [19.3, 238, 158, 105, 0.44, 0.07],
+  [20.3, 140, 134, 196, 0.5, 0.03], // dusk
+  [21.5, 90, 95, 168, 0.58, 0.02],
+  [22.5, 58, 63, 134, 0.66, 0.0], // night
+  [23.2, 38, 45, 99, 0.74, 0.0],
+  [23.4, 23, 27, 69, 0.84, 0.0],
+  [23.7, 13, 16, 48, 0.93, 0.0], // near-black
+  [24.0, 10, 11, 28, 0.96, 0.0],
+];
+
+export interface Sky {
+  css: string;
+  /** Strength of the multiply fill, 0 at noon. */
+  a: number;
+  /** Strength of the additive horizon wash. */
+  lift: number;
+  /** 0 = broad daylight, 1 = lamps fully earning their keep. */
+  night: number;
+  /** Halo strength. Night, but pinched shut across midnight so a world can be
+   * swapped for the next one without forty lamps popping out of existence. */
+  lamps: number;
+}
+
+export function skyAt(t: number): Sky {
+  const h = t <= 0 ? 0 : t >= 24 ? 24 : t;
+  let i = 1;
+  while (i < SKY.length - 1 && SKY[i][0] < h) i++;
+  const a = SKY[i - 1];
+  const b = SKY[i];
+  const span = b[0] - a[0] || 1;
+  let f = (h - a[0]) / span;
+  f = f * f * (3 - 2 * f); // smoothstep: no visible kink at a keyframe
+  const mix4 = (k: number) => a[k] + (b[k] - a[k]) * f;
+  const alpha = mix4(4);
+  const night = Math.max(0, Math.min(1, (alpha - 0.16) / 0.42));
+  // Last lamp out just before midnight; first hearth lit a few minutes after.
+  const gate = h > 23.9 ? Math.max(0, (24 - h) / 0.1) : h < 0.25 ? Math.min(1, h / 0.25) : 1;
+  return {
+    css: `rgb(${Math.round(mix4(1))},${Math.round(mix4(2))},${Math.round(mix4(3))})`,
+    a: alpha,
+    lift: mix4(5),
+    night,
+    lamps: night * gate,
+  };
+}
+
+/** A soft round halo, baked once, tinted by whoever draws it. */
+function glowSprite(scene: GenesisScene): HTMLCanvasElement {
+  if (scene.glow) return scene.glow;
+  const R = 48;
+  const c = document.createElement('canvas');
+  c.width = R * 2;
+  c.height = R * 2;
+  const g = c.getContext('2d')!;
+  const grad = g.createRadialGradient(R, R, 0, R, R, R);
+  grad.addColorStop(0, 'rgba(255,226,160,1)');
+  grad.addColorStop(0.35, 'rgba(255,196,110,0.42)');
+  grad.addColorStop(0.72, 'rgba(255,170,90,0.10)');
+  grad.addColorStop(1, 'rgba(255,160,80,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, R * 2, R * 2);
+  scene.glow = c;
+  return c;
+}
+
 /* -------------------------------- rendering ------------------------------ */
 
 interface Item {
   depth: number;
+  /** World-pixel footprint, used to find the baked sprites standing in front. */
+  bx: number;
+  by: number;
+  bw: number;
+  bh: number;
   draw: (c: Ctx) => void;
+}
+
+interface Halo {
+  x: number;
+  y: number;
+  r: number;
+  a: number;
 }
 
 export function renderGenesis(
@@ -863,6 +1188,11 @@ export function renderGenesis(
   const g = f.getContext('2d')!;
   g.setTransform(1, 0, 0, 1, 0, 0);
   g.imageSmoothingEnabled = false;
+
+  const sky = skyAt(snap.t);
+  scene.lit = sky.night > 0.5;
+  scene.relight = 4;
+  syncVeg(scene, snap);
 
   const cx = Math.round(view.cx);
   const cy = Math.round(view.cy);
@@ -925,11 +1255,15 @@ export function renderGenesis(
       const hx = isoX(head[0], head[1]);
       const hy = isoY(head[0], head[1]);
       rect(g, hx, hy - 12, 1, 12, PAL.woodLight);
-      poly(g, [
-        [hx + 1, hy - 12],
-        [hx + 8, hy - 9.5],
-        [hx + 1, hy - 7.5],
-      ], '#63c9a8');
+      poly(
+        g,
+        [
+          [hx + 1, hy - 12],
+          [hx + 8, hy - 9.5],
+          [hx + 1, hy - 7.5],
+        ],
+        '#63c9a8'
+      );
     }
   }
 
@@ -940,19 +1274,33 @@ export function renderGenesis(
     drawBridge(g, scene.map.river, br.gx, br.gy, br.span, stage);
   }
 
-  /* ---- one depth-sorted pass over everything that stands up ------------ */
+  /* ---- the standing wood, straight off its own layer -------------------- */
+  g.drawImage(scene.veg.c, scene.lx, scene.ly);
+
+  /* ---- one depth-sorted pass over everything that is changing ---------- */
   const items: Item[] = [];
+  const halos: Halo[] = [];
   const push = (sp: Sprite, gx: number, gy: number, dy = 0, dx = 0) => {
     const x = isoX(gx, gy);
     const y = isoY(gx, gy);
     if (!inView(x, y)) return;
     const bx = Math.round(x - sp.ox + dx);
     const by = Math.round(y - sp.oy + dy);
-    items.push({ depth: y, draw: (c) => c.drawImage(sp.c, bx, by) });
+    items.push({
+      depth: y,
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => c.drawImage(sp.c, bx, by),
+    });
   };
 
+  // Only the trees the day is actually touching. Everything still standing is
+  // already on the layer that was blitted a moment ago.
   for (const tr of scene.map.trees) {
-    const state = snap.trees.get(tr.id) ?? 'standing';
+    const state = snap.trees.get(tr.id);
+    if (state === undefined || state === 'standing') continue;
     if (state === 'stump') {
       const sp = scene.pools.stump[Math.abs(tr.seed) % scene.pools.stump.length];
       push(sp, tr.gx, tr.gy);
@@ -960,26 +1308,31 @@ export function renderGenesis(
     }
     const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
     const sp = p[Math.abs(tr.seed) % p.length];
-    if (state === 'felling') {
-      // A tree under the axe leans and shivers a couple of pixels — enough to
-      // spot from across the valley, cheap enough to be a whole-pixel offset.
-      const sway = Math.round(Math.sin(clock * 3.1 + tr.seed) * 2);
-      push(sp, tr.gx, tr.gy, 0, sway);
-    } else {
-      push(sp, tr.gx, tr.gy);
-    }
-  }
-
-  for (const p of scene.map.scatter) {
-    const sp = propSprite(scene, p.kind, p.seed, '#63c9a8');
-    if (sp) push(sp, p.gx, p.gy);
+    // A tree under the axe leans and shivers a couple of pixels — enough to
+    // spot from across the valley, cheap enough to be a whole-pixel offset.
+    const sway = Math.round(Math.sin(clock * 3.1 + tr.seed) * 2);
+    push(sp, tr.gx, tr.gy, 0, sway);
   }
 
   for (const site of scene.map.sites) {
     for (const p of site.props) {
       if (!snap.props.has(p.id)) continue;
       const sp = propSprite(scene, p.kind, p.seed, site.accent);
-      if (sp) push(sp, p.gx, p.gy);
+      if (!sp) continue;
+      push(sp, p.gx, p.gy);
+      if (sky.lamps > 0.02 && (p.kind === 'lamp' || p.kind === 'campfire')) {
+        const x = isoX(p.gx, p.gy);
+        const y = isoY(p.gx, p.gy);
+        if (inView(x, y)) {
+          const lamp = p.kind === 'lamp';
+          halos.push({
+            x,
+            y: y - (lamp ? 14 : 2),
+            r: lamp ? 26 : 30,
+            a: sky.lamps * (lamp ? 0.72 : 0.85),
+          });
+        }
+      }
     }
     for (const b of site.buildings) {
       const st = snap.buildings.get(b.id);
@@ -990,7 +1343,22 @@ export function renderGenesis(
       const sp = structFor(scene, b, st.progress);
       const bx = Math.round(x - sp.ox);
       const by = Math.round(y - sp.oy);
-      items.push({ depth: y, draw: (c) => c.drawImage(sp.c, bx, by) });
+      items.push({
+        depth: y,
+        bx,
+        by,
+        bw: sp.c.width,
+        bh: sp.c.height,
+        draw: (c) => c.drawImage(sp.c, bx, by),
+      });
+      if (sky.lamps > 0.02 && st.status === 'done') {
+        halos.push({
+          x,
+          y: y - sp.oy * 0.45,
+          r: 18 + b.w * 0.22,
+          a: sky.lamps * 0.4,
+        });
+      }
     }
   }
 
@@ -998,7 +1366,14 @@ export function renderGenesis(
     if (!inView(w.x, w.y)) continue;
     const wx = Math.round(w.x);
     const wy = Math.round(w.y);
-    items.push({ depth: w.y + 6, draw: (c) => drawWheel(c, wx, wy, clock) });
+    items.push({
+      depth: w.y + 6,
+      bx: wx - 9,
+      by: wy - 9,
+      bw: 18,
+      bh: 18,
+      draw: (c) => drawWheel(c, wx, wy, clock),
+    });
   }
 
   for (const bot of amb.bots) {
@@ -1010,6 +1385,10 @@ export function renderGenesis(
     const { color, faceRight, action, phase } = bot;
     items.push({
       depth: y + 1,
+      bx: px - 7,
+      by: py - 20,
+      bw: 15,
+      bh: 22,
       draw: (c) => {
         drawBot(c, px, py, color, faceRight, action, phase);
         if (action === 'work' && Math.sin(phase * 11) > 0.85) {
@@ -1030,19 +1409,111 @@ export function renderGenesis(
     const px = Math.round(x);
     const py = Math.round(y);
     const { color, faceRight, phase } = w;
-    items.push({ depth: y + 1, draw: (c) => drawBot(c, px, py, color, faceRight, 'walk', phase) });
+    items.push({
+      depth: y + 1,
+      bx: px - 7,
+      by: py - 20,
+      bw: 15,
+      bh: 22,
+      draw: (c) => drawBot(c, px, py, color, faceRight, 'walk', phase),
+    });
+  }
+
+  /* ---- occlusion repair ------------------------------------------------
+   * Everything above was drawn *after* the whole standing wood, so a mover
+   * that should be hidden behind a nearer trunk would walk over it. Redraw the
+   * few baked sprites that stand in front of a mover, at the exact pixel the
+   * bake used, so the patch is invisible. Below 1× the error is a pixel or two
+   * and the query is not worth its own cost. */
+  if (zoom >= 0.75) {
+    const veg = scene.veg;
+    const n0 = items.length;
+    const need = new Set<number>();
+    for (let e = 0; e < n0; e++) {
+      const it = items[e];
+      const cx0 = Math.floor(it.bx / VCELL);
+      const cx1 = Math.floor((it.bx + it.bw) / VCELL);
+      const cy0 = Math.floor(it.by / VCELL);
+      const cy1 = Math.floor((it.by + it.bh) / VCELL);
+      for (let gy = cy0; gy <= cy1 + 1; gy++) {
+        for (let gx = cx0; gx <= cx1; gx++) {
+          const arr = veg.grid.get(vkey(gx, gy));
+          if (!arr) continue;
+          for (const idx of arr) {
+            if (!veg.on[idx] || need.has(idx)) continue;
+            const s = veg.items[idx];
+            if (s.depth <= it.depth) continue;
+            if (s.bx > it.bx + it.bw || s.bx + s.bw < it.bx) continue;
+            if (s.by > it.by + it.bh || s.by + s.bh < it.by) continue;
+            need.add(idx);
+          }
+        }
+      }
+    }
+    need.forEach((idx) => {
+      const s = veg.items[idx];
+      items.push({
+        depth: s.depth,
+        bx: s.bx,
+        by: s.by,
+        bw: s.bw,
+        bh: s.bh,
+        draw: (c) => paintVeg(c, s),
+      });
+    });
   }
 
   items.sort((a, b) => a.depth - b.depth);
   for (const it of items) it.draw(g);
 
-  drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1);
+  drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1, sky.night);
 
   /* ---- blit the world buffer to the viewport --------------------------- */
   g.setTransform(1, 0, 0, 1, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, vw, vh);
   ctx.drawImage(f, 0, 0, bw, bh, 0, 0, bw * zoom, bh * zoom);
+
+  /* ---- the sky, over the finished frame -------------------------------- */
+  // Deliberately *not* in the world buffer: this is one screen-sized fill
+  // rather than one world-sized one, and the crisp pixels underneath are
+  // already blitted and safe.
+  if (sky.a > 0.002) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.globalAlpha = sky.a;
+    ctx.fillStyle = sky.css;
+    ctx.fillRect(0, 0, vw, vh);
+    ctx.restore();
+  }
+  if (sky.lift > 0.004) {
+    // A wash of low sun (or the first grey of the morning) off the horizon.
+    const cool = snap.t < 12;
+    const grad = ctx.createLinearGradient(0, 0, 0, vh);
+    grad.addColorStop(0, cool ? 'rgba(126,158,214,1)' : 'rgba(255,180,99,1)');
+    grad.addColorStop(1, cool ? 'rgba(126,158,214,0)' : 'rgba(255,180,99,0)');
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = sky.lift;
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, vw, vh);
+    ctx.restore();
+  }
+  if (halos.length && sky.lamps > 0.02) {
+    const sp = glowSprite(scene);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.imageSmoothingEnabled = true;
+    for (const h of halos) {
+      const sx = (h.x - cx) * zoom;
+      const sy = (h.y - cy) * zoom;
+      const r = h.r * zoom;
+      if (sx + r < 0 || sx - r > vw || sy + r < 0 || sy - r > vh) continue;
+      ctx.globalAlpha = h.a;
+      ctx.drawImage(sp, sx - r, sy - r, r * 2, r * 2);
+    }
+    ctx.restore();
+  }
 }
 
 function drawBridge(
@@ -1086,7 +1557,11 @@ function drawBridge(
   }
 
   if (stage >= 2) {
-    poly(ctx, [corner(-half, -depth), corner(half, -depth), corner(half, depth), corner(-half, depth)], PAL.woodDark);
+    poly(
+      ctx,
+      [corner(-half, -depth), corner(half, -depth), corner(half, depth), corner(-half, depth)],
+      PAL.woodDark
+    );
     poly(
       ctx,
       [
@@ -1115,12 +1590,16 @@ function drawBridge(
     for (const side of [-1, 1]) {
       const a = corner(-half, side * depth);
       const b = corner(half, side * depth);
-      poly(ctx, [
-        [a[0], a[1] - 5],
-        [b[0], b[1] - 5],
-        [b[0], b[1] - 3.5],
-        [a[0], a[1] - 3.5],
-      ], PAL.woodLight);
+      poly(
+        ctx,
+        [
+          [a[0], a[1] - 5],
+          [b[0], b[1] - 5],
+          [b[0], b[1] - 3.5],
+          [a[0], a[1] - 3.5],
+        ],
+        PAL.woodLight
+      );
       for (let k = -half; k <= half; k += 1.6) {
         const p = corner(k, side * depth);
         rect(ctx, p[0], p[1] - 5, 1, 5, PAL.woodDark);
@@ -1135,15 +1614,19 @@ function drawSmoke(
   wx0: number,
   wy0: number,
   wx1: number,
-  wy1: number
+  wy1: number,
+  night = 0
 ): void {
+  // Smoke is the one thing the multiply pass cannot dim convincingly — white
+  // over a dark valley still reads as white — so it thins out after dark.
+  const dim = 0.8 * (1 - night * 0.72);
   for (const p of smoke) {
     const a = p.age;
     const r = 2 + a * 2.2;
     const px = Math.round(p.x + Math.sin(a * 1.7 + p.drift) * 3 + a * 2.2);
     const py = Math.round(p.y - a * 9);
     if (px + r < wx0 || px - r > wx1 || py + r < wy0 || py - r > wy1) continue;
-    ctx.globalAlpha = Math.max(0, 1 - a / 3.6) * 0.8;
+    ctx.globalAlpha = Math.max(0, 1 - a / 3.6) * dim;
     ctx.fillStyle = a < 1 ? '#ffffff' : a < 2.4 ? '#f1ece2' : '#e4e0da';
     const ri = Math.round(r);
     for (let k = -ri; k <= ri; k++) {

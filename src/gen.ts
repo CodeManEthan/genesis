@@ -703,6 +703,53 @@ function bridgeRoad(pts: Pt[], river: Pt[]): Pt[] {
   return line;
 }
 
+/**
+ * Carry a road from the town rim on into the green.
+ *
+ * A road that stops at the rim reads as a dead end; carried through, a town
+ * with two connections gets one continuous street. The extension is a
+ * quadratic Bezier that leaves the rim along the road's own heading and bends
+ * onto the radial, so it joins without a kink, and it stops `stopR` short of
+ * the exact centre so the founding house or the landmark is never paved over.
+ */
+function extendIntoTown(line: Pt[], centre: Pt, stopR: number, atStart: boolean): Pt[] {
+  const n = line.length;
+  if (n < 2) return line;
+  const tip = atStart ? line[0] : line[n - 1];
+  const nb = atStart ? line[1] : line[n - 2];
+  const tx = tip[0] - nb[0];
+  const ty = tip[1] - nb[1];
+  const tl = Math.hypot(tx, ty) || 1;
+  const heading: Pt = [tx / tl, ty / tl]; // continues on into the town
+
+  const rx = tip[0] - centre[0];
+  const ry = tip[1] - centre[1];
+  const rl = Math.hypot(rx, ry) || 1;
+  const stop: Pt = [centre[0] + (rx / rl) * stopR, centre[1] + (ry / rl) * stopR];
+
+  const span = dist(tip, stop);
+  if (span < 0.8) return line;
+  const ctrl: Pt = [tip[0] + heading[0] * span * 0.45, tip[1] + heading[1] * span * 0.45];
+
+  const steps = Math.max(2, Math.round(span / 1.4));
+  const ext: Pt[] = [];
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const m = 1 - t;
+    let p: Pt = [
+      m * m * tip[0] + 2 * m * t * ctrl[0] + t * t * stop[0],
+      m * m * tip[1] + 2 * m * t * ctrl[1] + t * t * stop[1],
+    ];
+    // The control point can nose the arc inside the keep-out; push it back out.
+    const d = dist(p, centre);
+    if (d < stopR) {
+      p = [centre[0] + ((p[0] - centre[0]) / (d || 1)) * stopR, centre[1] + ((p[1] - centre[1]) / (d || 1)) * stopR];
+    }
+    ext.push(p);
+  }
+  return atStart ? [...ext.reverse(), ...line] : [...line, ...ext];
+}
+
 /* ========================================================================== */
 /*  the generator                                                             */
 /* ========================================================================== */
@@ -996,6 +1043,12 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     line[line.length - 1] = goal;
 
     line = densify(bridgeRoad(line, river), 3.0, 0.4);
+    // Through-roads. s0 keeps a wider berth because its founding house sits on
+    // the exact centre; elsewhere the green is empty and the street can run
+    // right in. Bridges and arclength fracs are both derived below, from the
+    // final polyline, so the extra length is accounted for automatically.
+    line = extendIntoTown(line, pa, a === 0 ? 2.1 : 1.4, true);
+    line = extendIntoTown(line, pb, b === 0 ? 2.1 : 1.4, false);
 
     const kind: RoadSpec['kind'] = a === 0 || b === 0 ? 'highway' : depth[b] <= 2 ? 'lane' : 'track';
     const width = kind === 'highway' ? 0.62 : kind === 'lane' ? 0.5 : 0.4;
@@ -1122,7 +1175,7 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
       { maxR: 1.02, gap: 0.8, road: 1.2, river: 1.6 },
       { maxR: 1.14, gap: 0.7, road: 1.0, river: 1.6 },
       { maxR: 1.3, gap: 0.5, road: 0.8, river: 1.3 },
-      { maxR: 1.7, gap: 0.3, road: 0.0, river: 1.0 },
+      { maxR: 1.7, gap: 0.3, road: 0.4, river: 1.0 },
     ];
 
     const place = (i: number, r: number): Pt => {
@@ -1143,20 +1196,30 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
           return p;
         }
       }
-      // Desperation: anywhere at all that does not sit on another roof. Two
-      // sweeps, so a plot only ends up straddling a road if the green has
-      // genuinely run out of room.
+      // Desperation: a fine spiral, anywhere that does not sit on another
+      // roof. Now that streets run right through the green this gets used at
+      // high scales, so the last sweep does not just take the first hit — it
+      // takes the spot furthest from any road, which is what keeps a roof off
+      // the carriageway when the town is genuinely full.
+      let fallback: Pt | null = null;
+      let fallbackClear = -Infinity;
       for (let sweep = 0; sweep < 2; sweep++) {
-        for (let t = 0; t < 600; t++) {
-          const rr = site.r * 0.4 + t * 0.02;
-          const a = i * GOLDEN + t * 0.401;
+        const need = sweep === 0 ? r + 0.35 : r + 0.02;
+        for (let t = 0; t < 900; t++) {
+          const rr = site.r * 0.4 + t * 0.014;
+          const a = i * GOLDEN + t * 0.2749;
           const p: Pt = [site.u + Math.cos(a) * rr, site.v + Math.sin(a) * rr];
           if (!clearOfBuildings(p, r, 0.15)) continue;
-          if (sweep === 0 && roadLines.some((l) => polyDist(p, l) < r + 0.3)) continue;
-          return p;
+          let road = Infinity;
+          for (const l of roadLines) road = Math.min(road, polyDist(p, l));
+          if (road >= need) return p;
+          if (road > fallbackClear) {
+            fallbackClear = road;
+            fallback = p;
+          }
         }
       }
-      return [site.u, site.v];
+      return fallback ?? [site.u, site.v];
     };
 
     for (let i = 0; i < maxCount; i++) {
@@ -1214,12 +1277,26 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
   const allBuildings = siteBuildings.flat();
 
   /* ---- trees ------------------------------------------------------------ */
+  // Real woodland. The day's story is crews cutting their way through it, so
+  // the wood has to be thick enough that a road or a plot is genuinely carved
+  // out of something. Density is concentrated where the work happens — inside
+  // the town clearings and down the road corridors — while meadow stays open,
+  // so the map keeps its contrast instead of turning into one green mat.
   const TREE_DENSITY: Record<Biome, number> = {
-    forest: 0.135,
-    meadow: 0.05,
-    farm: 0.035,
-    wetland: 0.052,
+    forest: 0.27,
+    meadow: 0.07,
+    farm: 0.095,
+    wetland: 0.12,
   };
+  /** Extra trees packed into the town clearings, per unit area. */
+  const GROVE_DENSITY = 0.36;
+  /** Extra trees down the planned road corridors, and how wide they lie. */
+  const CORRIDOR_DENSITY = 0.24;
+  const CORRIDOR_HALF = 3;
+  /** No two trunks closer than this. */
+  const TREE_GAP = 0.62;
+  /** Trees a single plot may require felled before it can be surveyed. */
+  const PLOT_CLEAR_CAP = 11;
   const TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
     forest: [['oak', 0.36], ['pine', 0.36], ['hedgerow', 0.16], ['blossom', 0.12]],
     meadow: [['oak', 0.46], ['blossom', 0.22], ['hedgerow', 0.24], ['pine', 0.08]],
@@ -1231,10 +1308,24 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
   const treeUV: Pt[] = [];
   let treeId = 0;
 
-  const treeClear = (p: Pt): boolean => {
-    if (polyDist(p, river) < 1.5) return false;
-    for (const line of roadLines) {
-      if (polyDist(p, line) < 1.2) return false;
+  // Trees may now stand ON a planned road — the crews fell them as they build
+  // (see the road `clears` pass below). Only the water still pushes them back.
+  const treeClear = (p: Pt): boolean => polyDist(p, river) >= 1.5;
+
+  // Spacing test over a 1-unit hash grid, so thickening the wood stays linear.
+  const cells = new Map<number, number[]>();
+  const cellKey = (u: number, v: number) => (Math.floor(u) + 512) * 4096 + (Math.floor(v) + 512);
+  const spaced = (p: Pt): boolean => {
+    const cu = Math.floor(p[0]);
+    const cv = Math.floor(p[1]);
+    for (let du = -1; du <= 1; du++) {
+      for (let dv = -1; dv <= 1; dv++) {
+        const bucket = cells.get(cellKey(cu + du, cv + dv));
+        if (!bucket) continue;
+        for (const k of bucket) {
+          if (dist(treeUV[k], p) < TREE_GAP) return false;
+        }
+      }
     }
     return true;
   };
@@ -1248,8 +1339,13 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
   };
   const addTree = (p: Pt, kind: TreeKind, s: number) => {
     const [gx, gy] = uv(p[0], p[1]);
+    const k = trees.length;
     trees.push({ id: `tr${treeId++}`, kind, gx, gy, seed: s >>> 0 });
     treeUV.push(p);
+    const key = cellKey(p[0], p[1]);
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(k);
+    else cells.set(key, [k]);
   };
 
   for (const chunk of chunks) {
@@ -1264,7 +1360,7 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
         lerp(chunk.v0, chunk.v1, crng()),
       ];
       const kind = rollKind(crng(), table);
-      if (!treeClear(p)) continue;
+      if (!treeClear(p) || !spaced(p)) continue;
       addTree(p, kind, chunk.seed + t * 37);
       placed++;
     }
@@ -1275,22 +1371,35 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
   // nothing to fell.
   sites.forEach((site, si) => {
     const grng = mulberry32((seed + si * 3301 + 55) >>> 0);
-    const target = Math.round(Math.PI * site.r * site.r * 0.19);
+    const target = Math.round(Math.PI * site.r * site.r * GROVE_DENSITY);
     let placed = 0;
     for (let t = 0; t < target * 6 && placed < target; t++) {
       const a = grng() * Math.PI * 2;
       const rad = Math.sqrt(grng()) * site.r * 1.02;
       const p: Pt = [site.u + Math.cos(a) * rad, site.v + Math.sin(a) * rad];
-      if (!treeClear(p)) continue;
-      let tooClose = false;
-      for (const q of treeUV) {
-        if (Math.abs(q[0] - p[0]) < 1.1 && Math.abs(q[1] - p[1]) < 1.1 && dist(q, p) < 1.1) {
-          tooClose = true;
-          break;
-        }
-      }
-      if (tooClose) continue;
+      if (!treeClear(p) || !spaced(p)) continue;
       addTree(p, rollKind(grng(), TREE_KINDS.forest), seed + si * 271 + t * 29);
+      placed++;
+    }
+  });
+
+  // Road corridors. Routes are planned through standing wood, so the crews
+  // have something to cut on the way out — this is what puts a double-digit
+  // clears list on a long forest route.
+  roadLines.forEach((line, ri) => {
+    const rrng = mulberry32((seed + ri * 40009 + 131) >>> 0);
+    const cum = cumulative(line);
+    const total = cum[cum.length - 1];
+    const target = Math.round(total * CORRIDOR_HALF * 2 * CORRIDOR_DENSITY);
+    let placed = 0;
+    for (let t = 0; t < target * 6 && placed < target; t++) {
+      const at = pointAtS(line, cum, rrng() * total);
+      const a = rrng() * Math.PI * 2;
+      const rad = Math.sqrt(rrng()) * CORRIDOR_HALF;
+      const p: Pt = [at[0] + Math.cos(a) * rad, at[1] + Math.sin(a) * rad];
+      if (p[0] < bounds.u0 || p[0] > bounds.u1 || p[1] < bounds.v0 || p[1] > bounds.v1) continue;
+      if (!treeClear(p) || !spaced(p)) continue;
+      addTree(p, rollKind(rrng(), TREE_KINDS.forest), seed + ri * 617 + t * 43);
       placed++;
     }
   });
@@ -1314,6 +1423,46 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     });
   }
 
+  /* ---- clears: which trees stand on the routes -------------------------- */
+  // Roads claim first: they are built before the plots they lead to, so a tree
+  // in both a corridor and a plot belongs to the road. Claimed trees are never
+  // deleted and never appear in a second list — the timeline fells each one
+  // exactly once, as construction reaches its arclength.
+  const ROAD_CLEAR = 0.9;
+  const roadClaimed = new Set<string>();
+  roads.forEach((road, ri) => {
+    const line = roadLines[ri];
+    const cum = cumulative(line);
+    const total = cum[cum.length - 1] || 1;
+    const list: { tree: string; frac: number }[] = [];
+    trees.forEach((t, i) => {
+      if (dead.has(t.id) || roadClaimed.has(t.id)) return;
+      const p = treeUV[i];
+      let bd = Infinity;
+      let bs = 0;
+      for (let k = 0; k + 1 < line.length; k++) {
+        const d = segDist(p, line[k], line[k + 1]);
+        if (d >= bd) continue;
+        bd = d;
+        const seg = dist(line[k], line[k + 1]) || 1;
+        const proj = clamp(
+          ((p[0] - line[k][0]) * (line[k + 1][0] - line[k][0]) +
+            (p[1] - line[k][1]) * (line[k + 1][1] - line[k][1])) /
+            (seg * seg),
+          0,
+          1
+        );
+        bs = cum[k] + seg * proj;
+      }
+      if (bd >= ROAD_CLEAR) return;
+      roadClaimed.add(t.id);
+      list.push({ tree: t.id, frac: clamp(bs / total, 0, 1) });
+    });
+    list.sort((a, b) => a.frac - b.frac || (a.tree < b.tree ? -1 : 1));
+    road.clears = list;
+  });
+
+  /* ---- clears: which trees stand on which plot -------------------------- */
   for (const b of allBuildings) {
     if (b.role === 'homestead' && b.siteId === 's0' && b.id === 's0-b0') continue;
     const bu = b.gx - b.gy;
@@ -1321,21 +1470,24 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     const r = fpR(b.w) + 1.0;
     const cand: { id: string; d: number }[] = [];
     trees.forEach((t, i) => {
-      if (dead.has(t.id)) return;
+      // First claimant wins — roads before plots, and among plots whichever
+      // was surveyed first. One tree, one axe.
+      if (dead.has(t.id) || roadClaimed.has(t.id) || protectedTrees.has(t.id)) return;
       const d = dist(treeUV[i], [bu, bv]);
       if (d < r) cand.push({ id: t.id, d });
     });
     cand.sort((a, c) => a.d - c.d || (a.id < c.id ? -1 : 1));
-    const keep = cand.slice(0, 6);
+    const keep = cand.slice(0, PLOT_CLEAR_CAP);
     for (const k of keep) {
       b.clears.push(k.id);
       protectedTrees.add(k.id);
     }
-    for (const x of cand.slice(6)) {
-      // Never orphan a tree another plot is already waiting on — adopt it
-      // instead, since it is being felled anyway.
-      if (protectedTrees.has(x.id)) b.clears.push(x.id);
-      else dead.add(x.id);
+    for (const x of cand.slice(PLOT_CLEAR_CAP)) {
+      // Over the cap. If a neighbouring plot already claimed it, leave it to
+      // them — every tree is felled by exactly one claimant, so it never lands
+      // in two clears lists. Otherwise it comes out of the map entirely rather
+      // than being left standing under a finished roof.
+      if (!protectedTrees.has(x.id)) dead.add(x.id);
     }
   }
 
@@ -1467,7 +1619,7 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
       const pu = p.gx - p.gy;
       const pv = p.gx + p.gy;
       trees.forEach((t, i) => {
-        if (protectedTrees.has(t.id) || dead.has(t.id)) return;
+        if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) return;
         if (dist(treeUV[i], [pu, pv]) < 1.1) dead.add(t.id);
       });
     }

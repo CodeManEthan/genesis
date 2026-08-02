@@ -57,9 +57,14 @@ function makeFixture(seed, opts) {
     });
   }
 
-  // only these trees are ever allowed to be felled
-  const clearable = trees.slice(0, Math.floor(opts.trees * 0.55)).map((t) => t.id);
+  // three disjoint pools: plot trees, route trees, and wild forest that must
+  // survive the whole day untouched
+  const nPlot = Math.floor(opts.trees * 0.4);
+  const nRoute = Math.floor(opts.trees * 0.25);
+  const clearable = trees.slice(0, nPlot).map((t) => t.id);
+  const routeTrees = trees.slice(nPlot, nPlot + nRoute).map((t) => t.id);
   let cursor = 0;
+  let routeCursor = 0;
 
   const sites = [];
   for (let s = 0; s < nSites; s++) {
@@ -70,7 +75,7 @@ function makeFixture(seed, opts) {
       const ri = Math.floor(rng() * ROLES.length);
       const clears = [];
       if (!(s === 0 && b === 0)) {
-        const n = Math.floor(rng() * 3); // 0..2 trees per plot
+        const n = Math.floor(rng() * (opts.plotClears ?? 3)); // trees per plot
         for (let k = 0; k < n && cursor < clearable.length; k++) clears.push(clearable[cursor++]);
       }
       buildings.push({
@@ -125,7 +130,22 @@ function makeFixture(seed, opts) {
         a.gy + (b.gy - a.gy) * u + Math.cos(u * 2) * 2,
       ]);
     }
-    roads.push({ id: `r${s - 1}`, kind: 'lane', pts, width: 0.5, from: a.id, to: b.id });
+    const road = { id: `r${s - 1}`, kind: 'lane', pts, width: 0.5, from: a.id, to: b.id };
+    // trees standing on the planned route — a separate pool from the plots,
+    // ascending by frac. Omitted entirely when opts.roadClears is falsy, which
+    // is the "generator hasn't got round to it" path.
+    if (opts.roadClears) {
+      const rc = [];
+      for (let k = 0; k < opts.roadClears && routeCursor < routeTrees.length; k++) {
+        rc.push({
+          tree: routeTrees[routeCursor++],
+          frac: 0.06 + (k / opts.roadClears) * 0.86 + rng() * 0.02,
+        });
+      }
+      rc.sort((x, y) => x.frac - y.frac);
+      if (rc.length) road.clears = rc;
+    }
+    roads.push(road);
   }
   if (opts.loopRoad && nSites >= 3) {
     // a link road that founds nothing
@@ -279,8 +299,11 @@ function run(label, map, pace = 1) {
   const bridgeById = new Map(map.bridges.map((b) => [b.id, b]));
   const propIds = new Set();
   for (const s of map.sites) for (const p of s.props) propIds.add(p.id);
-  const clearable = new Set();
-  for (const s of map.sites) for (const b of s.buildings) for (const id of b.clears) clearable.add(id);
+  const plotClears = new Set();
+  for (const s of map.sites) for (const b of s.buildings) for (const id of b.clears) plotClears.add(id);
+  const roadClears = new Set();
+  for (const r of map.roads) for (const c of r.clears ?? []) roadClears.add(c.tree);
+  const clearable = new Set([...plotClears, ...roadClears]);
 
   /* (a) sorted, in range */
   for (let i = 0; i < ev.length; i++) {
@@ -341,8 +364,11 @@ function run(label, map, pace = 1) {
     const sT = surveyT.get(id);
     for (const treeId of b.clears) {
       if (!treeIds.has(treeId)) continue;
-      if (!chopDone.has(treeId)) bad(`(c) ${id}: clears tree ${treeId} never felled`);
-      else if (chopDone.get(treeId) > sT + 1e-9)
+      // road crews have first claim; those come down on the road's schedule
+      if (roadClears.has(treeId)) continue;
+      if (!chopDone.has(treeId)) {
+        if (!truncated) bad(`(c) ${id}: clears tree ${treeId} never felled`);
+      } else if (chopDone.get(treeId) > sT + 1e-9)
         bad(`(c) ${id}: tree ${treeId} felled at ${chopDone.get(treeId)} after survey ${sT}`);
     }
     const list = buildsOf.get(id) ?? [];
@@ -474,6 +500,60 @@ function run(label, map, pace = 1) {
   for (let t = 0.5; t <= 24.0001; t += 0.5) advance(hop3, tl, Math.min(t, 24));
   if (serialize(hop3) !== serialize(end)) bad(`(j) 48-hop advance != snapshotAt(24)`);
 
+  /* (l) road felling: nothing is left standing on finished road surface */
+  for (const r of map.roads) {
+    const list = roadEv.get(r.id) ?? [];
+    for (const c of r.clears ?? []) {
+      if (!treeIds.has(c.tree)) continue;
+      // the first road event that carries the surface past this tree
+      const passes = list.find((e) => e.frac >= c.frac - 1e-12);
+      if (!passes) continue; // truncated before the head got there
+      const down = chopDone.get(c.tree);
+      if (down === undefined)
+        bad(`(l) ${r.id}: tree ${c.tree} at frac ${c.frac.toFixed(3)} never felled, but road reached ${passes.frac.toFixed(3)}`);
+      else if (!(down < passes.t))
+        bad(
+          `(l) ${r.id}: tree ${c.tree} felled at ${hhmm(down)} but road passed frac ` +
+            `${c.frac.toFixed(3)} at ${hhmm(passes.t)}`,
+        );
+    }
+    // every route tree comes down (roads have first claim over plots)
+    if (!truncated)
+      for (const c of r.clears ?? []) {
+        if (!treeIds.has(c.tree)) continue;
+        if (!chopDone.has(c.tree)) bad(`(l) ${r.id}: route tree ${c.tree} never felled`);
+      }
+  }
+
+  /* (l2) at most 3 axes in flight per road crew */
+  for (const r of map.roads) {
+    const spans = [];
+    for (const c of r.clears ?? []) {
+      const a = chopStart.get(c.tree);
+      const b = chopDone.get(c.tree);
+      if (a === undefined) continue;
+      spans.push([a, 1], [b === undefined ? 24 : b, -1]);
+    }
+    spans.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+    let open = 0;
+    let peak = 0;
+    for (const [, d] of spans) {
+      open += d;
+      if (open > peak) peak = open;
+    }
+    if (peak > 3) bad(`(l2) ${r.id}: ${peak} axes in flight at once, cap is 3`);
+  }
+
+  /* (m) no tree felled twice */
+  const startCount = new Map();
+  const doneCount = new Map();
+  for (const e of ev) {
+    if (e.type === 'chop-start') startCount.set(e.treeId, (startCount.get(e.treeId) ?? 0) + 1);
+    if (e.type === 'chop-done') doneCount.set(e.treeId, (doneCount.get(e.treeId) ?? 0) + 1);
+  }
+  for (const [id, n] of startCount) if (n > 1) bad(`(m) tree ${id} felled ${n} times`);
+  for (const [id, n] of doneCount) if (n > 1) bad(`(m) tree ${id} chop-done ${n} times`);
+
   /* (k) day arc: first road mid-morning, ledger well spread, quiet close */
   const roadEvents = ev.filter((e) => e.type === 'road');
   const firstRoad = roadEvents.length ? roadEvents[0].t : null;
@@ -511,7 +591,8 @@ function run(label, map, pace = 1) {
   console.log(`${fails.length ? 'FAIL' : 'PASS'}  ${label}${full ? '' : `   [pace ${pace}]`}`);
   console.log(
     `  sites ${map.sites.length}  buildings ${buildingById.size}  roads ${map.roads.length}  ` +
-      `bridges ${map.bridges.length}  trees ${map.trees.length} (clearable ${clearable.size})`,
+      `bridges ${map.bridges.length}  trees ${map.trees.length} ` +
+      `(plot ${plotClears.size} / route ${roadClears.size} / wild ${map.trees.length - clearable.size})`,
   );
   console.log(
     `  events ${ev.length}   first road ${firstRoad === null ? '--' : hhmm(firstRoad)}   ` +
@@ -548,21 +629,37 @@ function sampleLogs(ev, n = 8) {
 const cases = [];
 
 cases.push([
-  'fixture: 3 sites / 1 bridge / loop road',
-  makeFixture(hashSeed('2026-08-02'), { buildings: [4, 3, 3], trees: 22, loopRoad: true }),
+  'fixture: 3 sites / bridge / loop road / 6 route trees per road',
+  makeFixture(hashSeed('2026-08-02'), {
+    buildings: [4, 3, 3],
+    trees: 60,
+    loopRoad: true,
+    roadClears: 6,
+  }),
 ]);
-cases.push(['fixture: 2 sites, tiny', makeFixture(1234, { buildings: [2, 1], trees: 20 })]);
+// deliberately no `clears` on the roads at all — the optional path
+cases.push(['fixture: 2 sites, tiny, no road clears', makeFixture(1234, { buildings: [2, 1], trees: 20 })]);
 cases.push([
-  'fixture: 3 sites, bridge right at the start of the road',
-  makeFixture(99, { buildings: [3, 4, 2], trees: 24, bridgeAt: 0.05 }),
+  'fixture: 3 sites, bridge at the start of the road',
+  makeFixture(99, { buildings: [3, 4, 2], trees: 60, bridgeAt: 0.05, roadClears: 6 }),
 ]);
 cases.push([
-  'fixture: 3 sites, bridge right at the end of the road',
-  makeFixture(777, { buildings: [3, 3, 4], trees: 24, bridgeAt: 0.97 }),
+  'fixture: 3 sites, bridge at the end of the road',
+  makeFixture(777, { buildings: [3, 3, 4], trees: 60, bridgeAt: 0.97, roadClears: 8 }),
+]);
+cases.push([
+  'fixture: dense forest — 12 plot clears, 14 route trees per road',
+  makeFixture(4242, {
+    buildings: [5, 5, 4],
+    trees: 150,
+    plotClears: 13,
+    roadClears: 14,
+    loopRoad: true,
+  }),
 ]);
 cases.push([
   'fixture: big — 5 sites, 30 buildings',
-  makeFixture(5150, { buildings: [7, 6, 6, 6, 5], trees: 60, loopRoad: true }),
+  makeFixture(5150, { buildings: [7, 6, 6, 6, 5], trees: 180, loopRoad: true, roadClears: 10 }),
 ]);
 cases.push(['fixture: one site only', makeFixture(31337, { buildings: [5], trees: 18 })]);
 
@@ -625,7 +722,8 @@ for (const [label, map] of cases) {
 
 const withRoads = cases.filter(([, m]) => m.roads.length && m.sites.length > 1);
 const realOnes = withRoads.filter(([l]) => l.startsWith('gen.ts'));
-const paceCases = [...withRoads.slice(0, 2), ...realOnes.slice(0, 1)];
+const dense = withRoads.filter(([l]) => l.startsWith('fixture: dense'));
+const paceCases = [...withRoads.slice(0, 2), ...dense.slice(0, 1), ...realOnes.slice(0, 1)];
 for (const [label, map] of paceCases) {
   for (const pace of [0.5, 2, 0.25, 4]) {
     const r = run(label, map, pace);
@@ -680,6 +778,74 @@ if (showcase) {
       `stumps ${[...mid.trees.values()].filter((v) => v === 'stump').length}  ` +
       `props ${mid.props.size}  log ${mid.log.length}`,
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* pacing across map scales, with dense clears throughout                     */
+/* -------------------------------------------------------------------------- */
+
+console.log(`\n${'='.repeat(72)}`);
+console.log('pacing sweep — last roof must land in 20:24..22:00 at every map scale');
+const shapes = [
+  ['1 site,  4 buildings', [4]],
+  ['2 sites, 7 buildings', [4, 3]],
+  ['3 sites, 14 buildings', [5, 5, 4]],
+  ['4 sites, 22 buildings', [7, 5, 5, 5]],
+  ['5 sites, 30 buildings', [7, 6, 6, 6, 5]],
+  ['6 sites, 42 buildings', [8, 7, 7, 7, 7, 6]],
+  ['7 sites, 56 buildings', [8, 8, 8, 8, 8, 8, 8]],
+];
+let sweepFail = 0;
+for (const [name, buildings] of shapes) {
+  const nb = buildings.reduce((a, b) => a + b, 0);
+  const m = makeFixture(hashSeed(name), {
+    buildings,
+    trees: Math.max(60, nb * 30),
+    plotClears: 13,
+    roadClears: 14,
+    loopRoad: buildings.length >= 3,
+  });
+  const tl = buildTimeline(m);
+  const bs = tl.events.filter((e) => e.type === 'build');
+  const last = bs.length ? bs[bs.length - 1].t : 0;
+  const chops = tl.events.filter((e) => e.type === 'chop-done').length;
+  const ok = last >= 20.4 && last <= 22.0;
+  if (!ok) sweepFail++;
+  console.log(
+    `  ${ok ? 'ok  ' : 'BAD '} ${name.padEnd(22)} last roof ${hhmm(last)}   ` +
+      `${tl.events.length} events, ${chops} trees felled`,
+  );
+}
+if (sweepFail) failed += sweepFail;
+total += shapes.length;
+
+/* -------------------------------------------------------------------------- */
+/* road-cutting detail: does the head visibly slow through the wood?          */
+/* -------------------------------------------------------------------------- */
+
+{
+  const [, m] = cases.find(([l]) => l.startsWith('fixture: dense'));
+  const tl = buildTimeline(m);
+  // the road with the most trees on it
+  const road = m.roads.reduce((best, r) =>
+    (r.clears?.length ?? 0) > (best?.clears?.length ?? 0) ? r : best, null);
+  if (road) {
+    const steps = tl.events.filter((e) => e.type === 'road' && e.roadId === road.id);
+    const cl = road.clears;
+    console.log(`\n${'='.repeat(72)}`);
+    console.log(`road ${road.id} (${road.kind}), ${cl.length} trees on the route`);
+    let prev = null;
+    for (const e of steps) {
+      const n = cl.filter((c) => c.frac <= e.frac && (!prev || c.frac > prev.frac)).length;
+      const mins = prev ? Math.round((e.t - prev.t) * 60) : 0;
+      console.log(
+        `  frac ${e.frac.toFixed(3)}  ${hhmm(e.t)}` +
+          (prev ? `  +${String(mins).padStart(3)} min` : '        ') +
+          (n ? `   ${'|'.repeat(n)} ${n} tree${n > 1 ? 's' : ''} felled in this stretch` : ''),
+      );
+      prev = e;
+    }
+  }
 }
 
 console.log(`\n${failed ? `${failed}/${total} CASES FAILED` : `all ${total} cases PASS`}`);

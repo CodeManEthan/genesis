@@ -161,6 +161,11 @@ export interface RoadSpec {
   width: number; // 0.62 highway / 0.5 lane / 0.4 track
   from: string; // site id
   to: string; // site id
+  /** Trees standing on/beside the planned route, in ascending `frac`
+   * (0..1 of arclength). The timeline fells each one just before road
+   * construction reaches its frac — crews cut their way through the wood.
+   * Optional for fixture compatibility; absent means none. */
+  clears?: { tree: string; frac: number }[];
 }
 
 export interface BridgeSpec {

@@ -20,14 +20,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  TH,
-  TW,
-  hashSeed,
-  type GenesisMap,
-  type Timeline,
-  type WorldSnapshot,
-} from './types';
+import { TH, TW, hashSeed, type GenesisMap, type Timeline, type WorldSnapshot } from './types';
 import {
   buildGenesisScene,
   makeAmbient,
@@ -125,7 +118,7 @@ function paceIndex(p: number): number {
 }
 
 const randomSeed = () => Math.floor(Math.random() * 4294967296) >>> 0;
-const stepSeed = (seed: number, d: 1 | -1) => (seed + d + 4294967296) % 4294967296 >>> 0;
+const stepSeed = (seed: number, d: 1 | -1) => ((seed + d + 4294967296) % 4294967296) >>> 0;
 
 function fmtClock(t: number): string {
   const c = clamp(t, 0, 23.9999);
@@ -139,9 +132,23 @@ function wallClockHours(): number {
   return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
 }
 
-function utcDateKey(): string {
+/**
+ * The date that hands out the day's seed. Deliberately *local*, because the
+ * world clock above is local: the valley has to be born at the visitor's own
+ * midnight, or LIVE would roll the day over hours away from the seed changing.
+ */
+function dayKey(d = new Date()): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+const daySeed = (d?: Date) => hashSeed(dayKey(d));
+
+/** Tomorrow's seed, for pre-generating the world the clock is about to reach. */
+function nextDaySeed(): number {
   const d = new Date();
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  d.setHours(12, 0, 0, 0);
+  d.setDate(d.getDate() + 1);
+  return daySeed(d);
 }
 
 interface Cam {
@@ -167,9 +174,10 @@ export default function TheGenesis() {
   const [paceIdx, setPaceIdx] = useState(1);
   const [lines, setLines] = useState<{ t: number; text: string }[]>([]);
 
-  /** The seed the date hands out; "Today" is whatever this is. */
+  /** The seed the date hands out; "Today" is whatever this is. Moves on by
+   * itself when a LIVE world rolls over into the next day. */
   const todayRef = useRef(0);
-  if (!todayRef.current) todayRef.current = hashSeed(utcDateKey());
+  if (!todayRef.current) todayRef.current = daySeed();
 
   const worldRef = useRef<World | null>(null);
   const sceneRef = useRef<GenesisScene | null>(null);
@@ -199,22 +207,28 @@ export default function TheGenesis() {
 
   /** Worlds stay shareable: the address bar always describes what is on screen,
    * and says nothing it does not have to. */
-  const syncUrl = useCallback((nextSeed: number, nextPace: number, newMap: boolean) => {
-    const url = new URL(window.location.href);
-    const q = url.searchParams;
-    if (nextSeed === todayRef.current) q.delete('seed');
-    else q.set('seed', String(nextSeed >>> 0));
-    if (nextPace === 1) q.delete('pace');
-    else q.set('pace', String(nextPace));
-    // A different valley invalidates any hand-set camera in the URL.
-    if (newMap) {
-      q.delete('zoom');
-      q.delete('cx');
-      q.delete('cy');
-    }
-    const s = q.toString();
-    window.history.replaceState(null, '', `${url.pathname}${s ? `?${s}` : ''}${url.hash}`);
-  }, []);
+  const syncUrl = useCallback(
+    (nextSeed: number, nextPace: number, newMap: boolean, dropT = false) => {
+      const url = new URL(window.location.href);
+      const q = url.searchParams;
+      // A rolled-over day has left its deep-linked hour far behind; keeping it
+      // would make a reload of this URL show something else entirely.
+      if (dropT) q.delete('t');
+      if (nextSeed === todayRef.current) q.delete('seed');
+      else q.set('seed', String(nextSeed >>> 0));
+      if (nextPace === 1) q.delete('pace');
+      else q.set('pace', String(nextPace));
+      // A different valley invalidates any hand-set camera in the URL.
+      if (newMap) {
+        q.delete('zoom');
+        q.delete('cx');
+        q.delete('cy');
+      }
+      const s = q.toString();
+      window.history.replaceState(null, '', `${url.pathname}${s ? `?${s}` : ''}${url.hash}`);
+    },
+    []
+  );
 
   /* ------------------------------- sizing ------------------------------- */
   useEffect(() => {
@@ -276,6 +290,24 @@ export default function TheGenesis() {
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
       logLenRef.current = snapRef.current.log.length;
       setLines(snapRef.current.log.slice(-3));
+
+      // Dev hooks for the screenshot harness: start the transport rolling at a
+      // chosen speed so a capture can be taken mid-playback (or mid-midnight).
+      const qSpeed = Number(q.get('speed'));
+      if (q.has('speed') && isFinite(qSpeed)) {
+        let best = 0;
+        for (let i = 0; i < SPEEDS.length; i++) {
+          if (Math.abs(SPEEDS[i] - qSpeed) < Math.abs(SPEEDS[best] - qSpeed)) best = i;
+        }
+        speedRef.current = SPEEDS[best];
+        setSpeedIdx(best);
+      }
+      if (q.get('autoplay') === '1') {
+        modeRef.current = 'player';
+        setMode('player');
+        playingRef.current = true;
+        setPlaying(true);
+      }
       setReady(true);
     }
 
@@ -376,12 +408,34 @@ export default function TheGenesis() {
       pushLog();
     };
 
+    /* ---- the world waiting on the other side of midnight ---------------- */
+    /** Pre-built while the valley is already dark, so the swap costs nothing. */
+    let pending: {
+      seed: number;
+      pace: number;
+      world: World;
+      scene: GenesisScene;
+    } | null = null;
+
+    const ensurePending = (s: number) => {
+      if (pending && pending.seed === s && pending.pace === paceRef.current) return pending;
+      const w = loadWorld(s, paceRef.current);
+      pending = {
+        seed: s,
+        pace: paceRef.current,
+        world: w,
+        scene: buildGenesisScene(w.map),
+      };
+      return pending;
+    };
+
     /** A new seed or a new pace both mean a new map, and a new map is a whole
      * new world: ledger, baked terrain, crowd and framing all go. The clock
      * does not — the visitor keeps their hour, and LIVE stays LIVE. */
     const rebuild = (s: number, p: number) => {
       seedRef.current = s;
       paceRef.current = p;
+      pending = null;
       world = loadWorld(s, p);
       worldRef.current = world;
       scene = buildGenesisScene(world.map);
@@ -398,6 +452,48 @@ export default function TheGenesis() {
       dirtyRef.current = true;
       paintOnce();
     };
+
+    /**
+     * Midnight. The day the visitor has been watching is over, and the valley
+     * has been fading towards black since about 23:40, so the swap itself is
+     * invisible: the map, timeline, bake and crowd are all replaced while there
+     * is nothing to see, and the light comes back up on a single house.
+     *
+     * Which seed comes next is the one thing the two modes disagree about.
+     * LIVE follows the calendar — the new local date hands out the new seed, and
+     * "Today" moves with it. A browsed world just steps to seed + 1, which is
+     * the same thing the › button does, and stops being today's world.
+     */
+    const roll = (nextSeed: number, carryT: number, live: boolean) => {
+      const next = ensurePending(nextSeed);
+      pending = null;
+      world = next.world;
+      worldRef.current = world;
+      scene = next.scene;
+      sceneRef.current = scene;
+      seedRef.current = nextSeed;
+      if (live) todayRef.current = nextSeed;
+
+      tRef.current = clamp(carryT, 0, 24);
+      snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
+      resetAmbient(scene, amb, snapRef.current);
+      settleAmbient(scene, amb, snapRef.current);
+      camRef.current = clampCam(fitCam());
+
+      // The ledger starts over: yesterday's closing line goes out with the
+      // light, and the founding of the new valley fades in with the pre-dawn.
+      logLenRef.current = -1;
+      pushLog();
+      setSeed(nextSeed);
+      setValley(world.map.valleyName);
+      setTDisp(tRef.current);
+      syncUrl(nextSeed, paceRef.current, true, true);
+      dirtyRef.current = true;
+    };
+
+    /** The seed the clock is heading towards. */
+    const comingSeed = () =>
+      modeRef.current === 'live' ? nextDaySeed() : stepSeed(seedRef.current, 1);
 
     api.current = {
       applyT,
@@ -421,7 +517,11 @@ export default function TheGenesis() {
         const py = ay ?? vh / 2;
         const wx = cam.cx + px / cam.zoom;
         const wy = cam.cy + py / cam.zoom;
-        camRef.current = clampCam({ zoom: next, cx: wx - px / next, cy: wy - py / next });
+        camRef.current = clampCam({
+          zoom: next,
+          cx: wx - px / next,
+          cy: wy - py / next,
+        });
         dirtyRef.current = true;
         if (reducedRef.current) paintOnce();
       },
@@ -447,25 +547,54 @@ export default function TheGenesis() {
       },
     };
 
+    /* ---- optional frame-time readout (`?perf=1`) ------------------------ */
+    // console.error so the headless screenshot harness, which only relays
+    // errors, picks it up.
+    const perf = new URLSearchParams(window.location.search).get('perf') === '1';
+    let pN = 0;
+    let pSum = 0;
+    let pMax = 0;
+
     function paintOnce() {
       const cam = camRef.current!;
+      const t0 = perf ? performance.now() : 0;
       renderGenesis(ctx!, scene, amb, snapRef.current!, { ...cam, vw, vh }, clock);
       dirtyRef.current = false;
+      if (!perf) return;
+      const ms = performance.now() - t0;
+      pSum += ms;
+      pMax = Math.max(pMax, ms);
+      if (++pN >= 120) {
+        console.error(
+          `PERF render avg ${(pSum / pN).toFixed(2)}ms max ${pMax.toFixed(2)}ms ` +
+            `(${(1000 / (pSum / pN)).toFixed(0)} fps ceiling) zoom ${camRef.current!.zoom} ` +
+            `t=${tRef.current.toFixed(2)} trees=${scene.map.trees.length}`
+        );
+        pN = 0;
+        pSum = 0;
+        pMax = 0;
+      }
     }
 
     /* ---- the tick ------------------------------------------------------- */
+    // Generation is ~25ms; doing it here, deep in the dark, keeps the boundary
+    // itself free of any hitch at any playback speed.
+    const PREGEN_AT = 23.5;
     let uiAccum = 0;
     const tick = (dt: number) => {
       const running = modeRef.current === 'live' || playingRef.current;
       if (modeRef.current === 'live') {
-        applyT(wallClockHours());
+        const wall = wallClockHours();
+        // The wall clock only ever runs forward, so a large step *backwards* is
+        // the calendar turning over underneath us.
+        if (wall < tRef.current - 12) roll(daySeed(), wall, true);
+        else applyT(wall);
       } else if (playingRef.current) {
-        applyT(tRef.current + (dt * speedRef.current) / 3600);
-        if (tRef.current >= 24 - 1e-6) {
-          playingRef.current = false;
-          setPlaying(false);
-        }
+        const raw = tRef.current + (dt * speedRef.current) / 3600;
+        if (raw >= 24) roll(stepSeed(seedRef.current, 1), raw - 24, false);
+        else applyT(raw);
       }
+      if (running && tRef.current >= PREGEN_AT) ensurePending(comingSeed());
       syncAmbient(scene, amb, snapRef.current!);
       if (running && !reducedRef.current) {
         clock += dt;
@@ -620,6 +749,8 @@ export default function TheGenesis() {
 
   const latest = lines.length ? lines[lines.length - 1].text : '';
   const pct = (clamp(tDisp, 0, 24) / 24) * 100;
+  /** The dark either side of midnight: the ledger goes quiet with the valley. */
+  const hush = tDisp >= 23.7 || tDisp < 0.25;
 
   return (
     <div className="genesis" ref={wrapRef}>
@@ -637,7 +768,7 @@ export default function TheGenesis() {
         role="img"
       />
 
-      <div className="gen-ticker" aria-hidden="true">
+      <div className={`gen-ticker${hush ? ' gen-hush' : ''}`} aria-hidden="true">
         {lines.map((l, i) => (
           <p key={`${l.t}-${l.text}`} data-age={lines.length - 1 - i}>
             <span className="gen-stamp">{fmtClock(l.t)}</span>
@@ -1004,6 +1135,9 @@ const CSS = `
 }
 .gen-ticker p[data-age='1'] { opacity: 0.72; }
 .gen-ticker p[data-age='2'] { opacity: 0.48; }
+/* The last hour of a world, and the first minutes of the next one. */
+.gen-ticker p { transition: opacity 0.9s ease; }
+.gen-ticker.gen-hush p { opacity: 0.34; }
 .gen-stamp {
   font-variant-numeric: tabular-nums;
   color: #2f9e7d;

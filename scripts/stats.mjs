@@ -118,6 +118,12 @@ function report(seed) {
     );
   }
 
+  const rc = map.roads.map((r) => (r.clears || []).length);
+  say(
+    `road clears: ${rc.join(', ')}  (total ${rc.reduce((a, b) => a + b, 0)}, ` +
+      `max ${Math.max(0, ...rc)})`
+  );
+
   say(`\nBRIDGES (${map.bridges.length})`);
   for (const b of map.bridges) {
     const p = uvOf(b);
@@ -125,6 +131,8 @@ function report(seed) {
     say(`  ${b.id} on ${b.roadId} at (${f1(p[0])},${f1(p[1])}) span ${b.span}  river dist ${f1(dr)} ${dr <= 1 ? 'ok' : 'OFF-RIVER'}`);
   }
 
+  const area = (map.bounds.u1 - map.bounds.u0) * (map.bounds.v1 - map.bounds.v0);
+  say(`\ntree density ${(map.trees.length / area).toFixed(3)} / u,v unit^2 over ${area} units^2`);
   const clearCounts = map.sites.flatMap((s) => s.buildings.map((b) => b.clears.length));
   const withClears = clearCounts.filter((n) => n > 0).length;
   say(
@@ -289,24 +297,17 @@ function checks(seed, map, scale = 1) {
     check('j  roads clear non-endpoint towns', bad === 0, `${bad} intrusions, margin ${f1(worst)}`);
   }
   {
+    // Trees may now stand on a planned road — the crews fell them. Only the
+    // water still pushes them back.
     let bad = 0;
-    for (const t of map.trees) {
-      if (polyDist(uvOf(t), river) < 1.5 - 1e-6) bad++;
-      else
-        for (const r of map.roads) {
-          if (polyDist(uvOf(t), roadUV.get(r.id)) < 1.2 - 1e-6) {
-            bad++;
-            break;
-          }
-        }
-    }
-    check('k  trees clear river/roads', bad === 0, `${bad} violations`);
+    for (const t of map.trees) if (polyDist(uvOf(t), river) < 1.5 - 1e-6) bad++;
+    check('k  trees clear the river', bad === 0, `${bad} violations`);
   }
   {
     const s0b = map.sites[0].buildings.length;
     const ok =
-      map.trees.length >= 400 &&
-      map.trees.length <= 1100 &&
+      map.trees.length >= 1400 &&
+      map.trees.length <= 2400 &&
       map.scatter.length >= 90 &&
       map.scatter.length <= 220 &&
       map.sites.length >= 2 &&
@@ -324,6 +325,87 @@ function checks(seed, map, scale = 1) {
   {
     const w = map.sites.flatMap((s) => s.buildings).filter((b) => b.w % 4 !== 0 || b.w < 24 || b.w > 64);
     check('m  building widths legal', w.length === 0, `${w.length} bad`);
+  }
+
+  /* (n) road clears: live tree, on the route, fracs sane and ascending */
+  {
+    const ids = new Set(map.trees.map((t) => t.id));
+    let missing = 0;
+    let offRoute = 0;
+    let badFrac = 0;
+    let unsorted = 0;
+    let worst = 0;
+    let total = 0;
+    for (const r of map.roads) {
+      const line = roadUV.get(r.id);
+      let prev = -Infinity;
+      for (const c of r.clears || []) {
+        total++;
+        const t = map.trees.find((x) => x.id === c.tree);
+        if (!t) {
+          missing++;
+          continue;
+        }
+        if (!ids.has(c.tree)) missing++;
+        const d = polyDist(uvOf(t), line);
+        worst = Math.max(worst, d);
+        if (d > 1.0) offRoute++;
+        if (!(c.frac >= 0 && c.frac <= 1)) badFrac++;
+        if (c.frac < prev - 1e-9) unsorted++;
+        prev = c.frac;
+      }
+    }
+    check(
+      'n  road clears valid + ascending',
+      missing === 0 && offRoute === 0 && badFrac === 0 && unsorted === 0,
+      `${total} claims, ${missing} missing, ${offRoute} off-route, ${badFrac} bad frac, ${unsorted} unsorted, worst dist ${f1(worst)}`
+    );
+  }
+
+  /* (o) a tree is never claimed twice */
+  {
+    const seen = new Map();
+    let dup = 0;
+    const claim = (id, who) => {
+      if (seen.has(id)) dup++;
+      else seen.set(id, who);
+    };
+    for (const r of map.roads) for (const c of r.clears || []) claim(c.tree, r.id);
+    for (const s of map.sites) for (const b of s.buildings) for (const id of b.clears) claim(id, b.id);
+    check('o  no tree claimed twice', dup === 0, `${seen.size} claims, ${dup} duplicated`);
+  }
+
+  /* (p) roads run through to the town centres, not to dead ends at the rim */
+  {
+    let worst = 0;
+    let bad = 0;
+    for (const r of map.roads) {
+      const line = roadUV.get(r.id);
+      for (const [end, id] of [[line[0], r.from], [line[line.length - 1], r.to]]) {
+        const s = map.sites.find((x) => x.id === id);
+        if (!s) continue;
+        const d = d2(end, uvOf(s));
+        worst = Math.max(worst, d);
+        if (d > 2.3) bad++;
+      }
+    }
+    check('p  roads reach town centres', bad === 0, `${bad} short, furthest terminus ${f1(worst)}`);
+  }
+
+  /* (q) no roof sits on a road, extensions included */
+  {
+    let bad = 0;
+    let worst = Infinity;
+    for (const s of map.sites) {
+      for (const b of s.buildings) {
+        for (const r of map.roads) {
+          const gap = polyDist(uvOf(b), roadUV.get(r.id)) - fpR(b.w);
+          worst = Math.min(worst, gap);
+          if (gap < 0) bad++;
+        }
+      }
+    }
+    check('q  buildings clear of roads', bad === 0, `${bad} paved, tightest ${f1(worst)}`);
   }
 
   const pass = results.every((r) => r.ok);
