@@ -83,10 +83,15 @@ export function valleyName(rng: () => number): string {
   return `The ${join(stem, pick(rng, VALE_ELEMENTS))}`;
 }
 
-/** Convenience for gen.ts: n distinct town names off one stream. */
-export function townNames(rng: () => number, n: number): string[] {
+/**
+ * Convenience for gen.ts: n distinct town names off one stream.
+ *
+ * Pass a shared `used` set to draw a further batch later that stays distinct
+ * from an earlier one — gen.ts needs that to extend its town roster without
+ * disturbing the names it already handed out.
+ */
+export function townNames(rng: () => number, n: number, used = new Set<string>()): string[] {
   const out: string[] = [];
-  const used = new Set<string>();
   for (let i = 0; i < n; i++) {
     let name = townName(rng);
     for (let tries = 0; tries < 200 && used.has(name); tries++) name = townName(rng);

@@ -1,15 +1,20 @@
 /**
  * Genesis — procedural map generation.
  *
- *   generateMap(seed) -> GenesisMap
+ *   generateMap(seed, scale = 1) -> GenesisMap
  *
  * Pure, deterministic, DOM-free. Every random draw comes from mulberry32 in
- * types.ts; no Date, no Math.random. Same seed => byte-identical JSON.
+ * types.ts; no Date, no Math.random. Same seed and scale => byte-identical
+ * JSON.
+ *
+ * `scale` (0.25 .. 4) is the pace control: it says how much gets BUILT in a
+ * day, never how fast the clock runs. See the SUBSET STABILITY note further
+ * down — a smaller scale is a strict prefix of a larger one.
  *
  * GENERATION ORDER (each stage only reads the stages above it):
- *   bounds -> river -> sites -> accents/names -> road network (spanning tree,
- *   A* routed) -> bridges -> chunks/biomes -> buildings -> trees -> clears ->
- *   wild scatter -> site dressing.
+ *   bounds -> river -> town roster -> accents/names -> road network
+ *   (append-only tree, A* routed) -> bridges -> chunks/biomes -> buildings ->
+ *   trees -> clears -> wild scatter -> site dressing -> trim to scale.
  *
  * ── COORDINATE SPACE ──────────────────────────────────────────────────────
  * All planning happens in screen-aligned (u, v): u = gx - gy, v = gx + gy.
@@ -537,7 +542,11 @@ function routeRoad(grid: RouteGrid, start: Pt, goal: Pt, avoid: { u: number; v: 
     return idx(i, j);
   };
 
-  // Per-road town penalty field.
+  // Per-road town penalty field. `avoid[].r` already carries the slack the
+  // smoothing passes need, so this is a plain hard core — no graded shoulder.
+  // A shoulder reads as the obvious way to centre a road in a narrow corridor,
+  // but it turns every tight gap into a toll booth, and A* answers by looping
+  // half way round the valley instead.
   const pen = new Float32Array(w * h);
   for (const a of avoid) {
     const i0 = clamp(Math.floor(a.u - a.r - u0), 0, w - 1);
@@ -698,8 +707,36 @@ function bridgeRoad(pts: Pt[], river: Pt[]): Pt[] {
 /*  the generator                                                             */
 /* ========================================================================== */
 
-export function generateMap(seed: number): GenesisMap {
+/* ========================================================================== */
+/*  content scale                                                             */
+/* ========================================================================== */
+
+/**
+ * `scale` says how much gets BUILT in a day, not how fast the day runs. A
+ * bigger scale means more towns and more plots per town; the land itself —
+ * bounds, river, chunks, trees, scatter — never changes.
+ *
+ * SUBSET STABILITY. For one seed, the world at a smaller scale is a strict
+ * prefix of the world at a larger one: same terrain, same names, same
+ * positions, with sites, roads and per-site buildings only ever APPENDED. That
+ * is what lets the pace control be a live knob rather than a reroll.
+ *
+ * It is bought by generating the full scale-4 roster every time, in an order
+ * that never consults `scale`, and truncating at the end. Everything that
+ * shapes the land — tree clearance, felling, biome cascade — is computed
+ * against that full roster, so it cannot shift when the roster is trimmed.
+ */
+const SCALE_MIN = 0.25;
+const SCALE_MAX = 4;
+
+/** Town-count multiplier. Tuned to ~2 at 0.25x, ~3-4 at 0.5x, ~9-11 at 2x, ~13-16 at 4x. */
+const siteFactor = (s: number) => (s <= 1 ? Math.pow(s, 0.8) : Math.pow(s, 0.585));
+/** Plots-per-town multiplier — deliberately gentler than the town count. */
+const buildFactor = (s: number) => (s <= 1 ? Math.pow(s, 0.75) : Math.pow(s, 0.29));
+
+export function generateMap(seed: number, scale = 1): GenesisMap {
   const rng = mulberry32(seed >>> 0);
+  const S = clamp(scale, SCALE_MIN, SCALE_MAX);
 
   const content = { u0: -34, v0: -40, u1: 34, v1: 40 };
   const bounds = { u0: -40, v0: -46, u1: 40, v1: 46 };
@@ -722,7 +759,10 @@ export function generateMap(seed: number): GenesisMap {
     accent: string;
   }
   const sites: Site[] = [];
-  const nSites = 5 + Math.floor(rng() * 3); // 5..7
+  // The day's baseline town count. Everything scale-related is expressed as a
+  // multiple of this, and it is drawn from the seed alone, so the roster is
+  // identical no matter what scale was asked for.
+  const nBase = 5 + Math.floor(rng() * 3); // 5..7
 
   // sites[0]: the founding homestead, near the middle, off the water.
   {
@@ -769,12 +809,12 @@ export function generateMap(seed: number): GenesisMap {
   // river to bridge rather than a river to look at.
   const bankOf = makeBankTest(river, bounds);
   const homeBank = bankOf([sites[0].u, sites[0].v]);
-  const wantFar = nSites >= 6 ? 2 : 1;
-  for (let relax = 0; sites.length < nSites && relax < 5; relax++) {
+  const wantFar = nBase >= 6 ? 2 : 1;
+  for (let relax = 0; sites.length < nBase && relax < 5; relax++) {
     const gap = 14 - relax;
-    for (let i = sites.length; i < nSites; i++) {
+    for (let i = sites.length; i < nBase; i++) {
       const far = sites.filter((s) => bankOf([s.u, s.v]) !== homeBank).length;
-      const slots = nSites - i;
+      const slots = nBase - i;
       // The first pass demands the far bank; the second drops the demand so a
       // pinched map still gets its full complement of towns.
       const needFar = slots <= wantFar - far;
@@ -805,75 +845,126 @@ export function generateMap(seed: number): GenesisMap {
     }
   }
 
-  /* ---- accents and names ----------------------------------------------- */
+  /* ---- accents, names, and the rest of the world's one-off rolls -------- */
   const pool = ACCENTS.slice();
   for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
+  const usedNames = new Set<string>();
+  const names = townNames(rng, sites.length, usedNames);
+  const landmarkOffset = Math.floor(rng() * LANDMARK_ROLES.length);
+  const scatterTarget = 100 + Math.floor(rng() * 80);
+  const valley = valleyName(rng);
+
+  /* ---- the rest of the roster ------------------------------------------ */
+  // Frontier holdings beyond the day's baseline. They are drawn last and only
+  // ever appended, so trimming the roster for a smaller scale can never move
+  // one of the towns above. They infill a little tighter and run a little
+  // smaller than the founding towns.
+  const rosterMax = clamp(Math.round(nBase * siteFactor(SCALE_MAX)), 2, 16);
+  for (let relax = 0; sites.length < rosterMax && relax < 6; relax++) {
+    const gap = 12 - relax * 0.8;
+    for (let i = sites.length; i < rosterMax; i++) {
+      let done = false;
+      for (let t = 0; t < 3000 && !done; t++) {
+        const r = 4 + rng() * 2;
+        const margin = Math.max(6, r + 2);
+        const u = lerp(content.u0 + margin, content.u1 - margin, rng());
+        const v = lerp(content.v0 + margin, content.v1 - margin, rng());
+        const p: Pt = [u, v];
+        if (polyDist(p, river) < Math.max(RIVER_CLEAR, r + 1.2)) continue;
+        let ok = true;
+        for (const s of sites) {
+          if (dist(p, [s.u, s.v]) < Math.max(gap, s.r + r + 3)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+        sites.push({ id: `s${sites.length}`, name: '', u, v, r, accent: '' });
+        done = true;
+      }
+      if (!done) break;
+    }
+  }
+  // Order each block outward from the founding house. Roster order IS founding
+  // order — it decides which towns a small day reaches and which town each road
+  // hangs off — so growing outward from the first house both tells the right
+  // story and keeps the road network short. Sorting inside the blocks rather
+  // than across them means a scale-1 day still gets the well-spaced founding
+  // towns rather than a mix of those and the tighter frontier holdings.
+  {
+    const home: Pt = [sites[0].u, sites[0].v];
+    const outward = (a: Site, b: Site) =>
+      dist([a.u, a.v], home) - dist([b.u, b.v], home) || a.u - b.u || a.v - b.v;
+    const baseline = sites.slice(1, Math.min(nBase, sites.length)).sort(outward);
+    const frontier = sites.slice(Math.min(nBase, sites.length)).sort(outward);
+    sites.length = 1;
+    sites.push(...baseline, ...frontier);
+  }
+  if (sites.length > names.length) {
+    names.push(...townNames(rng, sites.length - names.length, usedNames));
+  }
   sites.forEach((s, i) => {
+    s.id = `s${i}`;
     s.accent = pool[i % pool.length];
-  });
-  const names = townNames(rng, sites.length);
-  sites.forEach((s, i) => {
     s.name = names[i];
   });
 
+  /** How many of the roster actually get founded today. */
+  const nSites = clamp(Math.round(nBase * siteFactor(S)), 2, sites.length);
+
   /* ---- road network ---------------------------------------------------- */
-  // Prim's algorithm rooted at sites[0]: each new town joins via the nearest
-  // town that already exists, which is exactly the day's expansion story.
+  // Every town joins via the NEAREST town founded before it — Prim's rule, but
+  // with "already connected" pinned to the roster order rather than to Prim's
+  // own visit order. That makes the network append-only by construction: the
+  // edge for town i only ever looks at towns below i, so truncating the roster
+  // truncates the road list and can never rewire an earlier road.
+  //
+  // (Textbook Prim is NOT safe here: a frontier holding can be nearer to the
+  // tree than a founding town, which reorders the edges and re-parents earlier
+  // towns, so the scale-1 road list would stop being a prefix of the scale-4
+  // one.)
   const parent = new Array<number>(sites.length).fill(-1);
   const depth = new Array<number>(sites.length).fill(0);
-  const inTree = [0];
   const edges: [number, number][] = [];
-  while (inTree.length < sites.length) {
-    let bestD = Infinity;
-    let bestA = 0;
-    let bestB = -1;
-    for (let b = 0; b < sites.length; b++) {
-      if (inTree.includes(b)) continue;
-      for (const a of inTree) {
-        const d = dist([sites[a].u, sites[a].v], [sites[b].u, sites[b].v]);
-        if (d < bestD) {
-          bestD = d;
-          bestA = a;
-          bestB = b;
-        }
+  let loops = 0;
+  for (let i = 1; i < sites.length; i++) {
+    const p: Pt = [sites[i].u, sites[i].v];
+    let best = -1;
+    let bd = Infinity;
+    let second = -1;
+    let sd = Infinity;
+    for (let j = 0; j < i; j++) {
+      const d = dist(p, [sites[j].u, sites[j].v]);
+      if (d < bd) {
+        second = best;
+        sd = bd;
+        best = j;
+        bd = d;
+      } else if (d < sd) {
+        second = j;
+        sd = d;
       }
     }
-    if (bestB < 0) break;
-    parent[bestB] = bestA;
-    depth[bestB] = depth[bestA] + 1;
-    edges.push([bestA, bestB]);
-    inTree.push(bestB);
-  }
-
-  // One optional loop between two nearby leaves, but never a second river
-  // crossing — the valley should read as having one or two bridges.
-  const deg = new Array<number>(sites.length).fill(0);
-  for (const [a, b] of edges) {
-    deg[a]++;
-    deg[b]++;
-  }
-  if (rng() < 0.7) {
-    let bestD = Infinity;
-    let best: [number, number] | null = null;
-    for (let a = 1; a < sites.length; a++) {
-      if (deg[a] !== 1) continue;
-      for (let b = a + 1; b < sites.length; b++) {
-        if (deg[b] !== 1) continue;
-        if (parent[a] === b || parent[b] === a) continue;
-        const pa: Pt = [sites[a].u, sites[a].v];
-        const pb: Pt = [sites[b].u, sites[b].v];
-        if (bankOf(pa) !== bankOf(pb)) continue;
-        const d = dist(pa, pb);
-        if (d < 26 && d < bestD) {
-          bestD = d;
-          best = [a, b];
-        }
-      }
+    parent[i] = best;
+    depth[i] = depth[best] + 1;
+    edges.push([best, i]);
+    // A neighbourly second lane, so the network is not a pure tree. Decided
+    // per town from its own stream and capped in roster order, both of which
+    // keep the append-only property.
+    const lrng = mulberry32((seed + i * 7331 + 91) >>> 0);
+    if (
+      second >= 0 &&
+      loops < 2 &&
+      sd < 24 &&
+      bankOf(p) === bankOf([sites[second].u, sites[second].v]) &&
+      lrng() < 0.42
+    ) {
+      edges.push([second, i]);
+      loops++;
     }
-    if (best) edges.push(best);
   }
 
   const grid = buildRouteGrid(content, river);
@@ -893,7 +984,7 @@ export function generateMap(seed: number): GenesisMap {
     const goal: Pt = [pb[0] - (dx / l) * B.r * 0.85, pb[1] - (dy / l) * B.r * 0.85];
 
     const avoid = sites
-      .map((s, i) => ({ u: s.u, v: s.v, r: s.r + 1, i }))
+      .map((s, i) => ({ u: s.u, v: s.v, r: s.r + 1.6, i }))
       .filter((s) => s.i !== a && s.i !== b);
 
     let line = routeRoad(grid, start, goal, avoid);
@@ -929,6 +1020,14 @@ export function generateMap(seed: number): GenesisMap {
     }
   });
 
+  // Both ends of edge `ei` are roster indices <= the town it serves, and the
+  // edges are emitted in roster order, so the roads a smaller scale keeps are
+  // exactly a prefix of this array — and likewise the bridges hung off them.
+  const roadCount = edges.filter(([a, b]) => Math.max(a, b) < nSites).length;
+  const activeRoads = roads.slice(0, roadCount);
+  const activeRoadIds = new Set(activeRoads.map((r) => r.id));
+  const activeBridges = bridges.filter((b) => activeRoadIds.has(b.roadId));
+
   /* ---- chunks / biomes -------------------------------------------------- */
   const chunks: Chunk[] = [];
   const CU = 8;
@@ -943,8 +1042,14 @@ export function generateMap(seed: number): GenesisMap {
       const cv = v0 + ch / 2;
       const c: Pt = [cu, cv];
       const edge = Math.max(Math.abs(cu) / (bounds.u1 - 2), Math.abs(cv) / (bounds.v1 - 2));
+      // Keyed to the baseline towns only. Using the whole scale-4 roster would
+      // turn most of the valley into farmland and leave the frontier glades
+      // with nothing to fell; keying it to nBase is equally scale-independent
+      // and leaves the outer holdings standing in real woodland.
       let nearSite = Infinity;
-      for (const s of sites) nearSite = Math.min(nearSite, dist(c, [s.u, s.v]) - s.r);
+      for (let k = 0; k < nBase && k < sites.length; k++) {
+        nearSite = Math.min(nearSite, dist(c, [sites[k].u, sites[k].v]) - sites[k].r);
+      }
       const nearRiver = polyDist(c, river);
 
       let biome: Biome = 'meadow';
@@ -968,17 +1073,24 @@ export function generateMap(seed: number): GenesisMap {
   /* ---- buildings -------------------------------------------------------- */
   const GOLDEN = 2.399963;
   const siteBuildings: BuildingSpec[][] = [];
-  const landmarkOffset = Math.floor(rng() * LANDMARK_ROLES.length);
+  const siteBuilt: number[] = [];
 
   sites.forEach((site, si) => {
     const brng = mulberry32((seed * 7919 + si * 104729 + 17) >>> 0);
     const list: BuildingSpec[] = [];
     // Tie the number of plots to how much green there is, so a 4.5-tile
-    // hamlet does not have to squeeze seven roofs onto its rim.
+    // hamlet does not have to squeeze seven roofs onto its rim. `count` is the
+    // baseline (scale-1) figure and drives the ring layout, so the rings stay
+    // put no matter how many of them actually get built today.
     const count =
       si === 0
         ? clamp(Math.round((site.r - 3.2) * 1.4) + 3, 8, 10)
         : clamp(Math.round((site.r - 3.2) * 1.4) + Math.floor(brng() * 2), 3, 7);
+    const lo = si === 0 ? 3 : 2;
+    const hi = si === 0 ? 14 : 11;
+    const countAt = (x: number) => clamp(Math.round(count * buildFactor(x)), lo, hi);
+    const maxCount = countAt(SCALE_MAX);
+    siteBuilt.push(Math.min(maxCount, countAt(S)));
     const usedLabels = new Set<string>();
     // Scale the architecture to the town so a small holding does not try to
     // fit a 64px hall inside a 5-tile green.
@@ -1047,7 +1159,7 @@ export function generateMap(seed: number): GenesisMap {
       return [site.u, site.v];
     };
 
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < maxCount; i++) {
       const founding = si === 0 && i === 0;
       const landmark = founding ? false : (si === 0 ? i === 1 : i === 0);
 
@@ -1184,6 +1296,10 @@ export function generateMap(seed: number): GenesisMap {
   });
 
   /* ---- clears: which trees stand on which plot -------------------------- */
+  // Computed against the FULL building roster, not the scaled-down one. Felling
+  // is what mutates the tree list, so it has to be blind to scale or the woods
+  // would shift under the pace control. A plot that never gets built simply
+  // keeps its `clears` list and nobody ever swings the axe.
   const dead = new Set<string>();
   const protectedTrees = new Set<string>();
 
@@ -1232,7 +1348,6 @@ export function generateMap(seed: number): GenesisMap {
     farm: [['bush', 0.34], ['flowers', 0.26], ['sheep', 0.24], ['rock', 0.16]],
     wetland: [['reeds', 0.56], ['bush', 0.2], ['rock', 0.14], ['flowers', 0.1]],
   };
-  const scatterTarget = 100 + Math.floor(rng() * 80);
   {
     const srng = mulberry32((seed ^ 0x5bf03635) >>> 0);
     for (let t = 0; t < scatterTarget * 12 && scatter.length < scatterTarget; t++) {
@@ -1361,7 +1476,10 @@ export function generateMap(seed: number): GenesisMap {
   const liveTrees = trees.filter((t) => !dead.has(t.id));
 
   /* ---- assemble --------------------------------------------------------- */
-  const siteSpecs: SiteSpec[] = sites.map((s, i) => {
+  // The only place `scale` is allowed to bite: trim the roster to the towns
+  // and plots the day will actually reach. Everything above was computed
+  // against the full roster, so the trim is a pure prefix.
+  const siteSpecs: SiteSpec[] = sites.slice(0, nSites).map((s, i) => {
     const [gx, gy] = uv(s.u, s.v);
     return {
       id: s.id,
@@ -1370,7 +1488,7 @@ export function generateMap(seed: number): GenesisMap {
       gy,
       radius: s.r,
       accent: s.accent,
-      buildings: siteBuildings[i],
+      buildings: siteBuildings[i].slice(0, siteBuilt[i]),
       props: siteProps[i],
     };
   });
@@ -1384,10 +1502,10 @@ export function generateMap(seed: number): GenesisMap {
     river: river.map((p) => uv(p[0], p[1]) as Vec2),
     riverWidth,
     sites: siteSpecs,
-    roads,
-    bridges,
+    roads: activeRoads,
+    bridges: activeBridges,
     trees: liveTrees,
     scatter,
-    valleyName: valleyName(rng),
+    valleyName: valley,
   };
 }

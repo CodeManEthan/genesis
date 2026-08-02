@@ -58,8 +58,6 @@ import {
 export interface World {
   map: GenesisMap;
   timeline: Timeline;
-  /** Re-lay the same map's day at a different work pace. */
-  retime: (map: GenesisMap, pace: number) => Timeline;
   emptySnapshot: (map: GenesisMap) => WorldSnapshot;
   snapshotAt: (map: GenesisMap, tl: Timeline, t: number) => WorldSnapshot;
   advance: (snap: WorldSnapshot, tl: Timeline, toT: number) => void;
@@ -78,26 +76,28 @@ import { advance, buildTimeline, emptySnapshot, snapshotAt } from './timeline';
 
 const USE_GENERATED = true;
 
+/**
+ * `pace` is how ambitious the day is, so it belongs to the *map*: a bigger pace
+ * generates more of the valley. The timeline then paces whatever it is handed
+ * across the same 24 hours, which is why nothing here passes it along.
+ */
 function loadWorld(seed: number, pace = 1): World {
   if (USE_GENERATED) {
-    const map = generateMap(seed);
+    const map = generateMap(seed, pace);
     return {
       map,
-      timeline: buildTimeline(map, pace),
-      retime: buildTimeline,
+      timeline: buildTimeline(map),
       emptySnapshot,
       snapshotAt,
       advance,
     };
   }
+  // The fixture is one hand-written valley; there is no more of it to build.
   const map = fixtureMap();
   map.seed = seed;
-  // The fixture is a hand-written day; there is nothing in it to re-pace.
-  const retime = (m: GenesisMap) => fixtureTimeline(m);
   return {
     map,
-    timeline: retime(map),
-    retime,
+    timeline: fixtureTimeline(map),
     emptySnapshot: fixtureEmptySnapshot,
     snapshotAt: fixtureSnapshotAt,
     advance: fixtureAdvance,
@@ -107,8 +107,9 @@ function loadWorld(seed: number, pace = 1): World {
 /* --------------------------------- helpers ------------------------------- */
 
 const SPEEDS = [60, 600, 3600];
-/** How hard the valley works, which is a different question from how fast the
- * clock runs. 1 is a full day's work; 4 has the last roof on by lunchtime. */
+/** How much the valley builds today, which is a different question from how
+ * fast the clock runs. The day is always a day; at 4 it simply fills with four
+ * times the settlement, and at ½ it stays a hamlet. */
 const PACES = [0.5, 1, 2, 4];
 const PACE_LABELS = ['½', '1', '2', '4'];
 const clamp = (n: number, lo: number, hi: number) => (n < lo ? lo : n > hi ? hi : n);
@@ -374,6 +375,30 @@ export default function TheGenesis() {
       dirtyRef.current = true;
       pushLog();
     };
+
+    /** A new seed or a new pace both mean a new map, and a new map is a whole
+     * new world: ledger, baked terrain, crowd and framing all go. The clock
+     * does not — the visitor keeps their hour, and LIVE stays LIVE. */
+    const rebuild = (s: number, p: number) => {
+      seedRef.current = s;
+      paceRef.current = p;
+      world = loadWorld(s, p);
+      worldRef.current = world;
+      scene = buildGenesisScene(world.map);
+      sceneRef.current = scene;
+      setAmbientPace(amb, p);
+      snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
+      resetAmbient(scene, amb, snapRef.current);
+      settleAmbient(scene, amb, snapRef.current);
+      camRef.current = clampCam(fitCam());
+      logLenRef.current = -1;
+      pushLog();
+      setSeed(s);
+      setValley(world.map.valleyName);
+      dirtyRef.current = true;
+      paintOnce();
+    };
+
     api.current = {
       applyT,
       paint: () => {
@@ -408,42 +433,17 @@ export default function TheGenesis() {
         dirtyRef.current = true;
         if (reducedRef.current) paintOnce();
       },
-      // A different valley is a whole new world: map, ledger, baked terrain and
-      // crowd all go. The clock does not — the visitor keeps their hour, and
-      // LIVE stays LIVE.
       chooseSeed: (nextSeed) => {
         const s = nextSeed >>> 0;
         if (s === seedRef.current) return;
-        seedRef.current = s;
-        world = loadWorld(s, paceRef.current);
-        worldRef.current = world;
-        scene = buildGenesisScene(world.map);
-        sceneRef.current = scene;
-        amb = makeAmbient(paceRef.current);
-        ambRef.current = amb;
-        snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
-        settleAmbient(scene, amb, snapRef.current);
-        camRef.current = clampCam(fitCam());
-        logLenRef.current = -1;
-        pushLog();
-        setSeed(s);
-        setValley(world.map.valleyName);
-        dirtyRef.current = true;
-        paintOnce();
+        rebuild(s, paceRef.current);
       },
-      // Same map, same hour, a different day's work in it.
+      // A bigger pace is a bigger valley, so it regenerates the map too. The
+      // seed guarantees everything already on screen stays exactly where it is
+      // and simply gains neighbours.
       choosePace: (nextPace) => {
         if (nextPace === paceRef.current) return;
-        paceRef.current = nextPace;
-        world.timeline = world.retime(world.map, nextPace);
-        setAmbientPace(amb, nextPace);
-        snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
-        resetAmbient(scene, amb, snapRef.current);
-        settleAmbient(scene, amb, snapRef.current);
-        logLenRef.current = -1;
-        pushLog();
-        dirtyRef.current = true;
-        paintOnce();
+        rebuild(seedRef.current, nextPace);
       },
     };
 
@@ -585,7 +585,8 @@ export default function TheGenesis() {
     const n = (paceIndex(paceRef.current) + 1) % PACES.length;
     setPaceIdx(n);
     api.current?.choosePace(PACES[n]);
-    syncUrl(seedRef.current, PACES[n], false);
+    // A different pace is a different map, so any hand-set camera is stale too.
+    syncUrl(seedRef.current, PACES[n], true);
   }, [syncUrl]);
 
   const goLive = useCallback(() => {
@@ -735,8 +736,8 @@ export default function TheGenesis() {
           type="button"
           className="gen-pace"
           onClick={cyclePace}
-          aria-label={`Work pace: ${PACE_LABELS[paceIdx]} times a normal day's work`}
-          title="Work pace — how much the valley gets built in a day"
+          aria-label={`Ambition: ${PACE_LABELS[paceIdx]}× as much valley built today`}
+          title="Ambition — how much the valley builds today"
         >
           <span className="gen-plab" aria-hidden="true">
             pace

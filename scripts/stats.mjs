@@ -7,6 +7,10 @@
 //   node scripts/genesis-stats.mjs 7 8 9
 //   node scripts/genesis-stats.mjs --sweep 200     # invariants only, 200 seeds
 //
+// Each seed is reported at scale 1 and then checked at every scale in
+// SCALES, plus the subset-stability checks that guarantee a smaller scale is a
+// strict prefix of a larger one.
+//
 // All distances below are measured in screen-aligned u/v units (u = gx - gy,
 // v = gx + gy) — the same space gen.ts plans in and the space site.radius is
 // compared against by the renderer.
@@ -161,7 +165,9 @@ function report(seed) {
 
 /* ------------------------------- invariants ------------------------------ */
 
-function checks(seed, map) {
+const SCALES = [0.25, 0.5, 1, 2, 4];
+
+function checks(seed, map, scale = 1) {
   const river = map.river.map(toUV);
   const roadUV = new Map(map.roads.map((r) => [r.id, r.pts.map(toUV)]));
   const results = [];
@@ -244,8 +250,8 @@ function checks(seed, map) {
 
   /* (f) determinism */
   {
-    const a = JSON.stringify(generateMap(seed));
-    const b = JSON.stringify(generateMap(seed));
+    const a = JSON.stringify(generateMap(seed, scale));
+    const b = JSON.stringify(generateMap(seed, scale));
     check('f  deterministic', a === b, `${a.length} bytes`);
   }
 
@@ -297,19 +303,22 @@ function checks(seed, map) {
     check('k  trees clear river/roads', bad === 0, `${bad} violations`);
   }
   {
+    const s0b = map.sites[0].buildings.length;
     const ok =
       map.trees.length >= 400 &&
-      map.trees.length <= 950 &&
+      map.trees.length <= 1100 &&
       map.scatter.length >= 90 &&
       map.scatter.length <= 220 &&
-      map.sites.length >= 5 &&
-      map.sites.length <= 7 &&
-      map.sites[0].buildings.length >= 8 &&
-      map.sites[0].buildings.length <= 10;
+      map.sites.length >= 2 &&
+      map.sites.length <= 16 &&
+      s0b >= 3 &&
+      s0b <= 14 &&
+      // Scale 1 must still land on the hand-tuned baseline.
+      (scale !== 1 || (map.sites.length >= 5 && map.sites.length <= 7 && s0b >= 8 && s0b <= 10));
     check(
       'l  populations in spec range',
       ok,
-      `${map.sites.length} sites, s0 ${map.sites[0].buildings.length} bldg, ${map.trees.length} trees, ${map.scatter.length} scatter, ${map.bridges.length} bridges`
+      `${map.sites.length} sites, s0 ${s0b} bldg, ${map.trees.length} trees, ${map.scatter.length} scatter, ${map.bridges.length} bridges`
     );
   }
   {
@@ -318,11 +327,94 @@ function checks(seed, map) {
   }
 
   const pass = results.every((r) => r.ok);
-  console.log('\nINVARIANTS');
+  console.log(`\nINVARIANTS  seed ${seed}  scale ${scale}`);
   for (const r of results) {
     console.log(`  ${r.ok ? 'PASS' : 'FAIL'}  ${r.name.padEnd(38)} ${r.detail}`);
   }
-  console.log(`  => seed ${seed}: ${pass ? 'ALL PASS' : 'FAILURES'}`);
+  console.log(`  => seed ${seed} @ ${scale}x: ${pass ? 'ALL PASS' : 'FAILURES'}`);
+  return pass;
+}
+
+/* --------------------------- subset stability ---------------------------- */
+
+/**
+ * A smaller scale must be a strict prefix of a larger one: same land, same
+ * names, same positions, with sites / roads / per-site buildings only ever
+ * appended. This is what makes the pace control a live knob instead of a
+ * reroll, so it is checked pairwise across every adjacent pair of scales.
+ */
+function subsetChecks(seed) {
+  const maps = SCALES.map((s) => generateMap(seed, s));
+  const results = [];
+  const check = (name, ok, detail = '') => results.push({ name, ok, detail });
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  // Terrain is scale-invariant, full stop.
+  for (const field of ['river', 'riverWidth', 'chunks', 'trees', 'scatter', 'bounds', 'content', 'valleyName']) {
+    const ok = maps.every((m) => same(m[field], maps[0][field]));
+    check(`terrain: ${field} identical`, ok);
+  }
+
+  for (let k = 1; k < maps.length; k++) {
+    const lo = maps[k - 1];
+    const hi = maps[k];
+    const tag = `${SCALES[k - 1]}x < ${SCALES[k]}x`;
+
+    check(
+      `${tag}: sites grow`,
+      hi.sites.length >= lo.sites.length,
+      `${lo.sites.length} -> ${hi.sites.length}`
+    );
+    // Site identity, position, radius, accent, name and dressing must not move.
+    let bad = 0;
+    let bldBad = 0;
+    let bldShrink = 0;
+    for (let i = 0; i < lo.sites.length; i++) {
+      const a = lo.sites[i];
+      const b = hi.sites[i];
+      if (!b) {
+        bad++;
+        continue;
+      }
+      const meta = (x) => ({ id: x.id, name: x.name, gx: x.gx, gy: x.gy, radius: x.radius, accent: x.accent, props: x.props });
+      if (!same(meta(a), meta(b))) bad++;
+      if (b.buildings.length < a.buildings.length) bldShrink++;
+      for (let j = 0; j < a.buildings.length; j++) {
+        if (!same(a.buildings[j], b.buildings[j])) bldBad++;
+      }
+    }
+    check(`${tag}: site prefix identical`, bad === 0, `${bad} mismatched sites`);
+    check(`${tag}: buildings are a prefix`, bldBad === 0 && bldShrink === 0, `${bldBad} changed, ${bldShrink} shrank`);
+
+    const roadPrefix =
+      hi.roads.length >= lo.roads.length &&
+      lo.roads.every((r, i) => same(r, hi.roads[i]));
+    check(`${tag}: roads are a prefix`, roadPrefix, `${lo.roads.length} -> ${hi.roads.length}`);
+
+    const bridgePrefix =
+      hi.bridges.length >= lo.bridges.length &&
+      lo.bridges.every((b, i) => same(b, hi.bridges[i]));
+    check(`${tag}: bridges are a prefix`, bridgePrefix, `${lo.bridges.length} -> ${hi.bridges.length}`);
+  }
+
+  // The default argument must be exactly scale 1.
+  check(
+    'default scale === explicit 1',
+    JSON.stringify(generateMap(seed)) === JSON.stringify(generateMap(seed, 1))
+  );
+  // Out-of-range scales clamp rather than explode.
+  check(
+    'scale clamps to [0.25, 4]',
+    JSON.stringify(generateMap(seed, 0.01)) === JSON.stringify(generateMap(seed, 0.25)) &&
+      JSON.stringify(generateMap(seed, 99)) === JSON.stringify(generateMap(seed, 4))
+  );
+
+  const pass = results.every((r) => r.ok);
+  console.log(`\nSUBSET STABILITY  seed ${seed}`);
+  for (const r of results) {
+    console.log(`  ${r.ok ? 'PASS' : 'FAIL'}  ${r.name.padEnd(38)} ${r.detail}`);
+  }
+  console.log(`  => seed ${seed} subset: ${pass ? 'ALL PASS' : 'FAILURES'}`);
   return pass;
 }
 
@@ -331,28 +423,51 @@ function checks(seed, map) {
 const argv = process.argv.slice(2);
 let allPass = true;
 
+const quietly = (fn) => {
+  const out = [];
+  const orig = console.log;
+  console.log = (...a) => out.push(a.join(' '));
+  let ok;
+  try {
+    ok = fn();
+  } finally {
+    console.log = orig;
+  }
+  return { ok, out };
+};
+
 if (argv[0] === '--sweep') {
   const n = Number(argv[1] || 100);
-  const fails = [];
-  for (let s = 1; s <= n; s++) {
-    const map = generateMap(s);
-    const out = [];
-    const orig = console.log;
-    console.log = (...a) => out.push(a.join(' '));
-    const ok = checks(s, map);
-    console.log = orig;
-    if (!ok) {
-      fails.push(s);
-      console.log(out.join('\n'));
+  for (const scale of [1, 4]) {
+    const fails = [];
+    for (let s = 1; s <= n; s++) {
+      const r = quietly(() => checks(s, generateMap(s, scale), scale));
+      if (!r.ok) {
+        fails.push(s);
+        console.log(r.out.join('\n'));
+      }
+    }
+    console.log(`sweep ${n} seeds @ ${scale}x: ${fails.length ? `FAIL ${fails.join(',')}` : 'ALL PASS'}`);
+    if (fails.length) allPass = false;
+  }
+  const subFails = [];
+  for (let s = 1; s <= Math.min(n, 60); s++) {
+    const r = quietly(() => subsetChecks(s));
+    if (!r.ok) {
+      subFails.push(s);
+      console.log(r.out.join('\n'));
     }
   }
-  console.log(`\nsweep ${n} seeds: ${fails.length ? `FAIL ${fails.join(',')}` : 'ALL PASS'}`);
-  allPass = fails.length === 0;
+  console.log(`sweep ${Math.min(n, 60)} seeds subset stability: ${subFails.length ? `FAIL ${subFails.join(',')}` : 'ALL PASS'}`);
+  if (subFails.length) allPass = false;
 } else {
   const seeds = argv.length ? argv.map(Number) : [1, 42, 20260802];
   for (const s of seeds) {
-    const map = report(s);
-    if (!checks(s, map)) allPass = false;
+    report(s);
+    for (const scale of SCALES) {
+      if (!checks(s, generateMap(s, scale), scale)) allPass = false;
+    }
+    if (!subsetChecks(s)) allPass = false;
   }
 }
 
