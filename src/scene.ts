@@ -171,6 +171,12 @@ export interface Ambient {
   /** Cheap fingerprint of everything the ambient layer derives from. */
   sig: string;
   rng: () => number;
+  /**
+   * Work pace, matching the pace the timeline was built at. It never changes
+   * *what* the ambient layer does, only how hard it looks: legs and hammers run
+   * at sqrt(pace), and a busy valley puts an extra hand or two on each site.
+   */
+  pace: number;
 }
 
 interface RoadGeo {
@@ -512,7 +518,7 @@ const BOT_COLORS = ['#ef7f93', '#63c9a8', '#9b8fe8', '#f0c75e', '#6cc4d9', '#e98
 const BOT_SPEED = 1.3; // tiles per second
 const WALK_SPEED = 1.05;
 
-export function makeAmbient(): Ambient {
+export function makeAmbient(pace = 1): Ambient {
   return {
     bots: [],
     walkers: [],
@@ -522,7 +528,25 @@ export function makeAmbient(): Ambient {
     wheels: [],
     sig: '',
     rng: mulberry32(4242),
+    pace: paceOf(pace),
   };
+}
+
+const paceOf = (p: number) => (Number.isFinite(p) ? Math.max(0.25, Math.min(4, p)) : 1);
+
+/** How much faster legs and hammers move. */
+const paceRate = (amb: Ambient) => Math.sqrt(amb.pace);
+
+/** Extra hands per site once the valley is working above a normal day. */
+const paceCrew = (amb: Ambient) =>
+  amb.pace > 1 ? Math.min(2, Math.round(Math.sqrt(amb.pace))) : 0;
+
+/** Retune the crowd for a new work pace. The next sync re-derives the counts. */
+export function setAmbientPace(amb: Ambient, pace: number): void {
+  const p = paceOf(pace);
+  if (p === amb.pace) return;
+  amb.pace = p;
+  amb.sig = '';
 }
 
 /** A fingerprint of everything the ambient layer keys off. */
@@ -600,9 +624,12 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
   const rng = amb.rng;
 
   /* ---- population ------------------------------------------------------ */
+  const extra = paceCrew(amb);
   for (const site of scene.map.sites) {
     const founded = snap.founded.has(site.id);
-    const want = founded ? Math.max(1, Math.min(snap.population.get(site.id) ?? 1, 8)) : 0;
+    const want = founded
+      ? Math.max(1, Math.min((snap.population.get(site.id) ?? 1) + extra, 8 + extra))
+      : 0;
     const mine = amb.bots.filter((b) => b.site === site.id);
     if (mine.length > want) {
       const drop = new Set(mine.slice(want));
@@ -684,6 +711,7 @@ export function stepAmbient(
   dt: number
 ): void {
   const rng = amb.rng;
+  const rate = paceRate(amb);
 
   for (const site of scene.map.sites) {
     if (!snap.founded.has(site.id)) continue;
@@ -692,7 +720,7 @@ export function stepAmbient(
     const tasks = siteTasks(scene, site, snap);
 
     crew.forEach((bot, i) => {
-      bot.phase += dt;
+      bot.phase += dt * rate;
       const task = tasks.length ? tasks[i % tasks.length] : null;
 
       if (task) {
@@ -702,7 +730,7 @@ export function stepAmbient(
             : [task.gx + bot.jx * 0.9 + 1.1, task.gy + bot.jy * 0.9 + 1.1];
         bot.tx = goal[0];
         bot.ty = goal[1];
-        const moved = moveTo(bot, dt, task.action === 'carry' ? 'carry' : 'walk');
+        const moved = moveTo(bot, dt, task.action === 'carry' ? 'carry' : 'walk', rate);
         if (!moved) {
           if (task.action === 'carry') {
             bot.action = 'carry';
@@ -719,7 +747,7 @@ export function stepAmbient(
       }
 
       // Nothing to build: drift between the finished houses.
-      const moving = moveTo(bot, dt, 'walk');
+      const moving = moveTo(bot, dt, 'walk', rate);
       if (!moving) {
         bot.action = 'idle';
         bot.timer -= dt;
@@ -739,8 +767,8 @@ export function stepAmbient(
     if (!road) continue;
     const geo = scene.roadGeo.get(road.id)!;
     const end = geo.len * (snap.roads.get(road.id) ?? 0);
-    w.phase += dt;
-    w.s += WALK_SPEED * dt * w.dir;
+    w.phase += dt * rate;
+    w.s += WALK_SPEED * rate * dt * w.dir;
     if (w.s >= end) {
       w.s = end;
       w.dir = -1;
@@ -759,12 +787,12 @@ export function stepAmbient(
 }
 
 /** @returns true while the bot is still travelling. */
-function moveTo(bot: Bot, dt: number, action: BotAction): boolean {
+function moveTo(bot: Bot, dt: number, action: BotAction, rate = 1): boolean {
   const dx = bot.tx - bot.gx;
   const dy = bot.ty - bot.gy;
   const d = Math.hypot(dx, dy);
   if (d < 0.18) return false;
-  const step = BOT_SPEED * dt;
+  const step = BOT_SPEED * rate * dt;
   if (d <= step) {
     bot.gx = bot.tx;
     bot.gy = bot.ty;

@@ -33,6 +33,7 @@ import {
   makeAmbient,
   renderGenesis,
   resetAmbient,
+  setAmbientPace,
   settleAmbient,
   stepAmbient,
   syncAmbient,
@@ -57,6 +58,8 @@ import {
 export interface World {
   map: GenesisMap;
   timeline: Timeline;
+  /** Re-lay the same map's day at a different work pace. */
+  retime: (map: GenesisMap, pace: number) => Timeline;
   emptySnapshot: (map: GenesisMap) => WorldSnapshot;
   snapshotAt: (map: GenesisMap, tl: Timeline, t: number) => WorldSnapshot;
   advance: (snap: WorldSnapshot, tl: Timeline, toT: number) => void;
@@ -75,16 +78,26 @@ import { advance, buildTimeline, emptySnapshot, snapshotAt } from './timeline';
 
 const USE_GENERATED = true;
 
-function loadWorld(seed: number): World {
+function loadWorld(seed: number, pace = 1): World {
   if (USE_GENERATED) {
     const map = generateMap(seed);
-    return { map, timeline: buildTimeline(map), emptySnapshot, snapshotAt, advance };
+    return {
+      map,
+      timeline: buildTimeline(map, pace),
+      retime: buildTimeline,
+      emptySnapshot,
+      snapshotAt,
+      advance,
+    };
   }
   const map = fixtureMap();
   map.seed = seed;
+  // The fixture is a hand-written day; there is nothing in it to re-pace.
+  const retime = (m: GenesisMap) => fixtureTimeline(m);
   return {
     map,
-    timeline: fixtureTimeline(map),
+    timeline: retime(map),
+    retime,
     emptySnapshot: fixtureEmptySnapshot,
     snapshotAt: fixtureSnapshotAt,
     advance: fixtureAdvance,
@@ -94,8 +107,24 @@ function loadWorld(seed: number): World {
 /* --------------------------------- helpers ------------------------------- */
 
 const SPEEDS = [60, 600, 3600];
+/** How hard the valley works, which is a different question from how fast the
+ * clock runs. 1 is a full day's work; 4 has the last roof on by lunchtime. */
+const PACES = [0.5, 1, 2, 4];
+const PACE_LABELS = ['½', '1', '2', '4'];
 const clamp = (n: number, lo: number, hi: number) => (n < lo ? lo : n > hi ? hi : n);
 const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+
+/** Nearest rung of the pace ladder to an arbitrary `?pace=`. */
+function paceIndex(p: number): number {
+  let best = 1;
+  for (let i = 0; i < PACES.length; i++) {
+    if (Math.abs(PACES[i] - p) < Math.abs(PACES[best] - p)) best = i;
+  }
+  return best;
+}
+
+const randomSeed = () => Math.floor(Math.random() * 4294967296) >>> 0;
+const stepSeed = (seed: number, d: 1 | -1) => (seed + d + 4294967296) % 4294967296 >>> 0;
 
 function fmtClock(t: number): string {
   const c = clamp(t, 0, 23.9999);
@@ -133,7 +162,13 @@ export default function TheGenesis() {
   const [speedIdx, setSpeedIdx] = useState(1);
   const [tDisp, setTDisp] = useState(0);
   const [valley, setValley] = useState('');
+  const [seed, setSeed] = useState(0);
+  const [paceIdx, setPaceIdx] = useState(1);
   const [lines, setLines] = useState<{ t: number; text: string }[]>([]);
+
+  /** The seed the date hands out; "Today" is whatever this is. */
+  const todayRef = useRef(0);
+  if (!todayRef.current) todayRef.current = hashSeed(utcDateKey());
 
   const worldRef = useRef<World | null>(null);
   const sceneRef = useRef<GenesisScene | null>(null);
@@ -148,6 +183,8 @@ export default function TheGenesis() {
   const dirtyRef = useRef(true);
   const reducedRef = useRef(false);
   const logLenRef = useRef(0);
+  const seedRef = useRef(0);
+  const paceRef = useRef(1);
 
   const api = useRef<{
     applyT: (t: number) => void;
@@ -155,7 +192,28 @@ export default function TheGenesis() {
     fit: () => void;
     stepZoom: (dir: 1 | -1, ax?: number, ay?: number) => void;
     pan: (dx: number, dy: number) => void;
+    chooseSeed: (seed: number) => void;
+    choosePace: (pace: number) => void;
   } | null>(null);
+
+  /** Worlds stay shareable: the address bar always describes what is on screen,
+   * and says nothing it does not have to. */
+  const syncUrl = useCallback((nextSeed: number, nextPace: number, newMap: boolean) => {
+    const url = new URL(window.location.href);
+    const q = url.searchParams;
+    if (nextSeed === todayRef.current) q.delete('seed');
+    else q.set('seed', String(nextSeed >>> 0));
+    if (nextPace === 1) q.delete('pace');
+    else q.set('pace', String(nextPace));
+    // A different valley invalidates any hand-set camera in the URL.
+    if (newMap) {
+      q.delete('zoom');
+      q.delete('cx');
+      q.delete('cy');
+    }
+    const s = q.toString();
+    window.history.replaceState(null, '', `${url.pathname}${s ? `?${s}` : ''}${url.hash}`);
+  }, []);
 
   /* ------------------------------- sizing ------------------------------- */
   useEffect(() => {
@@ -190,8 +248,14 @@ export default function TheGenesis() {
     if (!worldRef.current) {
       const q = new URLSearchParams(window.location.search);
       const qSeed = Number(q.get('seed'));
-      const seed = q.has('seed') && isFinite(qSeed) ? qSeed >>> 0 : hashSeed(utcDateKey());
-      const world = loadWorld(seed);
+      const seed0 = q.has('seed') && isFinite(qSeed) ? qSeed >>> 0 : todayRef.current;
+      const qPace = Number(q.get('pace'));
+      const pace0 = PACES[q.has('pace') && isFinite(qPace) ? paceIndex(qPace) : 1];
+      seedRef.current = seed0;
+      paceRef.current = pace0;
+      setSeed(seed0);
+      setPaceIdx(paceIndex(pace0));
+      const world = loadWorld(seed0, pace0);
       worldRef.current = world;
       setValley(world.map.valleyName);
 
@@ -207,16 +271,18 @@ export default function TheGenesis() {
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
       sceneRef.current = buildGenesisScene(world.map);
-      ambRef.current = makeAmbient();
+      ambRef.current = makeAmbient(pace0);
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
       logLenRef.current = snapRef.current.log.length;
       setLines(snapRef.current.log.slice(-3));
       setReady(true);
     }
 
-    const world = worldRef.current!;
-    const scene = sceneRef.current!;
-    const amb = ambRef.current!;
+    // Reassigned wholesale when the visitor picks a different valley, so
+    // everything downstream keeps talking to the world that is on screen.
+    let world = worldRef.current!;
+    let scene = sceneRef.current!;
+    let amb = ambRef.current!;
 
     const vw = Math.max(1, Math.round(size.w));
     const vh = Math.max(1, Math.round(size.h));
@@ -227,28 +293,29 @@ export default function TheGenesis() {
     ctx.imageSmoothingEnabled = false;
 
     /* ---- zoom ladder: fitted overview, then whole-pixel steps ---------- */
-    const c = world.map.content;
-    const contentW = Math.max(1, (c.u1 - c.u0) * (TW / 2));
-    const contentH = Math.max(1, (c.v1 - c.v0) * (TH / 2));
-    const raw = Math.min(vw / contentW, vh / contentH);
-    // Above 1× the art wants whole-number magnification or the tile edges go
-    // uneven; below it, any scale is fine because we are downsampling.
-    const overview = raw >= 1 ? Math.max(1, Math.floor(raw)) : Math.max(0.24, raw);
-    const ladder: number[] = [overview];
-    for (const z of [0.5, 1, 2, 3, 4]) {
-      if (z > ladder[ladder.length - 1] * 1.15) ladder.push(z);
-    }
-    while (ladder.length < 4) ladder.push(ladder[ladder.length - 1] * 2);
-    ladderRef.current = ladder;
-
+    // Both are derived from the *current* map, so a new valley reframes and
+    // re-rungs the ladder without the effect having to run again.
     const fitCam = (): Cam => {
-      const z = overview;
+      const c = world.map.content;
+      const contentW = Math.max(1, (c.u1 - c.u0) * (TW / 2));
+      const contentH = Math.max(1, (c.v1 - c.v0) * (TH / 2));
+      const raw = Math.min(vw / contentW, vh / contentH);
+      // Above 1× the art wants whole-number magnification or the tile edges go
+      // uneven; below it, any scale is fine because we are downsampling.
+      const overview = raw >= 1 ? Math.max(1, Math.floor(raw)) : Math.max(0.24, raw);
+      const ladder: number[] = [overview];
+      for (const z of [0.5, 1, 2, 3, 4]) {
+        if (z > ladder[ladder.length - 1] * 1.15) ladder.push(z);
+      }
+      while (ladder.length < 4) ladder.push(ladder[ladder.length - 1] * 2);
+      ladderRef.current = ladder;
       return {
-        zoom: z,
-        cx: c.u0 * (TW / 2) + contentW / 2 - vw / z / 2,
-        cy: c.v0 * (TH / 2) + contentH / 2 - vh / z / 2,
+        zoom: overview,
+        cx: c.u0 * (TW / 2) + contentW / 2 - vw / overview / 2,
+        cy: c.v0 * (TH / 2) + contentH / 2 - vh / overview / 2,
       };
     };
+    const home = fitCam();
 
     const clampCam = (cam: Cam): Cam => {
       const PAD = 160;
@@ -264,7 +331,7 @@ export default function TheGenesis() {
     };
 
     if (!camRef.current) {
-      camRef.current = fitCam();
+      camRef.current = home;
       // Dev-only camera params, used by the screenshot harness to inspect a
       // particular corner of the valley at a particular magnification.
       const q = new URLSearchParams(window.location.search);
@@ -340,6 +407,43 @@ export default function TheGenesis() {
         clampCam(cam);
         dirtyRef.current = true;
         if (reducedRef.current) paintOnce();
+      },
+      // A different valley is a whole new world: map, ledger, baked terrain and
+      // crowd all go. The clock does not — the visitor keeps their hour, and
+      // LIVE stays LIVE.
+      chooseSeed: (nextSeed) => {
+        const s = nextSeed >>> 0;
+        if (s === seedRef.current) return;
+        seedRef.current = s;
+        world = loadWorld(s, paceRef.current);
+        worldRef.current = world;
+        scene = buildGenesisScene(world.map);
+        sceneRef.current = scene;
+        amb = makeAmbient(paceRef.current);
+        ambRef.current = amb;
+        snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
+        settleAmbient(scene, amb, snapRef.current);
+        camRef.current = clampCam(fitCam());
+        logLenRef.current = -1;
+        pushLog();
+        setSeed(s);
+        setValley(world.map.valleyName);
+        dirtyRef.current = true;
+        paintOnce();
+      },
+      // Same map, same hour, a different day's work in it.
+      choosePace: (nextPace) => {
+        if (nextPace === paceRef.current) return;
+        paceRef.current = nextPace;
+        world.timeline = world.retime(world.map, nextPace);
+        setAmbientPace(amb, nextPace);
+        snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
+        resetAmbient(scene, amb, snapRef.current);
+        settleAmbient(scene, amb, snapRef.current);
+        logLenRef.current = -1;
+        pushLog();
+        dirtyRef.current = true;
+        paintOnce();
       },
     };
 
@@ -466,6 +570,24 @@ export default function TheGenesis() {
     });
   }, []);
 
+  /* -------------------------------- worlds ------------------------------- */
+  const pickSeed = useCallback(
+    (next: number) => {
+      const s = next >>> 0;
+      if (s === seedRef.current) return;
+      api.current?.chooseSeed(s);
+      syncUrl(s, paceRef.current, true);
+    },
+    [syncUrl]
+  );
+
+  const cyclePace = useCallback(() => {
+    const n = (paceIndex(paceRef.current) + 1) % PACES.length;
+    setPaceIdx(n);
+    api.current?.choosePace(PACES[n]);
+    syncUrl(seedRef.current, PACES[n], false);
+  }, [syncUrl]);
+
   const goLive = useCallback(() => {
     modeRef.current = 'live';
     setMode('live');
@@ -526,6 +648,49 @@ export default function TheGenesis() {
         {latest}
       </p>
 
+      <div className="gen-world" role="group" aria-label="Which valley">
+        <div className="gen-wrow">
+          <button
+            type="button"
+            className="gen-wshuffle"
+            onClick={() => pickSeed(randomSeed())}
+            title="Generate a valley from a random seed"
+          >
+            New valley
+          </button>
+          <button
+            type="button"
+            className="gen-wstep"
+            onClick={() => pickSeed(stepSeed(seedRef.current, -1))}
+            aria-label="Previous seed"
+            title="Previous seed"
+          >
+            ‹
+          </button>
+          <button
+            type="button"
+            className="gen-wstep"
+            onClick={() => pickSeed(stepSeed(seedRef.current, 1))}
+            aria-label="Next seed"
+            title="Next seed"
+          >
+            ›
+          </button>
+          <button
+            type="button"
+            className={`gen-wtoday${seed === todayRef.current ? ' on' : ''}`}
+            onClick={() => pickSeed(todayRef.current)}
+            aria-pressed={seed === todayRef.current}
+            title="Back to the valley this date generates"
+          >
+            Today
+          </button>
+        </div>
+        <p className="gen-wid">
+          {valley || '…'} <span>· seed {seed}</span>
+        </p>
+      </div>
+
       <div className="gen-zoom">
         <button type="button" onClick={() => api.current?.stepZoom(1)} aria-label="Zoom in">
           +
@@ -565,6 +730,18 @@ export default function TheGenesis() {
           title="Playback speed"
         >
           ×{SPEEDS[speedIdx]}
+        </button>
+        <button
+          type="button"
+          className="gen-pace"
+          onClick={cyclePace}
+          aria-label={`Work pace: ${PACE_LABELS[paceIdx]} times a normal day's work`}
+          title="Work pace — how much the valley gets built in a day"
+        >
+          <span className="gen-plab" aria-hidden="true">
+            pace
+          </span>
+          <b aria-hidden="true">{PACE_LABELS[paceIdx]}×</b>
         </button>
 
         <div className="gen-scrub">
@@ -660,6 +837,28 @@ const CSS = `
   font-variant-numeric: tabular-nums;
   font-size: 0.82rem;
 }
+/* Work pace is not playback speed, so it does not look like it: warmer fill,
+   a standing label, and the multiplier the other way round. */
+.gen-pace {
+  height: 32px;
+  padding: 0 9px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  background: rgba(240, 199, 94, 0.26);
+  border-color: rgba(160, 120, 24, 0.28) !important;
+}
+.gen-bar button.gen-pace:hover { background: rgba(240, 199, 94, 0.5); }
+.gen-plab {
+  font-size: 0.5rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+.gen-pace b { font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+
 .gen-scrub { position: relative; flex: 1 1 200px; min-width: 120px; height: 32px; }
 .gen-track {
   position: absolute;
@@ -731,6 +930,57 @@ const CSS = `
 }
 .gen-zoom button:hover { background: #fff; }
 
+.gen-world {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-start;
+}
+.gen-wrow {
+  display: flex;
+  gap: 5px;
+  padding: 5px;
+  border-radius: 10px;
+  background: rgba(253, 248, 239, 0.92);
+  border: 1px solid rgba(65, 58, 85, 0.14);
+  box-shadow: 0 3px 10px rgba(31, 28, 45, 0.2);
+}
+.gen-world button {
+  font: inherit;
+  font-size: 0.72rem;
+  height: 26px;
+  color: #413a55;
+  background: rgba(99, 201, 168, 0.16);
+  border: 1px solid rgba(65, 58, 85, 0.12);
+  border-radius: 7px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 0 9px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.gen-world button:hover { background: rgba(99, 201, 168, 0.36); }
+.gen-wstep { width: 24px; padding: 0 !important; font-size: 0.85rem !important; }
+.gen-wtoday.on { background: #63c9a8; color: #17301f; font-weight: 700; }
+.gen-wid {
+  margin: 0;
+  padding: 3px 8px;
+  border-radius: 7px;
+  font-size: 0.68rem;
+  line-height: 1.3;
+  font-weight: 700;
+  color: #413a55;
+  background: rgba(253, 248, 239, 0.82);
+  border: 1px solid rgba(65, 58, 85, 0.1);
+}
+.gen-wid span {
+  font-weight: 400;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
 .gen-ticker {
   position: absolute;
   left: 16px;
@@ -782,5 +1032,7 @@ const CSS = `
 @media (max-width: 620px) {
   .gen-clock { display: none; }
   .gen-ticker { max-width: 62vw; bottom: 74px; }
+  .gen-wid span { display: none; }
+  .gen-world button { font-size: 0.68rem; padding: 0 7px; }
 }
 `;

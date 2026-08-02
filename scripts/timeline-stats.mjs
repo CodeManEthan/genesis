@@ -254,11 +254,16 @@ function serialize(snap) {
   });
 }
 
-function run(label, map) {
+function run(label, map, pace = 1) {
   const fails = [];
   const bad = (msg) => fails.push(msg);
 
-  const tl = buildTimeline(map);
+  // at pace != 1 the day is deliberately re-scaled and may be cut off at
+  // midnight, so the "everything finishes" family of checks does not apply
+  const full = pace === 1;
+  const truncated = pace < 1;
+
+  const tl = pace === 1 ? buildTimeline(map) : buildTimeline(map, pace);
   const ev = tl.events;
 
   const siteIds = new Set(map.sites.map((s) => s.id));
@@ -330,7 +335,7 @@ function run(label, map) {
       continue;
     }
     if (!surveyT.has(id)) {
-      bad(`(c) no survey for ${id}`);
+      if (!truncated) bad(`(c) no survey for ${id}`);
       continue;
     }
     const sT = surveyT.get(id);
@@ -342,7 +347,7 @@ function run(label, map) {
     }
     const list = buildsOf.get(id) ?? [];
     if (!list.length) {
-      bad(`(c) no build events for ${id}`);
+      if (!truncated) bad(`(c) no build events for ${id}`);
       continue;
     }
     if (list[0].t < sT - 1e-9) bad(`(c) ${id}: build before survey`);
@@ -351,7 +356,8 @@ function run(label, map) {
       if (!(e.progress > prev)) bad(`(c) ${id}: progress not strictly monotonic (${prev} -> ${e.progress})`);
       prev = e.progress;
     }
-    if (list[list.length - 1].progress !== 1) bad(`(c) ${id}: last progress ${prev} !== 1`);
+    if (!truncated && list[list.length - 1].progress !== 1)
+      bad(`(c) ${id}: last progress ${prev} !== 1`);
   }
 
   /* (d) roads monotonic, end at 1 */
@@ -364,7 +370,7 @@ function run(label, map) {
   for (const r of map.roads) {
     const list = roadEv.get(r.id) ?? [];
     if (!list.length) {
-      bad(`(d) road ${r.id} never built`);
+      if (!truncated) bad(`(d) road ${r.id} never built`);
       continue;
     }
     let prev = 0;
@@ -372,15 +378,16 @@ function run(label, map) {
       if (!(e.frac > prev)) bad(`(d) ${r.id}: frac not monotonic (${prev} -> ${e.frac})`);
       prev = e.frac;
     }
-    if (Math.abs(prev - 1) > 1e-9) bad(`(d) ${r.id}: last frac ${prev} !== 1`);
+    if (!truncated && Math.abs(prev - 1) > 1e-9) bad(`(d) ${r.id}: last frac ${prev} !== 1`);
   }
 
   /* (e) bridge stages 1,2,3 in order, stage 3 gates the road */
   for (const br of map.bridges) {
     const stages = ev.filter((e) => e.type === 'bridge' && e.bridgeId === br.id);
     const nums = stages.map((s) => s.stage);
-    if (nums.join(',') !== '1,2,3') bad(`(e) ${br.id}: stages [${nums}] !== 1,2,3`);
-    const t3 = stages.length ? stages[stages.length - 1].t : Infinity;
+    const want = truncated ? '1,2,3'.slice(0, Math.max(0, nums.length * 2 - 1)) : '1,2,3';
+    if (nums.join(',') !== want) bad(`(e) ${br.id}: stages [${nums}] !== ${want}`);
+    const t3 = nums[nums.length - 1] === 3 ? stages[stages.length - 1].t : Infinity;
     const road = roadById.get(br.roadId);
     if (!road) continue;
     const bf = fracOf(road.pts, br.gx, br.gy);
@@ -395,7 +402,12 @@ function run(label, map) {
   for (let i = 1; i < map.sites.length; i++) {
     const s = map.sites[i];
     if (!foundT.has(s.id)) {
-      bad(`(f) site ${s.id} never founded`);
+      if (!truncated) bad(`(f) site ${s.id} never founded`);
+      // truncated day: the site was never reached, so it must be untouched
+      else
+        for (const b of s.buildings)
+          if (surveyT.has(b.id) || buildsOf.has(b.id))
+            bad(`(f) ${b.id} has events but ${s.id} was never founded`);
       continue;
     }
     const fT = foundT.get(s.id);
@@ -420,24 +432,37 @@ function run(label, map) {
   /* (g) the last roof lands in the evening window */
   const builds = ev.filter((e) => e.type === 'build');
   const lastBuild = builds.length ? builds[builds.length - 1].t : 0;
-  if (builds.length && !(lastBuild >= 19.5 && lastBuild <= 22.5))
+  if (full && builds.length && !(lastBuild >= 19.5 && lastBuild <= 22.5))
     bad(`(g) last build at ${hhmm(lastBuild)} outside 19:30..22:30`);
 
   /* (h) determinism */
-  const again = buildTimeline(map);
-  if (JSON.stringify(again.events) !== JSON.stringify(ev)) bad(`(h) buildTimeline not deterministic`);
+  const again = pace === 1 ? buildTimeline(map) : buildTimeline(map, pace);
+  if (JSON.stringify(again.events) !== JSON.stringify(ev))
+    bad(`(h) buildTimeline not deterministic at pace ${pace}`);
 
   /* (i) end state complete */
   const end = snapshotAt(map, tl, 24);
-  for (const [id] of buildingById) {
-    const st = end.buildings.get(id);
-    if (!st || st.status !== 'done' || st.progress !== 1)
-      bad(`(i) ${id} not done at t=24 (${st ? st.status + ' ' + st.progress : 'missing'})`);
+  if (!truncated) {
+    for (const [id] of buildingById) {
+      const st = end.buildings.get(id);
+      if (!st || st.status !== 'done' || st.progress !== 1)
+        bad(`(i) ${id} not done at t=24 (${st ? st.status + ' ' + st.progress : 'missing'})`);
+    }
+    for (const r of map.roads)
+      if (end.roads.get(r.id) !== 1) bad(`(i) road ${r.id} frac ${end.roads.get(r.id)} !== 1`);
+    for (const b of map.bridges)
+      if (end.bridges.get(b.id) !== 3) bad(`(i) bridge ${b.id} stage ${end.bridges.get(b.id)} !== 3`);
+    for (const s of map.sites) if (!end.founded.has(s.id)) bad(`(i) site ${s.id} never founded`);
+    for (const id of propIds) if (!end.props.has(id)) bad(`(i) prop ${id} never appeared`);
+  } else {
+    // the sun goes down on unfinished work — that is the whole point
+    const unfinished = [...end.buildings.values()].filter((b) => b.status !== 'done').length;
+    if (!unfinished) bad(`(i') pace ${pace}: every building finished, expected some still up on props`);
+    if (map.roads.length) {
+      const partial = map.roads.filter((r) => (end.roads.get(r.id) ?? 0) < 1).length;
+      if (!partial) bad(`(i') pace ${pace}: every road reached frac 1, expected some part-built`);
+    }
   }
-  for (const r of map.roads) if (end.roads.get(r.id) !== 1) bad(`(i) road ${r.id} frac ${end.roads.get(r.id)} !== 1`);
-  for (const b of map.bridges) if (end.bridges.get(b.id) !== 3) bad(`(i) bridge ${b.id} stage ${end.bridges.get(b.id)} !== 3`);
-  for (const s of map.sites) if (!end.founded.has(s.id)) bad(`(i) site ${s.id} never founded`);
-  for (const id of propIds) if (!end.props.has(id)) bad(`(i) prop ${id} never appeared`);
 
   /* (j) incremental advance == full recompute */
   const hop = emptySnapshot(map);
@@ -452,16 +477,18 @@ function run(label, map) {
   /* (k) day arc: first road mid-morning, ledger well spread, quiet close */
   const roadEvents = ev.filter((e) => e.type === 'road');
   const firstRoad = roadEvents.length ? roadEvents[0].t : null;
-  if (firstRoad !== null && firstRoad < 6)
+  if (full && firstRoad !== null && firstRoad < 6)
     bad(`(k) first road at ${hhmm(firstRoad)} — too early for a mid-morning push`);
   const logs = ev.filter((e) => e.type === 'log');
-  if (logs.length < 25 || logs.length > 45) bad(`(k) ${logs.length} log lines, want 25..45`);
-  if (!logs.some((l) => l.t > 22)) bad(`(k) nothing in the ledger after 22:00`);
-  // no six-hour dead patch in the ledger
-  let prevLog = 0;
-  for (const l of logs) {
-    if (l.t - prevLog > 4.5) bad(`(k) ledger gap ${hhmm(prevLog)} -> ${hhmm(l.t)}`);
-    prevLog = l.t;
+  if (full) {
+    if (logs.length < 25 || logs.length > 45) bad(`(k) ${logs.length} log lines, want 25..45`);
+    if (!logs.some((l) => l.t > 22)) bad(`(k) nothing in the ledger after 22:00`);
+    // no six-hour dead patch in the ledger
+    let prevLog = 0;
+    for (const l of logs) {
+      if (l.t - prevLog > 4.5) bad(`(k) ledger gap ${hhmm(prevLog)} -> ${hhmm(l.t)}`);
+      prevLog = l.t;
+    }
   }
 
   /* --- report ----------------------------------------------------------- */
@@ -481,7 +508,7 @@ function run(label, map) {
   }
 
   console.log(`\n${'='.repeat(72)}`);
-  console.log(`${fails.length ? 'FAIL' : 'PASS'}  ${label}`);
+  console.log(`${fails.length ? 'FAIL' : 'PASS'}  ${label}${full ? '' : `   [pace ${pace}]`}`);
   console.log(
     `  sites ${map.sites.length}  buildings ${buildingById.size}  roads ${map.roads.length}  ` +
       `bridges ${map.bridges.length}  trees ${map.trees.length} (clearable ${clearable.size})`,
@@ -501,7 +528,7 @@ function run(label, map) {
   const foundLine = [...foundT.entries()].map(([k, v]) => `${k}@${hhmm(v)}`).join(' ');
   if (foundLine) console.log(`  foundings: ${foundLine}`);
   for (const m of fails) console.log(`  ! ${m}`);
-  return { fails, ev, tl, map };
+  return { fails, ev, tl, map, lastBuild, pace };
 }
 
 function sampleLogs(ev, n = 8) {
@@ -552,16 +579,84 @@ if (generateMap) {
 }
 
 let failed = 0;
+let total = 0;
 let showcase = null;
 let showcaseIsReal = false;
+const pace1LastBuild = new Map();
+
 for (const [label, map] of cases) {
   const r = run(label, map);
+  total++;
   if (r.fails.length) failed++;
+  pace1LastBuild.set(map, r.lastBuild);
   // prefer a real generated map for the flavour sample
   const real = label.startsWith('gen.ts');
   if (!showcase || (real && !showcaseIsReal)) {
     showcase = r;
     showcaseIsReal = real;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* pace — the same worlds at half and double the work rate                    */
+/* -------------------------------------------------------------------------- */
+
+// pace is clamped to [0.25, 4]
+for (const [label, map] of cases.slice(0, 2)) {
+  const lo = JSON.stringify(buildTimeline(map, 0.25).events);
+  const hi = JSON.stringify(buildTimeline(map, 4).events);
+  if (JSON.stringify(buildTimeline(map, 0.01).events) !== lo)
+    (console.log(`\n! pace 0.01 not clamped to 0.25 for ${label}`), failed++);
+  if (JSON.stringify(buildTimeline(map, 999).events) !== hi)
+    (console.log(`\n! pace 999 not clamped to 4 for ${label}`), failed++);
+  total += 2;
+}
+
+// buildTimeline(map, 1) must be indistinguishable from buildTimeline(map)
+for (const [label, map] of cases) {
+  const a = JSON.stringify(buildTimeline(map).events);
+  const b = JSON.stringify(buildTimeline(map, 1).events);
+  if (a !== b) {
+    console.log(`\n! pace 1 is not identical to the single-argument call for ${label}`);
+    failed++;
+  }
+  total++;
+}
+
+const withRoads = cases.filter(([, m]) => m.roads.length && m.sites.length > 1);
+const realOnes = withRoads.filter(([l]) => l.startsWith('gen.ts'));
+const paceCases = [...withRoads.slice(0, 2), ...realOnes.slice(0, 1)];
+for (const [label, map] of paceCases) {
+  for (const pace of [0.5, 2, 0.25, 4]) {
+    const r = run(label, map, pace);
+    total++;
+    const extra = [];
+
+    if (pace >= 1) {
+      // faster work rate = the same day, 1/pace as far in, nothing lost
+      const want = pace1LastBuild.get(map) / pace;
+      if (Math.abs(r.lastBuild - want) > 0.02)
+        extra.push(
+          `(pace) last build ${hhmm(r.lastBuild)}, expected ~${hhmm(want)} (pace-1 time / ${pace})`,
+        );
+      if (r.ev[r.ev.length - 1].t >= 24) extra.push(`(pace) event past midnight survived`);
+    } else {
+      // half the work rate = the day runs out before the work does
+      const end = snapshotAt(map, r.tl, 24);
+      const unfinished = [...end.buildings.values()].filter((b) => b.status !== 'done');
+      const partialRoads = map.roads.filter((rd) => (end.roads.get(rd.id) ?? 0) < 1);
+      if (!unfinished.length) extra.push(`(pace) nothing left unfinished at pace ${pace}`);
+      if (!partialRoads.length) extra.push(`(pace) no part-built road at pace ${pace}`);
+      console.log(
+        `  at midnight: ${unfinished.length}/${end.buildings.size} buildings unfinished, ` +
+          `${partialRoads.length}/${map.roads.length} roads part-built, ` +
+          `${end.founded.size}/${map.sites.length} sites founded`,
+      );
+    }
+
+    for (const m of extra) console.log(`  ! ${m}`);
+    if (extra.length) console.log(`  ^ FAIL (pace ${pace})`);
+    if (r.fails.length || extra.length) failed++;
   }
 }
 
@@ -587,5 +682,5 @@ if (showcase) {
   );
 }
 
-console.log(`\n${failed ? `${failed}/${cases.length} CASES FAILED` : `all ${cases.length} cases PASS`}`);
+console.log(`\n${failed ? `${failed}/${total} CASES FAILED` : `all ${total} cases PASS`}`);
 process.exit(failed ? 1 : 0);

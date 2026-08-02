@@ -776,7 +776,15 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
 /* public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
-export function buildTimeline(map: GenesisMap): Timeline {
+/**
+ * @param pace How hard the settlers work, relative to a normal day. 1 fills
+ *   the day exactly (last roof ~21:00). 2 gets it all done by lunchtime.
+ *   0.5 means the sun goes down on part-built roads and half-raised walls —
+ *   the day is simply truncated at midnight, which is the intended result,
+ *   not a failure. Clamped to [0.25, 4]; at exactly 1 the output is identical
+ *   to the single-argument call.
+ */
+export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
   const skel = expansionOrder(map);
   const target = 20.4 + mulberry32(((map.seed >>> 0) ^ 0x7a11c0de) >>> 0)() * 1.6;
 
@@ -791,7 +799,24 @@ export function buildTimeline(map: GenesisMap): Timeline {
 
   const pl = plan(map, skel, (lo + hi) / 2);
   if (pl.lastBuildT > 0.25) scalePlan(pl, target / pl.lastBuildT);
-  return { events: narrate(map, pl) };
+  const events = narrate(map, pl);
+
+  const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
+  if (k === 1) return { events };
+
+  // work rate k => everything happens 1/k as far into the day. Events pushed
+  // past midnight simply never happen; the array is sorted, so the tail just
+  // falls off. Nothing downstream assumes a road reaches 1 or a building
+  // reaches 'done'.
+  const scaled: GenesisEvent[] = [];
+  for (const e of events) {
+    const t = e.t / k;
+    if (t >= 24) break;
+    const c = { ...e } as GenesisEvent;
+    c.t = t;
+    scaled.push(c);
+  }
+  return { events: scaled };
 }
 
 /** WorldSnapshot is structural; we hang a private cursor off it so that
