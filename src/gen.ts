@@ -82,6 +82,39 @@ function polyDist(p: Pt, line: Pt[]): number {
   return best;
 }
 
+/**
+ * The segments of `line` that could possibly come within `pad` of any point in
+ * the box [u0,v0]-[u1,v1]. A segment whose own AABB, grown by `pad`, misses the
+ * box is strictly further than `pad` from every point in the box, so dropping
+ * it can never change a `polyDist(p, line) < pad` test for p inside the box.
+ */
+function segsNearBox(
+  line: Pt[],
+  u0: number,
+  v0: number,
+  u1: number,
+  v1: number,
+  pad: number
+): Pt[][] {
+  const out: Pt[][] = [];
+  for (let i = 0; i + 1 < line.length; i++) {
+    const a = line[i];
+    const b = line[i + 1];
+    if (Math.max(a[0], b[0]) + pad < u0 || Math.min(a[0], b[0]) - pad > u1) continue;
+    if (Math.max(a[1], b[1]) + pad < v0 || Math.min(a[1], b[1]) - pad > v1) continue;
+    out.push([a, b]);
+  }
+  return out;
+}
+
+/** True when any segment in `segs` comes closer than `d` to `p`. */
+function anySegWithin(p: Pt, segs: Pt[][], d: number): boolean {
+  for (let i = 0; i < segs.length; i++) {
+    if (segDist(p, segs[i][0], segs[i][1]) < d) return true;
+  }
+  return false;
+}
+
 /** Nearest distance plus the unit tangent of the nearest segment. */
 function polyNear(p: Pt, line: Pt[]): { d: number; tu: number; tv: number } {
   let best = Infinity;
@@ -781,7 +814,33 @@ const siteFactor = (s: number) => (s <= 1 ? Math.pow(s, 0.8) : Math.pow(s, 0.585
 /** Plots-per-town multiplier — deliberately gentler than the town count. */
 const buildFactor = (s: number) => (s <= 1 ? Math.pow(s, 0.75) : Math.pow(s, 0.29));
 
+/**
+ * Most recent worlds, keyed `seed:scale`. Generation is pure, so a repeat call
+ * can hand back the very same object — callers (timeline, scene) treat the map
+ * as immutable and never write to it. Insertion order is the LRU order: a hit
+ * is deleted and re-inserted so it moves to the young end.
+ */
+const MAP_CACHE_MAX = 4;
+const mapCache = new Map<string, GenesisMap>();
+
 export function generateMap(seed: number, scale = 1): GenesisMap {
+  const key = `${seed}:${scale}`;
+  const hit = mapCache.get(key);
+  if (hit !== undefined) {
+    mapCache.delete(key);
+    mapCache.set(key, hit);
+    return hit;
+  }
+  const map = buildMap(seed, scale);
+  mapCache.set(key, map);
+  if (mapCache.size > MAP_CACHE_MAX) {
+    const oldest = mapCache.keys().next();
+    if (!oldest.done) mapCache.delete(oldest.value);
+  }
+  return map;
+}
+
+function buildMap(seed: number, scale: number): GenesisMap {
   const rng = mulberry32(seed >>> 0);
   const S = clamp(scale, SCALE_MIN, SCALE_MAX);
 
@@ -1329,6 +1388,54 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     }
     return true;
   };
+  /**
+   * Conservative superset of the tree indices within `r` of (u, v), read off
+   * the same 1-unit hash grid the spacing test uses. Callers still apply the
+   * exact distance test, so a superset is safe; what a caller must NOT assume
+   * is grid order, hence the ascending sort — it restores the original
+   * tree-array iteration order for every scan below.
+   */
+  const treesNear = (u: number, v: number, r: number): number[] => {
+    const out: number[] = [];
+    const cu0 = Math.floor(u - r);
+    const cu1 = Math.floor(u + r);
+    const cv0 = Math.floor(v - r);
+    const cv1 = Math.floor(v + r);
+    for (let cu = cu0; cu <= cu1; cu++) {
+      for (let cv = cv0; cv <= cv1; cv++) {
+        const bucket = cells.get(cellKey(cu, cv));
+        if (bucket) for (const k of bucket) out.push(k);
+      }
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
+  /** Same, for the cells within `r` of any segment of `line`. Deduped. */
+  const treesNearLine = (line: Pt[], r: number): number[] => {
+    const keys = new Set<number>();
+    const out: number[] = [];
+    for (let i = 0; i + 1 < line.length; i++) {
+      const a = line[i];
+      const b = line[i + 1];
+      const cu0 = Math.floor(Math.min(a[0], b[0]) - r);
+      const cu1 = Math.floor(Math.max(a[0], b[0]) + r);
+      const cv0 = Math.floor(Math.min(a[1], b[1]) - r);
+      const cv1 = Math.floor(Math.max(a[1], b[1]) + r);
+      for (let cu = cu0; cu <= cu1; cu++) {
+        for (let cv = cv0; cv <= cv1; cv++) {
+          const key = cellKey(cu, cv);
+          if (keys.has(key)) continue;
+          keys.add(key);
+          const bucket = cells.get(key);
+          if (bucket) for (const k of bucket) out.push(k);
+        }
+      }
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
   const rollKind = <T,>(r: number, table: [T, number][]): T => {
     let acc = 0;
     for (const [k, wt] of table) {
@@ -1418,9 +1525,9 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     const fu = f.gx - f.gy;
     const fv = f.gx + f.gy;
     const clearR = fpR(f.w) + 2.5;
-    trees.forEach((t, i) => {
-      if (dist(treeUV[i], [fu, fv]) < clearR) dead.add(t.id);
-    });
+    for (const i of treesNear(fu, fv, clearR)) {
+      if (dist(treeUV[i], [fu, fv]) < clearR) dead.add(trees[i].id);
+    }
   }
 
   /* ---- clears: which trees stand on the routes -------------------------- */
@@ -1435,8 +1542,12 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     const cum = cumulative(line);
     const total = cum[cum.length - 1] || 1;
     const list: { tree: string; frac: number }[] = [];
-    trees.forEach((t, i) => {
-      if (dead.has(t.id) || roadClaimed.has(t.id)) return;
+    // Only trees in the grid cells straddling the route can be within
+    // ROAD_CLEAR of it; the exact per-segment scan below is unchanged, so the
+    // surviving set — and therefore the sort that orders it — is identical.
+    for (const i of treesNearLine(line, ROAD_CLEAR)) {
+      const t = trees[i];
+      if (dead.has(t.id) || roadClaimed.has(t.id)) continue;
       const p = treeUV[i];
       let bd = Infinity;
       let bs = 0;
@@ -1454,10 +1565,10 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
         );
         bs = cum[k] + seg * proj;
       }
-      if (bd >= ROAD_CLEAR) return;
+      if (bd >= ROAD_CLEAR) continue;
       roadClaimed.add(t.id);
       list.push({ tree: t.id, frac: clamp(bs / total, 0, 1) });
-    });
+    }
     list.sort((a, b) => a.frac - b.frac || (a.tree < b.tree ? -1 : 1));
     road.clears = list;
   });
@@ -1469,13 +1580,14 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     const bv = b.gx + b.gy;
     const r = fpR(b.w) + 1.0;
     const cand: { id: string; d: number }[] = [];
-    trees.forEach((t, i) => {
+    for (const i of treesNear(bu, bv, r)) {
+      const t = trees[i];
       // First claimant wins — roads before plots, and among plots whichever
       // was surveyed first. One tree, one axe.
-      if (dead.has(t.id) || roadClaimed.has(t.id) || protectedTrees.has(t.id)) return;
+      if (dead.has(t.id) || roadClaimed.has(t.id) || protectedTrees.has(t.id)) continue;
       const d = dist(treeUV[i], [bu, bv]);
       if (d < r) cand.push({ id: t.id, d });
-    });
+    }
     cand.sort((a, c) => a.d - c.d || (a.id < c.id ? -1 : 1));
     const keep = cand.slice(0, PLOT_CLEAR_CAP);
     for (const k of keep) {
@@ -1539,12 +1651,25 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     const props: PropSpec[] = [];
     const placedUV: Pt[] = [];
 
+    // `ok` only ever sees points inside the green (the first test rejects the
+    // rest), so the river and every route can be pre-trimmed to the segments
+    // that could reach that box. Segments dropped here are strictly further
+    // away than the threshold from every candidate, so the tests are exact.
+    const reach = site.r * 0.92;
+    const bu0 = site.u - reach;
+    const bu1 = site.u + reach;
+    const bv0 = site.v - reach;
+    const bv1 = site.v + reach;
+    const nearRiverSegs = segsNearBox(river, bu0, bv0, bu1, bv1, 1.6);
+    const nearRoadSegs: Pt[][] = [];
+    for (const line of roadLines) {
+      for (const s of segsNearBox(line, bu0, bv0, bu1, bv1, 1.3)) nearRoadSegs.push(s);
+    }
+
     const ok = (p: Pt): boolean => {
-      if (dist(p, [site.u, site.v]) > site.r * 0.92) return false;
-      if (polyDist(p, river) < 1.6) return false;
-      for (const line of roadLines) {
-        if (polyDist(p, line) < 1.3) return false;
-      }
+      if (dist(p, [site.u, site.v]) > reach) return false;
+      if (anySegWithin(p, nearRiverSegs, 1.6)) return false;
+      if (anySegWithin(p, nearRoadSegs, 1.3)) return false;
       for (const b of siteBuildings[si]) {
         const bu = b.gx - b.gy;
         const bv = b.gx + b.gy;
@@ -1618,10 +1743,11 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
     for (const p of props) {
       const pu = p.gx - p.gy;
       const pv = p.gx + p.gy;
-      trees.forEach((t, i) => {
-        if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) return;
+      for (const i of treesNear(pu, pv, 1.1)) {
+        const t = trees[i];
+        if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) continue;
         if (dist(treeUV[i], [pu, pv]) < 1.1) dead.add(t.id);
-      });
+      }
     }
   });
 
