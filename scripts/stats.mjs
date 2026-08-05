@@ -19,7 +19,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { generateMap, woodCharacter } = await import(join(root, 'src/components/designs/genesis/gen.ts'));
+const { generateMap, generateMapUncached, woodCharacter } = await import(
+  join(root, 'src/components/designs/genesis/gen.ts')
+);
 const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
 
 /* ---------------------------- renderer coverage --------------------------- */
@@ -288,10 +290,11 @@ function checks(seed, map, scale = 1) {
     check('e  clears reference live trees', bad === 0, `${bad} dangling`);
   }
 
-  /* (f) determinism */
+  /* (f) determinism — deliberately uncached, or the second call would be the
+     very same object coming back out of generateMap's LRU. */
   {
-    const a = JSON.stringify(generateMap(seed, scale));
-    const b = JSON.stringify(generateMap(seed, scale));
+    const a = JSON.stringify(generateMapUncached(seed, scale));
+    const b = JSON.stringify(generateMapUncached(seed, scale));
     check('f  deterministic', a === b, `${a.length} bytes`);
   }
 

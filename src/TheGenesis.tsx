@@ -117,6 +117,22 @@ function paceIndex(p: number): number {
   return best;
 }
 
+/**
+ * A cheap identity for "what the ticker is currently showing".
+ *
+ * The ledger is capped, so once a busy day passes the cap its *length* stops
+ * changing while new lines keep arriving — length alone would silently freeze
+ * the ticker for the rest of the day. The last entry, on the other hand, is
+ * new every time something is appended, and the ticker only ever shows the
+ * tail, so this is exactly as sensitive as the display is.
+ */
+function logSig(log: { t: number; text: string }[]): string {
+  const last = log[log.length - 1];
+  return last ? `${log.length}|${last.t}|${last.text}` : '0';
+}
+/** Never equal to any real signature: forces the next push through. */
+const LOG_FORCE = '!';
+
 const randomSeed = () => Math.floor(Math.random() * 4294967296) >>> 0;
 const stepSeed = (seed: number, d: 1 | -1) => ((seed + d + 4294967296) % 4294967296) >>> 0;
 
@@ -205,7 +221,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   const ladderRef = useRef<number[]>([1]);
   const dirtyRef = useRef(true);
   const reducedRef = useRef(false);
-  const logLenRef = useRef(0);
+  /** Identity of the ledger's last line, so "is there anything new?" survives
+   * the log's own cap. See `logSig` below. */
+  const logSigRef = useRef('');
   const seedRef = useRef(0);
   const paceRef = useRef(1);
 
@@ -227,7 +245,15 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       const q = url.searchParams;
       // A rolled-over day has left its deep-linked hour far behind; keeping it
       // would make a reload of this URL show something else entirely.
+      //
+      // Otherwise the hour is in the address bar exactly when it is a decision:
+      // a *held* moment is a framing worth sharing, so it is written down.
+      // LIVE and playback are not moments at all — they keep the URL clean, and
+      // a link to them opens on the visitor's own clock.
       if (dropT) q.delete('t');
+      else if (modeRef.current === 'player' && !playingRef.current) {
+        q.set('t', clamp(tRef.current, 0, 24).toFixed(1));
+      } else q.delete('t');
       if (nextSeed === todayRef.current) q.delete('seed');
       else q.set('seed', String(nextSeed >>> 0));
       if (nextPace === 1) q.delete('pace');
@@ -302,7 +328,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       sceneRef.current = buildGenesisScene(world.map);
       ambRef.current = makeAmbient(pace0);
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
-      logLenRef.current = snapRef.current.log.length;
+      logSigRef.current = logSig(snapRef.current.log);
       setLines(snapRef.current.log.slice(-3));
 
       // Dev hooks for the screenshot harness: start the transport rolling at a
@@ -396,8 +422,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
 
     const pushLog = () => {
       const snap = snapRef.current!;
-      if (snap.log.length === logLenRef.current) return;
-      logLenRef.current = snap.log.length;
+      const sig = logSig(snap.log);
+      if (sig === logSigRef.current) return;
+      logSigRef.current = sig;
       setLines(snap.log.slice(-3));
     };
 
@@ -413,7 +440,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         // cheap, and it is the only way the derived state stays honest.
         snapRef.current = world.snapshotAt(world.map, world.timeline, t);
         resetAmbient(scene, amb, snapRef.current);
-        logLenRef.current = -1;
+        logSigRef.current = LOG_FORCE;
       } else {
         world.advance(snap, world.timeline, t);
       }
@@ -459,7 +486,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       resetAmbient(scene, amb, snapRef.current);
       settleAmbient(scene, amb, snapRef.current);
       camRef.current = clampCam(fitCam());
-      logLenRef.current = -1;
+      logSigRef.current = LOG_FORCE;
       pushLog();
       setSeed(s);
       setValley(world.map.valleyName);
@@ -496,7 +523,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
 
       // The ledger starts over: yesterday's closing line goes out with the
       // light, and the founding of the new valley fades in with the pre-dawn.
-      logLenRef.current = -1;
+      logSigRef.current = LOG_FORCE;
       pushLog();
       setSeed(nextSeed);
       setValley(world.map.valleyName);
@@ -608,7 +635,11 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         if (raw >= 24) roll(stepSeed(seedRef.current, 1), raw - 24, false);
         else applyT(raw);
       }
-      if (running && tRef.current >= PREGEN_AT) ensurePending(comingSeed());
+      // A pre-built world is only worth its ~35MB of baked canvases while
+      // midnight is actually coming. Scrub or pause back into the day and it is
+      // dropped again; the next approach to 23:30 rebuilds it.
+      if (tRef.current < PREGEN_AT) pending = null;
+      else if (running) ensurePending(comingSeed());
       syncAmbient(scene, amb, snapRef.current!);
       if (running && !reducedRef.current) {
         clock += dt;
@@ -692,14 +723,27 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     setMode('player');
   }, []);
 
+  /** Dragging the scrubber fires a change per pixel; the address bar only has
+   * to catch up once the hand comes to rest. */
+  const momentTimer = useRef(0);
+  const syncMoment = useCallback(() => {
+    window.clearTimeout(momentTimer.current);
+    momentTimer.current = window.setTimeout(
+      () => syncUrl(seedRef.current, paceRef.current, false),
+      220
+    );
+  }, [syncUrl]);
+  useEffect(() => () => window.clearTimeout(momentTimer.current), []);
+
   const seek = useCallback(
     (t: number) => {
       detach();
       api.current?.applyT(t);
       setTDisp(clamp(t, 0, 24));
       api.current?.paint();
+      syncMoment();
     },
-    [detach]
+    [detach, syncMoment]
   );
 
   const togglePlay = useCallback(() => {
@@ -707,7 +751,8 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     playingRef.current = !playingRef.current;
     setPlaying(playingRef.current);
     api.current?.paint();
-  }, [detach]);
+    syncMoment();
+  }, [detach, syncMoment]);
 
   const cycleSpeed = useCallback(() => {
     setSpeedIdx((i) => {
@@ -744,7 +789,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     api.current?.applyT(wallClockHours());
     setTDisp(wallClockHours());
     api.current?.paint();
-  }, []);
+    // Back on the wall clock, so the deep-linked hour goes out of the URL.
+    syncMoment();
+  }, [syncMoment]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1249,9 +1296,29 @@ const CSS = `
   .gen-hint { display: none; }
 }
 
+/* A phone cannot hold the transport in one pill without clipping the end off
+   it, so the bar stops being a pill: the controls keep the top row, the day
+   gets the full width underneath to scrub along, and the buttons grow to
+   something a thumb can actually hit. */
 @media (max-width: 620px) {
+  .gen-bar {
+    left: 10px;
+    right: 10px;
+    bottom: 12px;
+    transform: none;
+    max-width: none;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 20px;
+  }
   .gen-clock { display: none; }
-  .gen-ticker { max-width: 62vw; bottom: 74px; }
+  .gen-ico { width: 40px; height: 40px; }
+  .gen-speed, .gen-pace, .gen-live { height: 40px; }
+  /* The one control that has to sit at the far end of the row. */
+  .gen-live { margin-left: auto; }
+  .gen-scrub { order: 2; flex: 1 0 100%; min-width: 0; height: 26px; }
+  .gen-ticker { max-width: 62vw; bottom: 108px; }
   .gen-wid span { display: none; }
   .gen-world button { font-size: 0.68rem; padding: 0 7px; }
   .gen-corner { right: 10px; top: 10px; gap: 6px; }

@@ -904,6 +904,15 @@ export function generateMap(seed: number, scale = 1): GenesisMap {
   return map;
 }
 
+/**
+ * The same world, built fresh every call and never cached. Only the test
+ * harness wants this: a determinism check against `generateMap` would compare
+ * an object with itself the moment the cache hits.
+ */
+export function generateMapUncached(seed: number, scale = 1): GenesisMap {
+  return buildMap(seed, scale);
+}
+
 function buildMap(seed: number, scale: number): GenesisMap {
   const rng = mulberry32(seed >>> 0);
   const S = clamp(scale, SCALE_MIN, SCALE_MAX);
