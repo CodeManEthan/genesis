@@ -292,15 +292,25 @@ function relaxTurns(line: Pt[], maxDeg: number, passes: number): Pt[] {
 /*  palettes and tables                                                       */
 /* ========================================================================== */
 
-/** Pastel gems, same family as GEM_COLORS in src/data/islands.ts. */
+/**
+ * Pastel gems, same family as GEM_COLORS in src/data/islands.ts.
+ *
+ * There must be at least as many of these as the biggest roster the pace
+ * control can ask for (`rosterMax`, capped at 16), because a site takes
+ * `pool[i % pool.length]` — with a shorter list the sixteenth town would wear
+ * the first town's colour and the two would read as one project. The four
+ * after the original fourteen fill the gaps that list left in the hue wheel:
+ * yellow-green, spring green, periwinkle and orchid.
+ */
 const ACCENTS = [
   '#ef7f93', '#f5a25d', '#f0c75e', '#6cc4d9', '#9b8fe8', '#63c9a8', '#e98fc3',
   '#7fb2ef', '#d9a066', '#8fd68f', '#c78ff0', '#5fbfa8', '#efb0a0', '#a8c96e',
+  '#c3d768', '#6fd18c', '#8fa5ee', '#dd8ae0',
 ];
 
 /** One landmark per site, rotated so no two towns share a silhouette. */
 const LANDMARK_ROLES: StructureRole[] = [
-  'hall', 'mill', 'chapel', 'granary', 'tower', 'smithy', 'barn',
+  'hall', 'mill', 'chapel', 'granary', 'tower', 'smithy', 'barn', 'brewhouse',
 ];
 
 /**
@@ -311,7 +321,7 @@ const LANDMARK_ROLES: StructureRole[] = [
 const COMMON_ROLES: StructureRole[] = [
   'cottage', 'cottage', 'cottage', 'cottage', 'house', 'house', 'house',
   'store', 'store', 'workshop', 'workshop', 'shed', 'shed', 'barn',
-  'granary', 'smithy', 'mill',
+  'granary', 'smithy', 'mill', 'bakery', 'bakery',
 ];
 
 const LABELS: Record<StructureRole, string[]> = {
@@ -334,12 +344,66 @@ const LABELS: Record<StructureRole, string[]> = {
   granary: ['The Granary', 'The Corn Store', 'The Grain Loft', 'Harvest Store'],
   smithy: ['The Smithy', 'The Forge', 'Anvil Yard', 'The Farrier'],
   shed: ['The Woodshed', 'The Tool Shed', 'The Lean-To', 'The Cart Shed'],
+  bakery: ['The Bakehouse', 'The Oven House', 'Loaf & Ladle', 'The Baker’s'],
+  brewhouse: ['The Brewhouse', 'The Oast House', 'The Malting', 'Hop Yard'],
 };
 
 const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', 'homestead']);
 
 /** Flavour dressing that shows up as a town matures. */
 const FLAVOUR_PROPS = ['crop', 'haystack', 'crates', 'barrels', 'cart', 'shed'];
+
+/** Base woodland mix per biome, before the day's forest character is applied. */
+const BASE_TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
+  forest: [['oak', 0.26], ['pine', 0.22], ['fir', 0.16], ['birch', 0.16], ['hedgerow', 0.1], ['blossom', 0.1]],
+  meadow: [['oak', 0.34], ['hedgerow', 0.2], ['birch', 0.18], ['blossom', 0.18], ['pine', 0.1]],
+  farm: [['hedgerow', 0.4], ['oak', 0.28], ['blossom', 0.18], ['birch', 0.14]],
+  wetland: [['willow', 0.3], ['pine', 0.22], ['birch', 0.14], ['blossom', 0.14], ['oak', 0.1], ['hedgerow', 0.1]],
+  moor: [['hedgerow', 0.46], ['fir', 0.3], ['pine', 0.16], ['birch', 0.08]],
+};
+
+/**
+ * The day's forest character: the one kind that runs away with the wood. Two
+ * valleys a day apart should not be the same green, and a character does more
+ * for that than any amount of per-tree jitter — a fir-dark valley and a
+ * birch-bright one read as different country from the fitted overview.
+ *
+ * Drawn from a substream of the seed alone (never the main stream, never the
+ * scale), so it cannot move when the pace control trims the roster.
+ */
+const WOOD_CHARACTERS: { name: string; kind: TreeKind; boost: number }[] = [
+  { name: 'oakwood', kind: 'oak', boost: 0.42 },
+  { name: 'birchvale', kind: 'birch', boost: 0.5 },
+  { name: 'firdark', kind: 'fir', boost: 0.52 },
+  { name: 'pinewood', kind: 'pine', boost: 0.44 },
+  { name: 'blossomvale', kind: 'blossom', boost: 0.34 },
+  { name: 'hedgeland', kind: 'hedgerow', boost: 0.34 },
+  { name: 'mixed', kind: 'oak', boost: 0 },
+];
+
+const woodChar = (seed: number) =>
+  WOOD_CHARACTERS[Math.floor(mulberry32((seed ^ 0x2f6a88c3) >>> 0)() * WOOD_CHARACTERS.length)];
+
+/** The day's forest character, by name. Exported for the test harness. */
+export const woodCharacter = (seed: number): string => woodChar(seed).name;
+
+/** Per-biome tree-kind tables for one seed, re-weighted by its character. */
+function woodland(seed: number): Record<Biome, [TreeKind, number][]> {
+  const ch = woodChar(seed);
+  const out = {} as Record<Biome, [TreeKind, number][]>;
+  for (const key of Object.keys(BASE_TREE_KINDS) as Biome[]) {
+    const base = BASE_TREE_KINDS[key];
+    // The wet ground keeps its willows whatever the character — they are what
+    // makes a river bank read as a river bank.
+    const boost = key === 'wetland' ? ch.boost * 0.4 : ch.boost;
+    const rows: [TreeKind, number][] = base.map(([k, w]) => [k, k === ch.kind ? w + boost : w]);
+    if (boost > 0 && !base.some(([k]) => k === ch.kind)) rows.push([ch.kind, boost]);
+    let total = 0;
+    for (const [, w] of rows) total += w;
+    out[key] = rows.map(([k, w]) => [k, w / total] as [TreeKind, number]);
+  }
+  return out;
+}
 
 const pick = <T,>(rng: () => number, list: readonly T[]): T =>
   list[Math.min(list.length - 1, Math.floor(rng() * list.length))];
@@ -1168,6 +1232,13 @@ function buildMap(seed: number, scale: number): GenesisMap {
       if (nearRiver < 5.5) biome = 'wetland';
       else if (nearSite < 6) biome = 'farm';
       else if (edge > 0.8) biome = 'forest';
+      // Open moor: the dry high ground a long way from both the water and the
+      // nearest holding, where nothing was ever cleared because nothing ever
+      // grew. Sparse, rocky, no farms. Keyed to the same seeded lattice as the
+      // forest patches so it is a pure function of the seed, and tested after
+      // the map-edge forest so the border still reads as deep wood.
+      else if (nearRiver > 9.5 && nearSite > 8.5 && (i * 5 + j * 11 + (seed % 7)) % 3 === 0)
+        biome = 'moor';
       else if ((i * 7 + j * 13 + (seed % 5)) % 5 === 0) biome = 'forest';
 
       chunks.push({
@@ -1186,6 +1257,9 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const GOLDEN = 2.399963;
   const siteBuildings: BuildingSpec[][] = [];
   const siteBuilt: number[] = [];
+  /** Plots the town would reach at the baseline pace, and at the busiest. */
+  const siteBuiltBase: number[] = [];
+  const siteBuiltMax: number[] = [];
 
   sites.forEach((site, si) => {
     const brng = mulberry32((seed * 7919 + si * 104729 + 17) >>> 0);
@@ -1203,6 +1277,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
     const countAt = (x: number) => clamp(Math.round(count * buildFactor(x)), lo, hi);
     const maxCount = countAt(SCALE_MAX);
     siteBuilt.push(Math.min(maxCount, countAt(S)));
+    siteBuiltBase.push(countAt(1));
+    siteBuiltMax.push(maxCount);
     const usedLabels = new Set<string>();
     // Scale the architecture to the town so a small holding does not try to
     // fit a 64px hall inside a 5-tile green.
@@ -1321,7 +1397,14 @@ function buildMap(seed: number, scale: number): GenesisMap {
         w,
         floors,
         roof,
-        chimney: founding || role === 'smithy' || role === 'cottage' || role === 'house' || brng() < 0.35,
+        chimney:
+          founding ||
+          role === 'smithy' ||
+          role === 'bakery' ||
+          role === 'brewhouse' ||
+          role === 'cottage' ||
+          role === 'house' ||
+          brng() < 0.35,
         awning: role === 'store' || (role === 'workshop' && brng() < 0.5),
         banner: founding || landmark,
         cupola: role === 'chapel' || (role === 'tower' && brng() < 0.6),
@@ -1346,6 +1429,7 @@ function buildMap(seed: number, scale: number): GenesisMap {
     meadow: 0.07,
     farm: 0.095,
     wetland: 0.12,
+    moor: 0.035,
   };
   /** Extra trees packed into the town clearings, per unit area. */
   const GROVE_DENSITY = 0.36;
@@ -1356,12 +1440,12 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const TREE_GAP = 0.62;
   /** Trees a single plot may require felled before it can be surveyed. */
   const PLOT_CLEAR_CAP = 11;
-  const TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
-    forest: [['oak', 0.36], ['pine', 0.36], ['hedgerow', 0.16], ['blossom', 0.12]],
-    meadow: [['oak', 0.46], ['blossom', 0.22], ['hedgerow', 0.24], ['pine', 0.08]],
-    farm: [['hedgerow', 0.48], ['oak', 0.34], ['blossom', 0.18]],
-    wetland: [['pine', 0.4], ['blossom', 0.22], ['oak', 0.2], ['hedgerow', 0.18]],
-  };
+  // The day's woodland, re-weighted by the seed's forest character (see
+  // WOOD_CHARACTERS): the base mix per biome, then one kind pushed to the
+  // front so one valley reads birch-bright and the next fir-dark. Weights are
+  // normalised, and the choice is made from a derived substream, so nothing
+  // about it depends on the pace scale.
+  const TREE_KINDS = woodland(seed);
 
   const trees: TreeSpec[] = [];
   const treeUV: Pt[] = [];
@@ -1611,6 +1695,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
     meadow: [['flowers', 0.34], ['bush', 0.24], ['sheep', 0.24], ['rock', 0.18]],
     farm: [['bush', 0.34], ['flowers', 0.26], ['sheep', 0.24], ['rock', 0.16]],
     wetland: [['reeds', 0.56], ['bush', 0.2], ['rock', 0.14], ['flowers', 0.1]],
+    // Open moor: stone and low scrub, and never a farm animal.
+    moor: [['rock', 0.42], ['bush', 0.34], ['stump', 0.12], ['flowers', 0.12]],
   };
   {
     const srng = mulberry32((seed ^ 0x5bf03635) >>> 0);
@@ -1645,7 +1731,120 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
+  /* ---- field fences along the farm lanes -------------------------------- */
+  // Farmland with a lane through it gets a run of picket fence set back from
+  // the carriageway, so the road reads as running between fields instead of
+  // across open green. This is terrain, not dressing: it is derived from the
+  // FULL road network and a substream of the seed, never from the pace, so it
+  // stays byte-identical at every scale.
+  //
+  // A run steps along whichever isometric diagonal the lane is closest to,
+  // because that is the only direction the fence sprite is drawn in; a run laid
+  // on the road's exact bearing would be a staircase of disconnected panels.
+  {
+    const frng = mulberry32((seed ^ 0x1d3a5f77) >>> 0);
+    /** One fence panel spans this far in u and in v (34 art px / TW tiles). */
+    const PANEL = 34 / TW;
+    /** How much green a panel keeps to itself. */
+    const FENCE_CLEAR = 1.0;
+    const biomeAt = (p: Pt): Biome => {
+      for (const c of chunks) {
+        if (p[0] >= c.u0 && p[0] < c.u1 && p[1] >= c.v0 && p[1] < c.v1) return c.biome;
+      }
+      return 'meadow';
+    };
+    const fenceOk = (p: Pt): boolean => {
+      if (p[0] < bounds.u0 + 1 || p[0] > bounds.u1 - 1) return false;
+      if (p[1] < bounds.v0 + 1 || p[1] > bounds.v1 - 1) return false;
+      if (biomeAt(p) !== 'farm') return false;
+      if (polyDist(p, river) < 1.8) return false;
+      for (const s of sites) if (dist(p, [s.u, s.v]) < s.r + 0.8) return false;
+      for (const l of roadLines) if (polyDist(p, l) < 1.35) return false;
+      // Undergrowth gives way to the fence, exactly as it does to a well — but
+      // only wild undergrowth. A tree somebody is already coming to fell keeps
+      // its appointment, so the fence goes somewhere else.
+      for (const i of treesNear(p[0], p[1], FENCE_CLEAR)) {
+        if (dist(treeUV[i], p) >= FENCE_CLEAR) continue;
+        if (protectedTrees.has(trees[i].id) || roadClaimed.has(trees[i].id)) return false;
+      }
+      for (const q of scatterUV) if (dist(p, q) < 1.3) return false;
+      return true;
+    };
+
+    const RUNS = 5;
+    let runs = 0;
+    for (let attempt = 0; attempt < 400 && runs < RUNS; attempt++) {
+      if (!roadLines.length) break;
+      const line = roadLines[Math.floor(frng() * roadLines.length)];
+      const cum = cumulative(line);
+      const total = cum[cum.length - 1] || 1;
+      const at = pointAtS(line, cum, frng() * total);
+      const near = polyNear(at, line);
+      // Nearest isometric diagonal to the lane: (1,1) is +gx, (-1,1) is +gy.
+      const alongGx = Math.abs(near.tu + near.tv) >= Math.abs(near.tv - near.tu);
+      const kind = alongGx ? 'fenceL' : 'fenceR';
+      const sgn =
+        (alongGx ? near.tu + near.tv : near.tv - near.tu) >= 0 ? 1 : -1;
+      const step: Pt = alongGx
+        ? [sgn * PANEL, sgn * PANEL]
+        : [-sgn * PANEL, sgn * PANEL];
+      const side = frng() < 0.5 ? 1 : -1;
+      const off = 1.7 + frng() * 0.5;
+      const n = 3 + Math.floor(frng() * 2);
+      const start: Pt = [
+        at[0] - near.tv * off * side - (step[0] * (n - 1)) / 2,
+        at[1] + near.tu * off * side - (step[1] * (n - 1)) / 2,
+      ];
+      const run: Pt[] = [];
+      for (let k = 0; k < n; k++) {
+        const p: Pt = [start[0] + step[0] * k, start[1] + step[1] * k];
+        if (!fenceOk(p)) break;
+        run.push(p);
+      }
+      if (run.length < 3) continue;
+      run.forEach((p, k) => {
+        const [gx, gy] = uv(p[0], p[1]);
+        scatter.push({
+          id: `pr${scatter.length}`,
+          kind,
+          gx,
+          gy,
+          seed: (seed + runs * 1741 + k * 59) >>> 0,
+        });
+        scatterUV.push(p);
+        for (const i of treesNear(p[0], p[1], FENCE_CLEAR)) {
+          if (dist(treeUV[i], p) < FENCE_CLEAR) dead.add(trees[i].id);
+        }
+      });
+      runs++;
+    }
+  }
+
   /* ---- site dressing ---------------------------------------------------- */
+  // Dressing is the one place the pace control is allowed to change what a
+  // town CONTAINS rather than only how many plots it reaches — a town that
+  // built twelve roofs today should not be wearing the same three barrels as
+  // the same town on a quarter-pace day.
+  //
+  // It stays subset-stable because the list is built in two blocks: the
+  // essentials (well, nameboard, lamps, and the junction / camp / timber
+  // pieces that follow from the roster) always come first, then the flavour
+  // tail, and only the LENGTH of that tail depends on the day's build count.
+  // Every position, id and seed is computed against the full roster, so a
+  // smaller scale is a strict prefix of a larger one.
+  //
+  // How many roads meet at each town, over the FULL road network: a crossroads
+  // is a property of the roster, so it is a crossroads at every pace.
+  const roadDegree = new Array<number>(sites.length).fill(0);
+  for (const [a, b] of edges) {
+    roadDegree[a]++;
+    roadDegree[b]++;
+  }
+  /** Trees this town's plots have to fell, over the full plot roster. */
+  const siteTimber = siteBuildings.map((list) => list.reduce((n, b) => n + b.clears.length, 0));
+  /** How much of each site's dressing today's pace actually reaches. */
+  const sitePropCount: number[] = [];
+
   const siteProps: PropSpec[][] = sites.map((site, si) => {
     const prng = mulberry32((seed + si * 60013 + 7) >>> 0);
     const props: PropSpec[] = [];
@@ -1712,6 +1911,11 @@ function buildMap(seed: number, scale: number): GenesisMap {
       return [site.u + Math.cos(a) * site.r * 0.3, site.v + Math.sin(a) * site.r * 0.3];
     };
 
+    // Decision rolls first, so the stream shape does not depend on which of
+    // the optional pieces this town happens to qualify for.
+    const campRoll = prng();
+    const flavourBase = 2 + Math.floor(prng() * 4); // 2..5 — the scale-1 figure
+
     // Order matters: it is the order the dressing appears over the day.
     add(`${site.id}-well`, 'well', spot(0.3, prng() * Math.PI * 2), 5 + si);
 
@@ -1730,11 +1934,44 @@ function buildMap(seed: number, scale: number): GenesisMap {
       add(`${site.id}-lamp${i}`, 'lamp', spot(0.44, signA + Math.PI * (0.6 + i)), 31 + i + si * 3);
     }
 
-    const flavour = 2 + Math.floor(prng() * 4); // 2..5
-    for (let i = 0; i < flavour; i++) {
+    // A finger post where three or more lanes meet.
+    if (roadDegree[si] >= 3) {
+      add(`${site.id}-post`, 'signpost', spot(0.4, signA + 2.2), 41 + si);
+    }
+
+    // The newest holdings are still half a camp: the last of the day's
+    // baseline towns always keeps a fire in the green, and the frontier
+    // holdings beyond it usually do. Keyed to nBase, which is drawn from the
+    // seed alone, so "newest" never moves when the roster is trimmed.
+    if (si >= nBase - 1 && (si === nBase - 1 || campRoll < 0.6)) {
+      add(`${site.id}-fire`, 'campfire', spot(0.24, signA + Math.PI * 1.35), 51 + si);
+    }
+
+    // Timber stacked where the axes have been busiest.
+    const piles = siteTimber[si] >= 44 ? 2 : siteTimber[si] >= 20 ? 1 : 0;
+    for (let i = 0; i < piles; i++) {
+      add(
+        `${site.id}-timber${i}`,
+        'lumber',
+        spot(0.66 + prng() * 0.12, prng() * Math.PI * 2),
+        61 + i + si * 5
+      );
+    }
+
+    /* ---- flavour tail: the only part the day's pace can shorten -------- */
+    // `flavourBase` is what a baseline day sees; a busier town works its way
+    // further down the same list, a quieter one stops sooner. Monotonic in the
+    // build count, so the prefix property holds across every pair of scales.
+    const essentials = props.length;
+    const room = Math.max(0, siteBuiltMax[si] - siteBuiltBase[si]);
+    const flavourMax = flavourBase + room;
+    const flavourAt = (built: number) =>
+      clamp(flavourBase + Math.round((built - siteBuiltBase[si]) * 0.75), 1, flavourMax);
+    for (let i = 0; i < flavourMax; i++) {
       const kind = FLAVOUR_PROPS[Math.floor(prng() * FLAVOUR_PROPS.length)];
       add(`${site.id}-p${i}`, kind, spot(0.62 + prng() * 0.22, prng() * Math.PI * 2), 200 + si * 31 + i);
     }
+    sitePropCount.push(essentials + flavourAt(siteBuilt[si]));
     return props;
   });
 
@@ -1767,7 +2004,10 @@ function buildMap(seed: number, scale: number): GenesisMap {
       radius: s.r,
       accent: s.accent,
       buildings: siteBuildings[i].slice(0, siteBuilt[i]),
-      props: siteProps[i],
+      // Append-only: the flavour tail is the sanctioned scale-dependent slice.
+      // Undergrowth was already cleared against the FULL list above, so the
+      // trees do not move when the tail is short.
+      props: siteProps[i].slice(0, sitePropCount[i]),
     };
   });
 

@@ -67,7 +67,7 @@ export interface Rect {
 
 /* --------------------------------- map ----------------------------------- */
 
-export type Biome = 'meadow' | 'forest' | 'farm' | 'wetland';
+export type Biome = 'meadow' | 'forest' | 'farm' | 'wetland' | 'moor';
 
 export interface Chunk {
   id: string; // "c3_4"
@@ -79,7 +79,7 @@ export interface Chunk {
   seed: number;
 }
 
-export type TreeKind = 'oak' | 'pine' | 'blossom' | 'hedgerow';
+export type TreeKind = 'oak' | 'pine' | 'blossom' | 'hedgerow' | 'birch' | 'willow' | 'fir';
 
 export interface TreeSpec {
   id: string; // "tr412"
@@ -115,6 +115,8 @@ export type StructureRole =
   | 'granary'
   | 'smithy'
   | 'shed'
+  | 'bakery'
+  | 'brewhouse'
   | 'homestead';
 
 export type RoofStyle = 'hip' | 'gable' | 'flat' | 'thatch';

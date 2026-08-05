@@ -19,8 +19,25 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { generateMap } = await import(join(root, 'src/components/designs/genesis/gen.ts'));
+const { generateMap, woodCharacter } = await import(join(root, 'src/components/designs/genesis/gen.ts'));
 const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
+
+/* ---------------------------- renderer coverage --------------------------- */
+
+// Mirrors of what scene.ts can actually draw. A generated kind with no sprite
+// here renders as NOTHING (or, for a tree, silently as an oak), which is the
+// one failure mode in this generator that leaves no trace in the JSON — so it
+// is checked rather than eyeballed. Keep in step with makePools(), TREE_POOL
+// and the propSprite() switch in src/components/designs/genesis/scene.ts.
+const TREE_SPRITES = new Set(['oak', 'pine', 'blossom', 'hedgerow', 'birch', 'willow', 'fir']);
+const PROP_SPRITES = new Set([
+  ...TREE_SPRITES,
+  'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
+  'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
+  'sheep', 'campfire',
+  // resolved by name in propSprite() rather than from a pool
+  'nameboard', 'signpost', 'stake', 'crane',
+]);
 
 /* ------------------------------ uv geometry ------------------------------ */
 
@@ -160,12 +177,27 @@ function report(seed) {
     return lm ? `${s.id}:${lm.role}` : `${s.id}:NONE`;
   });
   say(`landmarks: ${landmarks.join(', ')}`);
-  const kindCount = {};
-  for (const t of map.trees) kindCount[t.kind] = (kindCount[t.kind] || 0) + 1;
-  say(`tree kinds: ${Object.entries(kindCount).map(([k, v]) => `${k} ${v}`).join(', ')}`);
-  const scatterKinds = {};
-  for (const p of map.scatter) scatterKinds[p.kind] = (scatterKinds[p.kind] || 0) + 1;
-  say(`scatter kinds: ${Object.entries(scatterKinds).map(([k, v]) => `${k} ${v}`).join(', ')}`);
+  const hist = (items, key) => {
+    const n = {};
+    for (const it of items) n[key(it)] = (n[key(it)] || 0) + 1;
+    return Object.entries(n)
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+      .map(([k, v]) => `${k} ${v}`)
+      .join(', ');
+  };
+  say(`\nforest character: ${woodCharacter(seed)}`);
+  say(`tree kinds: ${hist(map.trees, (t) => t.kind)}`);
+  say(`scatter kinds: ${hist(map.scatter, (p) => p.kind)}`);
+  const props = map.sites.flatMap((s) => s.props);
+  say(`dressing kinds: ${hist(props, (p) => p.kind)}`);
+  // Dressing is the one thing the pace control adds to a town it has already
+  // founded, so the shape of that growth is worth watching from here.
+  const dress = (sc) => {
+    const m = generateMap(seed, sc);
+    return `${sc}x ${m.sites.map((s) => s.props.length).join('/')}`;
+  };
+  say(`dressing per site: ${[0.25, 1, 4].map(dress).join('   ')}`);
+  say(`accents: ${map.sites.map((s) => s.accent).join(' ')}`);
 
   console.log(lines.join('\n'));
   return map;
@@ -408,6 +440,29 @@ function checks(seed, map, scale = 1) {
     check('q  buildings clear of roads', bad === 0, `${bad} paved, tightest ${f1(worst)}`);
   }
 
+  /* (r) every kind the generator emits is something the renderer can draw */
+  {
+    const missing = new Set();
+    for (const t of map.trees) if (!TREE_SPRITES.has(t.kind)) missing.add(`tree:${t.kind}`);
+    for (const p of map.scatter) if (!PROP_SPRITES.has(p.kind)) missing.add(p.kind);
+    for (const s of map.sites) for (const p of s.props) if (!PROP_SPRITES.has(p.kind)) missing.add(p.kind);
+    check(
+      'r  every kind has a sprite',
+      missing.size === 0,
+      missing.size ? `NO SPRITE: ${[...missing].join(', ')}` : `${PROP_SPRITES.size} kinds known`
+    );
+  }
+
+  /* (s) no two towns wear the same accent */
+  {
+    const acc = map.sites.map((s) => s.accent);
+    check(
+      's  site accents distinct',
+      new Set(acc).size === acc.length,
+      `${new Set(acc).size}/${acc.length} distinct`
+    );
+  }
+
   const pass = results.every((r) => r.ok);
   console.log(`\nINVARIANTS  seed ${seed}  scale ${scale}`);
   for (const r of results) {
@@ -451,6 +506,10 @@ function subsetChecks(seed) {
     let bad = 0;
     let bldBad = 0;
     let bldShrink = 0;
+    let propBad = 0;
+    let propShrink = 0;
+    let propLo = 0;
+    let propHi = 0;
     for (let i = 0; i < lo.sites.length; i++) {
       const a = lo.sites[i];
       const b = hi.sites[i];
@@ -458,15 +517,29 @@ function subsetChecks(seed) {
         bad++;
         continue;
       }
-      const meta = (x) => ({ id: x.id, name: x.name, gx: x.gx, gy: x.gy, radius: x.radius, accent: x.accent, props: x.props });
+      const meta = (x) => ({ id: x.id, name: x.name, gx: x.gx, gy: x.gy, radius: x.radius, accent: x.accent });
       if (!same(meta(a), meta(b))) bad++;
       if (b.buildings.length < a.buildings.length) bldShrink++;
       for (let j = 0; j < a.buildings.length; j++) {
         if (!same(a.buildings[j], b.buildings[j])) bldBad++;
       }
+      // Dressing is the one thing a busier day is allowed to add to a town it
+      // had already founded, so props are a prefix rather than an equality:
+      // the essentials come first and the flavour tail only ever grows.
+      if (b.props.length < a.props.length) propShrink++;
+      for (let j = 0; j < a.props.length; j++) {
+        if (!same(a.props[j], b.props[j])) propBad++;
+      }
+      propLo += a.props.length;
+      propHi += b.props.length;
     }
     check(`${tag}: site prefix identical`, bad === 0, `${bad} mismatched sites`);
     check(`${tag}: buildings are a prefix`, bldBad === 0 && bldShrink === 0, `${bldBad} changed, ${bldShrink} shrank`);
+    check(
+      `${tag}: props are a prefix`,
+      propBad === 0 && propShrink === 0,
+      `${propBad} changed, ${propShrink} shrank, ${propLo} -> ${propHi} on the shared sites`
+    );
 
     const roadPrefix =
       hi.roads.length >= lo.roads.length &&

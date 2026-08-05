@@ -114,6 +114,9 @@ function makePools(): Record<string, Sprite[]> {
     pine: pool(6, (i) => buildTree(1, 23 + i * 41)),
     blossom: pool(4, (i) => buildTree(2, 31 + i * 43)),
     hedgerow: pool(4, (i) => buildTree(3, 47 + i * 29)),
+    birch: pool(5, (i) => buildTree(4, 107 + i * 33)),
+    willow: pool(4, (i) => buildTree(5, 113 + i * 27)),
+    fir: pool(5, (i) => buildTree(6, 127 + i * 39)),
     bush: pool(6, (i) => buildBush(53 + i * 17)),
     rock: pool(6, (i) => buildRock(59 + i * 19)),
     flowers: pool(6, (i) => buildFlowerPatch(61 + i * 23)),
@@ -140,6 +143,9 @@ const TREE_POOL: Record<string, string> = {
   pine: 'pine',
   blossom: 'blossom',
   hedgerow: 'hedgerow',
+  birch: 'birch',
+  willow: 'willow',
+  fir: 'fir',
 };
 
 /* --------------------------------- types --------------------------------- */

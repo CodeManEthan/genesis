@@ -240,6 +240,10 @@ export type StructureRole =
   | 'granary'
   | 'smithy'
   | 'shed'
+  // Genesis-only roles. Additive: the vale never asks for them, and every
+  // routine below falls through to the plain-house path when it sees one.
+  | 'bakery'
+  | 'brewhouse'
   | 'homestead';
 
 export interface StructureSpec {
@@ -446,9 +450,11 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
   const towerH = role === 'tower' ? Math.round(wallH * 0.5) + 16 : 0;
   const siloH = role === 'granary' ? wallH + 12 : 0;
   const sailR = role === 'mill' ? 22 : 0;
+  /** Oast-house cone above the brewhouse drum. */
+  const kilnH = role === 'brewhouse' ? 26 : 0;
 
-  const padX = 12 + (sailR ? 12 : 0);
-  const padTop = 34 + towerH + siloH + sailR + (spec.cupola ? 22 : 0);
+  const padX = 12 + (sailR ? 12 : 0) + (role === 'bakery' ? 8 : 0);
+  const padTop = 34 + towerH + siloH + sailR + kilnH + (spec.cupola ? 22 : 0);
   const padBottom = 8;
   const spriteW = W + padX * 2;
   const spriteH = padTop + Math.round(W * 0.4) + wallH + H + padBottom + 20;
@@ -660,6 +666,60 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
       rect(ctx, -W / 4 - 3, -4, 7, 4, PAL.stoneDark);
     }
 
+    if (role === 'bakery') {
+      // A stone dome oven bulging off the right-hand gable, its firing arch
+      // still glowing. The flue is stubby; the roof chimney does the smoke.
+      const ox = W / 2 + 4;
+      const oy = 1;
+      poly(ctx, diamond(ox + 1, oy + 2, 21), PAL.shadow);
+      blob(ctx, ox, oy - 12, [8, 13, 16, 18, 18, 17, 16, 14, 12, 9, 5], PAL.stone);
+      blob(ctx, ox - 3, oy - 11, [6, 9, 9, 7], PAL.stoneLight);
+      poly(ctx, [[ox - 5, oy], [ox + 5, oy], [ox + 4, oy - 6], [ox - 4, oy - 6]], PAL.stoneDark);
+      poly(ctx, [[ox - 3, oy], [ox + 3, oy], [ox + 2, oy - 4], [ox - 2, oy - 4]], PAL.forge);
+      poly(ctx, [[ox - 2, oy], [ox + 2, oy], [ox + 1, oy - 2], [ox - 1, oy - 2]], PAL.glassLit);
+      rect(ctx, ox - 1, oy - 19, 3, 7, PAL.stoneDark);
+      rect(ctx, ox - 2, oy - 20, 5, 1, PAL.stone);
+      // paddle and a rack of loaves leaning on the wall
+      rect(ctx, -W / 4, -6, 1, 7, PAL.woodLight);
+      rect(ctx, -W / 4 - 2, -9, 5, 3, PAL.wood);
+    }
+
+    if (role === 'brewhouse') {
+      // Oast house: a stone drum standing off the west corner with a conical
+      // kiln roof and a white cowl on top. It has to clear the ridge — a cone
+      // the same colour as the roof and the same height as the roof is a cone
+      // nobody can see.
+      const kw = 18;
+      const kb = wallH + 6;
+      const kx = -W / 2 + 6;
+      const ky = 0;
+      const eaveY = -kb + kw / 4;
+      const top = -kb - kilnH;
+      ctx.save();
+      ctx.translate(kx, ky);
+      poly(ctx, diamond(2, 3, kw + 4), PAL.shadow);
+      poly(ctx, [[-kw / 2, 0], [0, kw / 4], [0, kw / 4 - kb], [-kw / 2, -kb]], PAL.stoneLight);
+      poly(ctx, [[0, kw / 4], [kw / 2, 0], [kw / 2, -kb], [0, kw / 4 - kb]], PAL.stone);
+      for (let k = 8; k < kb; k += 9) {
+        poly(ctx, [[-kw / 2, -k], [0, kw / 4 - k], [0, kw / 4 - k + 1], [-kw / 2, -k + 1]], PAL.stoneDark);
+      }
+      poly(ctx, [[-kw / 2 + 2, -4], [-3, -4 + kw / 4 - 1], [-3, -14], [-kw / 2 + 2, -14 - kw / 4 + 1]], PAL.woodDark);
+      poly(ctx, diamond(0, eaveY, kw + 6), shade(accent, -0.42));
+      poly(ctx, [[-kw / 2 - 3, eaveY], [0, eaveY + kw / 4 + 1.5], [0, top]], accent);
+      poly(ctx, [[0, eaveY + kw / 4 + 1.5], [kw / 2 + 3, eaveY], [0, top]], shade(accent, -0.3));
+      poly(ctx, [[-kw / 4 - 1, (eaveY + top) / 2], [0, top], [0, top + 3], [-kw / 4, (eaveY + top) / 2 + 3]], shade(accent, 0.24));
+      rect(ctx, -3, top - 7, 7, 8, PAL.chalk);
+      rect(ctx, 1, top - 7, 3, 8, shade(PAL.chalk, -0.16));
+      poly(ctx, [[-4, top - 8], [4, top - 8], [0, top - 13]], PAL.stoneLight);
+      rect(ctx, 4, top - 6, 6, 1, PAL.woodDark);
+      ctx.restore();
+      // barrels waiting on the yard side
+      rect(ctx, W / 5, -8, 8, 8, PAL.wood);
+      rect(ctx, W / 5, -8, 3, 8, PAL.woodLight);
+      rect(ctx, W / 5, -6, 8, 1, PAL.stoneDark);
+      rect(ctx, W / 5, -2, 8, 1, PAL.stoneDark);
+    }
+
     if (spec.cupola && p >= 0.62) {
       const cy = -wallH - roofH - 2;
       rect(ctx, -5, cy - 9, 10, 9, PAL.wall);
@@ -717,7 +777,12 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
 
 /* ------------------------------- scenery ------------------------------- */
 
-export function buildTree(kind: 0 | 1 | 2 | 3, seed: number): Sprite {
+/**
+ * Tree sprites. 0 oak, 1 pine, 2 blossom, 3 hedgerow — and, added for Genesis
+ * and unused by the vale, 4 birch, 5 willow, 6 fir. Every new kind is a fresh
+ * branch above the hedgerow fallback, so 0..3 still draw exactly what they did.
+ */
+export function buildTree(kind: 0 | 1 | 2 | 3 | 4 | 5 | 6, seed: number): Sprite {
   const rng = mulberry32(seed);
   if (kind === 0) {
     const leaf = PAL.leaf[Math.floor(rng() * PAL.leaf.length)];
@@ -751,6 +816,56 @@ export function buildTree(kind: 0 | 1 | 2 | 3, seed: number): Sprite {
       blob(ctx, 0, -27, [6, 12, 16, 20, 20, 20, 18, 14, 10, 6], PAL.blossom);
       blob(ctx, -4, -26, [6, 10, 10, 8, 5], shade(PAL.blossom, 0.3));
       blob(ctx, 4, -20, [7, 8, 6], shade(PAL.blossom, -0.16));
+    });
+  }
+  if (kind === 4) {
+    // Birch: a slim chalk trunk with dark scars and a high, airy crown. Reads
+    // as a bright wood from across the valley.
+    const leaf = shade(PAL.leaf[Math.floor(rng() * PAL.leaf.length)], 0.3);
+    return makeSprite(28, 44, 14, 39, (ctx) => {
+      poly(ctx, diamond(1, 1, 15), PAL.shadowSoft);
+      rect(ctx, -1, -26, 3, 26, '#efe9dc');
+      rect(ctx, 1, -26, 1, 26, '#cbc2b0');
+      for (let i = 0; i < 4; i++) {
+        rect(ctx, -1, -6 - i * 5 - (i % 2), 2, 1, PAL.ink);
+      }
+      poly(ctx, [[0, -19], [-6, -25], [-5, -25], [1, -20]], '#e2dbcb');
+      blob(ctx, 0, -36, [6, 11, 15, 17, 18, 18, 17, 15, 12, 8, 5], leaf);
+      blob(ctx, -3, -34, [5, 8, 8, 6], shade(leaf, 0.24));
+      blob(ctx, 4, -28, [7, 8, 6, 4], shade(leaf, -0.2));
+    });
+  }
+  if (kind === 5) {
+    // Willow: a low mound of pale-gold foliage with fronds hanging off it.
+    // Genesis puts these on the wet ground either side of the river.
+    const leaf = mix(PAL.leaf[Math.floor(rng() * PAL.leaf.length)], '#cfd97e', 0.4);
+    return makeSprite(36, 38, 18, 33, (ctx) => {
+      poly(ctx, diamond(1, 1, 22), PAL.shadow);
+      rect(ctx, -2, -19, 4, 19, PAL.wood);
+      rect(ctx, 0, -19, 2, 19, PAL.woodDark);
+      blob(ctx, 0, -28, [10, 16, 20, 23, 25, 25, 23, 20, 17], leaf);
+      blob(ctx, -5, -27, [6, 10, 10, 7], shade(leaf, 0.26));
+      for (let i = 0; i < 8; i++) {
+        const x = -12 + i * 3.4;
+        const h = 5 + Math.floor(rng() * 8);
+        rect(ctx, x, -20, 1, h, i % 2 ? leaf : shade(leaf, -0.2));
+        rect(ctx, x, -20 + h, 1, 1, shade(leaf, -0.34));
+      }
+    });
+  }
+  if (kind === 6) {
+    // Dark fir: taller and narrower than the pine, and a good deal gloomier.
+    const leaf = shade(PAL.leaf[Math.floor(rng() * PAL.leaf.length)], -0.38);
+    return makeSprite(26, 62, 13, 57, (ctx) => {
+      poly(ctx, diamond(1, 1, 14), PAL.shadow);
+      rect(ctx, -1, -7, 3, 7, PAL.woodDark);
+      for (let i = 0; i < 4; i++) {
+        const y = -7 - i * 9;
+        const w = 21 - i * 4.5;
+        poly(ctx, [[-w / 2, y], [w / 2, y], [0, y - 16]], i % 2 ? shade(leaf, -0.12) : leaf);
+        poly(ctx, [[0, y], [w / 2, y], [0, y - 16]], shade(leaf, -0.3));
+      }
+      rect(ctx, -1, -52, 2, 4, shade(leaf, 0.18));
     });
   }
   // autumn / hedgerow tree
