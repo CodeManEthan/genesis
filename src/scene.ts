@@ -72,6 +72,8 @@ import {
   buildTree,
   buildWell,
   drawBot,
+  drawCart,
+  drawCraneLoad,
   drawWheel,
   isoTile,
   mix,
@@ -93,6 +95,7 @@ import {
   type BuildingSpec,
   type GenesisMap,
   type PropSpec,
+  type RoadSpec,
   type SiteSpec,
   type TreeSpec,
   type Vec2,
@@ -148,6 +151,14 @@ export interface Smoke {
   drift: number;
 }
 
+/** A settler still on the road in, before they join the site's crew. */
+export interface Arrival {
+  roadId: string;
+  /** Arclength along the road, walked towards the end nearest the site. */
+  s: number;
+  dir: 1 | -1;
+}
+
 export interface Bot {
   site: string;
   slot: number;
@@ -164,6 +175,8 @@ export interface Bot {
   jy: number;
   /** Carriers shuttle: 0 = heading to the plot, 1 = heading back to the yard. */
   leg: 0 | 1;
+  /** Set while the settler is still walking in; null once they are local. */
+  arrive: Arrival | null;
 }
 
 export interface Walker {
@@ -175,10 +188,23 @@ export interface Walker {
   gx: number;
   gy: number;
   faceRight: boolean;
+  /** Highways carry freight: this walker is pulling a hand cart. */
+  cart: boolean;
+  /** Colour of the load on the bed. Unused when `cart` is false. */
+  cargo: string;
 }
 
 export interface Ambient {
   bots: Bot[];
+  /**
+   * `bots` grouped by site id, rebuilt only when the crowd actually changes.
+   * The step loop runs once per site per frame and used to re-filter the whole
+   * population to find each crew, which is quadratic in a valley of eight
+   * towns; this is the same list, kept.
+   */
+  crews: Map<string, Bot[]>;
+  /** Settlers per site at the last sync, so an *increase* can be walked in. */
+  pop: Map<string, number>;
   walkers: Walker[];
   smoke: Smoke[];
   smokeClock: { t: number };
@@ -226,6 +252,12 @@ export interface VegLayer {
 
 /** The cell size of the vegetation index, in world pixels. */
 const VCELL = 96;
+/**
+ * How many baked sprites one frame may redraw to repair occlusion. A whole
+ * valley of towns at dusk can ask for more than it can see the benefit of; past
+ * this the frame simply stops, having already served every mover.
+ */
+const REPAIR_CAP = 260;
 const vkey = (cx: number, cy: number) => cx * 4096 + cy;
 
 export interface GenesisScene {
@@ -242,6 +274,7 @@ export interface GenesisScene {
   extra: Map<string, Sprite>;
   structs: Map<string, { key: string; sp: StructureSprite }>;
   roadGeo: Map<string, RoadGeo>;
+  roadById: Map<string, RoadSpec>;
   treeById: Map<string, TreeSpec>;
   siteProps: Map<string, { p: PropSpec; accent: string }>;
   /** World-pixel extent of the map itself (not the padded layer). */
@@ -475,7 +508,11 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
 
   /* ---- indexes --------------------------------------------------------- */
   const roadGeo = new Map<string, RoadGeo>();
-  for (const r of map.roads) roadGeo.set(r.id, cumulative(r.pts));
+  const roadById = new Map<string, RoadSpec>();
+  for (const r of map.roads) {
+    roadGeo.set(r.id, cumulative(r.pts));
+    roadById.set(r.id, r);
+  }
   const treeById = new Map<string, TreeSpec>();
   for (const t of map.trees) treeById.set(t.id, t);
   const siteProps = new Map<string, { p: PropSpec; accent: string }>();
@@ -493,6 +530,7 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
     extra: new Map(),
     structs: new Map(),
     roadGeo,
+    roadById,
     treeById,
     siteProps,
     x0,
@@ -730,12 +768,18 @@ function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): Stru
 /* ------------------------------ ambient life ----------------------------- */
 
 const BOT_COLORS = ['#ef7f93', '#63c9a8', '#9b8fe8', '#f0c75e', '#6cc4d9', '#e98fc3', '#f5a25d'];
+/** What is on the bed of a hand cart: sacks, cut timber, hay, stone. */
+const CARGO_COLORS = ['#c8a86a', '#a9743e', '#d8c06a', '#9aa3ad'];
 const BOT_SPEED = 1.3; // tiles per second
 const WALK_SPEED = 1.05;
+/** A cart is freight, so it plods; a walker on foot overtakes it. */
+const CART_SPEED = 0.72;
 
 export function makeAmbient(pace = 1): Ambient {
   return {
     bots: [],
+    crews: new Map(),
+    pop: new Map(),
     walkers: [],
     smoke: [],
     smokeClock: { t: 0 },
@@ -794,27 +838,41 @@ interface Task {
   ygy: number;
 }
 
+/**
+ * The jobs going on at one site, in staffing order: a crew of `n` takes the
+ * first `n`. So the order *is* the priority, and the errands at the bottom only
+ * get a body when the real work is already covered — which is what keeps a
+ * mature yard busy without doubling the crowd.
+ */
 function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Task[] {
   const out: Task[] = [];
   // Choppers first — a tree coming down is the most legible bit of work there
-  // is, so it should never be the job that goes unstaffed.
+  // is, so it should never be the job that goes unstaffed. The same pass
+  // remembers one felled stump, which is where the lumber haul below starts.
+  let stump: TreeSpec | null = null;
   for (const b of site.buildings) {
     for (const id of b.clears) {
-      if (snap.trees.get(id) !== 'felling') continue;
-      const tr = scene.treeById.get(id);
-      if (tr)
-        out.push({
-          gx: tr.gx,
-          gy: tr.gy,
-          action: 'work',
-          ygx: tr.gx,
-          ygy: tr.gy,
-        });
+      const state = snap.trees.get(id);
+      if (state === 'felling') {
+        const tr = scene.treeById.get(id);
+        if (tr)
+          out.push({
+            gx: tr.gx,
+            gy: tr.gy,
+            action: 'work',
+            ygx: tr.gx,
+            ygy: tr.gy,
+          });
+      } else if (state === 'stump' && !stump) {
+        stump = scene.treeById.get(id) ?? null;
+      }
     }
   }
+  let plot: BuildingSpec | null = null;
   for (const b of site.buildings) {
     const st = snap.buildings.get(b.id);
     if (!st || st.status === 'unplanned' || st.status === 'done') continue;
+    if (!plot) plot = b;
     out.push({ gx: b.gx, gy: b.gy, action: 'work', ygx: b.gx, ygy: b.gy });
     out.push({
       gx: b.gx,
@@ -824,7 +882,60 @@ function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Ta
       ygy: site.gy + (b.gy - site.gy) * 0.25,
     });
   }
+
+  /* ---- errands, only ever staffed by a spare pair of hands -------------- */
+  // Timber off the stumps the site just made, up to whatever is being framed.
+  if (plot && stump) {
+    out.push({ gx: plot.gx, gy: plot.gy, action: 'carry', ygx: stump.gx, ygy: stump.gy });
+  }
+  // Water from the well, once there is a well to draw it from.
+  for (const p of site.props) {
+    if (p.kind !== 'well' || !snap.props.has(p.id)) continue;
+    out.push({ gx: p.gx, gy: p.gy, action: 'carry', ygx: site.gx, ygy: site.gy });
+    break;
+  }
   return out;
+}
+
+/**
+ * The road a newcomer to `site` would have walked in on: the built road back to
+ * the oldest place it connects to, entered a few tiles short of the town so the
+ * last of the journey happens on screen.
+ *
+ * Returns null if nothing leads here yet — the first settlers of a site are
+ * already standing in the meadow when it is founded, with no road to arrive by.
+ */
+function arrivalOn(
+  scene: GenesisScene,
+  site: SiteSpec,
+  snap: WorldSnapshot,
+  rng: () => number
+): Arrival | null {
+  const sites = scene.map.sites;
+  let best: RoadSpec | null = null;
+  let bestAge = Infinity;
+  for (const road of scene.map.roads) {
+    if (road.from !== site.id && road.to !== site.id) continue;
+    // Part-built roads stop in the middle of the wood; nobody arrives down one.
+    if ((snap.roads.get(road.id) ?? 0) < 0.98) continue;
+    const other = road.from === site.id ? road.to : road.from;
+    // Sites are in founding order, so a lower index is the older neighbour.
+    const age = sites.findIndex((s) => s.id === other);
+    if (age >= 0 && age < bestAge) {
+      bestAge = age;
+      best = road;
+    }
+  }
+  if (!best) return null;
+  const geo = scene.roadGeo.get(best.id)!;
+  const pts = best.pts;
+  const head = pts[0];
+  const tail = pts[pts.length - 1];
+  const atHead =
+    Math.hypot(head[0] - site.gx, head[1] - site.gy) <=
+    Math.hypot(tail[0] - site.gx, tail[1] - site.gy);
+  const back = Math.min(geo.len * 0.55, 5 + rng() * 4);
+  return { roadId: best.id, s: atHead ? back : geo.len - back, dir: atHead ? -1 : 1 };
 }
 
 function wanderPoint(site: SiteSpec, snap: WorldSnapshot, rng: () => number): Vec2 {
@@ -846,21 +957,43 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
   const rng = amb.rng;
 
   /* ---- population ------------------------------------------------------ */
+  // Regroup the standing crowd by site once, rather than re-filtering the whole
+  // population for every one of up to eight towns.
+  const crews = amb.crews;
+  for (const arr of crews.values()) arr.length = 0;
+  for (const b of amb.bots) {
+    const arr = crews.get(b.site);
+    if (arr) arr.push(b);
+    else crews.set(b.site, [b]);
+  }
+
   const extra = paceCrew(amb);
+  const next: Bot[] = [];
   for (const site of scene.map.sites) {
     const founded = snap.founded.has(site.id);
     const want = founded
       ? Math.max(1, Math.min((snap.population.get(site.id) ?? 1) + extra, 8 + extra))
       : 0;
-    const mine = amb.bots.filter((b) => b.site === site.id);
-    if (mine.length > want) {
-      const drop = new Set(mine.slice(want));
-      amb.bots = amb.bots.filter((b) => !drop.has(b));
+    let mine = crews.get(site.id);
+    if (!mine) {
+      mine = [];
+      crews.set(site.id, mine);
     }
-    for (let i = mine.length; i < want; i++) {
+    const had = mine.length;
+    if (had > want) mine.length = want;
+
+    // A town that gains settlers has had people *arrive*, and people arrive on
+    // the road. Only a town that already existed can be walked into: the first
+    // pair of a new site are the ones who founded it, and are simply there.
+    const was = amb.pop.get(site.id) ?? 0;
+    const now = snap.population.get(site.id) ?? 0;
+    amb.pop.set(site.id, now);
+    let walkIn = had > 0 && now > was ? Math.min(2, want - had) : 0;
+
+    for (let i = had; i < want; i++) {
       const a = rng() * Math.PI * 2;
       const r = Math.sqrt(rng()) * site.radius * 0.6;
-      amb.bots.push({
+      const bot: Bot = {
         site: site.id,
         slot: i,
         gx: site.gx + Math.cos(a) * r,
@@ -875,20 +1008,41 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
         jx: (rng() - 0.5) * 1.8,
         jy: (rng() - 0.5) * 1.8,
         leg: 0,
-      });
+        arrive: null,
+      };
+      if (walkIn > 0) {
+        const arr = arrivalOn(scene, site, snap, rng);
+        if (arr) {
+          const geo = scene.roadGeo.get(arr.roadId)!;
+          const at = alongPolyline(scene.roadById.get(arr.roadId)!.pts, geo, arr.s);
+          bot.gx = at[0];
+          bot.gy = at[1];
+          bot.action = 'walk';
+          bot.arrive = arr;
+          walkIn--;
+        }
+      }
+      mine.push(bot);
     }
+    for (const b of mine) next.push(b);
   }
+  amb.bots = next;
   amb.bots.forEach((b, i) => {
     b.slot = i;
   });
 
-  /* ---- road walkers ---------------------------------------------------- */
+  /* ---- road traffic ---------------------------------------------------- */
+  // A highway is the road freight uses, so it gets a hand cart as well as a
+  // walker; a lane or a track only ever carries people.
   amb.walkers = amb.walkers.filter((w) => (snap.roads.get(w.roadId) ?? 0) > 0.5);
+  const onRoad = new Map<string, number>();
+  for (const w of amb.walkers) onRoad.set(w.roadId, (onRoad.get(w.roadId) ?? 0) + 1);
   for (const road of scene.map.roads) {
     const frac = snap.roads.get(road.id) ?? 0;
     if (frac <= 0.5) continue;
-    const want = road.kind === 'highway' ? 2 : 1;
-    const have = amb.walkers.filter((w) => w.roadId === road.id).length;
+    const highway = road.kind === 'highway';
+    const want = highway ? 2 : 1;
+    const have = onRoad.get(road.id) ?? 0;
     const geo = scene.roadGeo.get(road.id)!;
     for (let i = have; i < want; i++) {
       const s = geo.len * frac * rng();
@@ -902,6 +1056,8 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
         gx: at[0],
         gy: at[1],
         faceRight: true,
+        cart: highway && i === 0,
+        cargo: CARGO_COLORS[Math.floor(rng() * CARGO_COLORS.length)],
       });
     }
   }
@@ -937,12 +1093,16 @@ export function stepAmbient(
 
   for (const site of scene.map.sites) {
     if (!snap.founded.has(site.id)) continue;
-    const crew = amb.bots.filter((b) => b.site === site.id);
-    if (!crew.length) continue;
+    const crew = amb.crews.get(site.id);
+    if (!crew || !crew.length) continue;
     const tasks = siteTasks(scene, site, snap);
 
     crew.forEach((bot, i) => {
       bot.phase += dt * rate;
+      if (bot.arrive) {
+        stepArrival(scene, bot, site, dt, rate);
+        return;
+      }
       const task = tasks.length ? tasks[i % tasks.length] : null;
 
       if (task) {
@@ -985,12 +1145,12 @@ export function stepAmbient(
   }
 
   for (const w of amb.walkers) {
-    const road = scene.map.roads.find((r) => r.id === w.roadId);
+    const road = scene.roadById.get(w.roadId);
     if (!road) continue;
     const geo = scene.roadGeo.get(road.id)!;
     const end = geo.len * (snap.roads.get(road.id) ?? 0);
     w.phase += dt * rate;
-    w.s += WALK_SPEED * rate * dt * w.dir;
+    w.s += (w.cart ? CART_SPEED : WALK_SPEED) * rate * dt * w.dir;
     if (w.s >= end) {
       w.s = end;
       w.dir = -1;
@@ -1006,6 +1166,44 @@ export function stepAmbient(
   }
 
   stepSmoke(amb, dt);
+}
+
+/**
+ * Walk a newcomer the last few tiles of their journey, along the road, and put
+ * them into the site's crew when they get there. Until then they take no task:
+ * you cannot frame a wall you have not reached yet.
+ */
+function stepArrival(
+  scene: GenesisScene,
+  bot: Bot,
+  site: SiteSpec,
+  dt: number,
+  rate: number
+): void {
+  const a = bot.arrive!;
+  const road = scene.roadById.get(a.roadId);
+  const geo = road ? scene.roadGeo.get(a.roadId) : undefined;
+  if (!road || !geo) {
+    bot.arrive = null;
+    return;
+  }
+  a.s += WALK_SPEED * rate * dt * a.dir;
+  const home = a.dir < 0 ? a.s <= 0 : a.s >= geo.len;
+  if (home) a.s = a.dir < 0 ? 0 : geo.len;
+  const at = alongPolyline(road.pts, geo, a.s);
+  const sdx = at[0] - bot.gx - (at[1] - bot.gy);
+  if (Math.abs(sdx) > 0.001) bot.faceRight = sdx > 0;
+  bot.gx = at[0];
+  bot.gy = at[1];
+  bot.action = 'walk';
+  // The road stops at the edge of town as often as at its middle, so either
+  // running out of road or simply reaching the place counts as arriving.
+  if (home || Math.hypot(bot.gx - site.gx, bot.gy - site.gy) < 1.4) {
+    bot.arrive = null;
+    bot.tx = site.gx + bot.jx;
+    bot.ty = site.gy + bot.jy;
+    bot.timer = 0.5;
+  }
 }
 
 /** @returns true while the bot is still travelling. */
@@ -1045,6 +1243,8 @@ function stepSmoke(amb: Ambient, dt: number): void {
 /** Scrubbing backwards throws the whole ambient layer away and re-seeds it. */
 export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
   amb.bots = [];
+  amb.crews.clear();
+  amb.pop.clear();
   amb.walkers = [];
   amb.smoke = [];
   amb.smokeClock.t = 0;
@@ -1359,8 +1559,54 @@ export function renderGenesis(
           a: sky.lamps * 0.4,
         });
       }
+      // Something landmark-sized going up gets a crane in its yard, on the side
+      // the site is: that is where the materials come from and where the ground
+      // is already trampled. It goes away with the last course of the roof.
+      if (b.w >= 44 && st.progress > 0.12 && st.progress < 0.985) {
+        const cs = propSprite(scene, 'crane', b.seed, b.accent);
+        if (cs) {
+          let ux = site.gx - b.gx;
+          let uy = site.gy - b.gy;
+          const d = Math.hypot(ux, uy);
+          if (d < 0.5) {
+            ux = 0.7071;
+            uy = 0.7071;
+          } else {
+            ux /= d;
+            uy /= d;
+          }
+          const kgx = b.gx + ux * 2.1;
+          const kgy = b.gy + uy * 2.1;
+          const kx = isoX(kgx, kgy);
+          const ky = isoY(kgx, kgy);
+          if (inView(kx, ky)) {
+            const cbx = Math.round(kx - cs.ox);
+            const cby = Math.round(ky - cs.oy);
+            const hx = Math.round(kx);
+            const hy = Math.round(ky);
+            items.push({
+              // The hook and its load stay inside the mast sprite's own box,
+              // so one rectangle covers the whole crane for occlusion repair.
+              depth: ky,
+              bx: cbx,
+              by: cby,
+              bw: cs.c.width,
+              bh: cs.c.height,
+              draw: (c) => {
+                c.drawImage(cs.c, cbx, cby);
+                drawCraneLoad(c, hx, hy, clock);
+              },
+            });
+          }
+        }
+      }
     }
   }
+
+  // Everything from here on moves every frame. The occlusion repair below runs
+  // over these first, so that if it ever hits its budget it is the scenery that
+  // goes unrepaired, never the crowd.
+  const moversFrom = items.length;
 
   for (const w of amb.wheels) {
     if (!inView(w.x, w.y)) continue;
@@ -1408,7 +1654,20 @@ export function renderGenesis(
     if (!inView(x, y)) continue;
     const px = Math.round(x);
     const py = Math.round(y);
-    const { color, faceRight, phase } = w;
+    const { color, faceRight, phase, cargo } = w;
+    if (w.cart) {
+      // A cart is bed, load, wheels and carter: nearly three times a walker
+      // wide, and the occlusion rect has to say so or it drives through trunks.
+      items.push({
+        depth: y + 1,
+        bx: px - 18,
+        by: py - 20,
+        bw: 36,
+        bh: 22,
+        draw: (c) => drawCart(c, px, py, color, faceRight, phase, cargo),
+      });
+      continue;
+    }
     items.push({
       depth: y + 1,
       bx: px - 7,
@@ -1429,8 +1688,8 @@ export function renderGenesis(
     const veg = scene.veg;
     const n0 = items.length;
     const need = new Set<number>();
-    for (let e = 0; e < n0; e++) {
-      const it = items[e];
+    /** @returns false once the repair budget is spent. */
+    const repairsFor = (it: Item): boolean => {
       const cx0 = Math.floor(it.bx / VCELL);
       const cx1 = Math.floor((it.bx + it.bw) / VCELL);
       const cy0 = Math.floor(it.by / VCELL);
@@ -1439,17 +1698,28 @@ export function renderGenesis(
         for (let gx = cx0; gx <= cx1; gx++) {
           const arr = veg.grid.get(vkey(gx, gy));
           if (!arr) continue;
-          for (const idx of arr) {
-            if (!veg.on[idx] || need.has(idx)) continue;
+          // Cell lists ascend with item index, and item index ascends with
+          // depth, so walking a cell backwards reaches the sprites in front of
+          // this one first and can stop dead at the first one behind it. In a
+          // dense wood that is the difference between reading a handful of
+          // entries per cell and reading all of them.
+          for (let k = arr.length - 1; k >= 0; k--) {
+            const idx = arr[k];
             const s = veg.items[idx];
-            if (s.depth <= it.depth) continue;
+            if (s.depth <= it.depth) break;
+            if (!veg.on[idx] || need.has(idx)) continue;
             if (s.bx > it.bx + it.bw || s.bx + s.bw < it.bx) continue;
             if (s.by > it.by + it.bh || s.by + s.bh < it.by) continue;
             need.add(idx);
+            if (need.size >= REPAIR_CAP) return false;
           }
         }
       }
-    }
+      return true;
+    };
+    let room = true;
+    for (let e = moversFrom; e < n0 && room; e++) room = repairsFor(items[e]);
+    for (let e = 0; e < moversFrom && room; e++) room = repairsFor(items[e]);
     need.forEach((idx) => {
       const s = veg.items[idx];
       items.push({

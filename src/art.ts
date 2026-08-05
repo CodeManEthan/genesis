@@ -1129,6 +1129,33 @@ export function buildCrane(accent: string): Sprite {
   });
 }
 
+/**
+ * The moving half of a crane: the hook line and the load swinging under the
+ * jib. Drawn in `buildCrane`'s own local coordinates, so `x, y` is the same
+ * anchor point the crane sprite was placed at.
+ *
+ * The Vale draws this inline in its entity pass; Genesis calls it here so the
+ * two valleys swing the same load at the same rate.
+ */
+export function drawCraneLoad(ctx: Ctx, x: number, y: number, t: number): void {
+  const jibX = 20;
+  const topY = -50;
+  const sway = Math.sin(t * 0.8) * 5;
+  const drop = 24 + Math.sin(t * 0.55) * 9;
+  const hx = Math.round(x) + Math.round(jibX + sway * 0.4);
+  const hy = Math.round(y) + topY;
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(hx, hy, 1, Math.round(drop));
+  const lx = hx - 4;
+  const ly = hy + Math.round(drop);
+  ctx.fillStyle = PAL.woodLight;
+  ctx.fillRect(lx, ly, 9, 6);
+  ctx.fillStyle = PAL.wood;
+  ctx.fillRect(lx, ly + 4, 9, 2);
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(lx, ly, 9, 1);
+}
+
 /* ------------------------------- dynamics ------------------------------- */
 
 export type BotAction = 'walk' | 'idle' | 'work' | 'carry';
