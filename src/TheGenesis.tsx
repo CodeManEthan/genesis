@@ -133,6 +133,19 @@ function logSig(log: { t: number; text: string }[]): string {
 /** Never equal to any real signature: forces the next push through. */
 const LOG_FORCE = '!';
 
+/**
+ * Pixel art has to be drawn at the *panel's* resolution. Size the backing store
+ * in CSS pixels instead and a 3× phone renders the whole valley into a third of
+ * the pixels it owns — the detail is decimated away before the browser scales
+ * the finished frame back up, and what smoothing the upscale adds softens what
+ * little survived. That is exactly what Genesis used to look like on a phone.
+ *
+ * Capped at 3: past that the frame costs ratio² more fill for a difference no
+ * eye can find, and phones that report 4 are the ones least able to afford it.
+ */
+const MAX_DPR = 3;
+const deviceRatio = () => Math.min(Math.max(1, window.devicePixelRatio || 1), MAX_DPR);
+
 const randomSeed = () => Math.floor(Math.random() * 4294967296) >>> 0;
 const stepSeed = (seed: number, d: 1 | -1) => ((seed + d + 4294967296) % 4294967296) >>> 0;
 
@@ -190,7 +203,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+  /** CSS box of the wrapper, plus the display ratio it is being drawn at: a
+   * change to either one has to rebuild the canvas backing store. */
+  const [size, setSize] = useState<{ w: number; h: number; dpr: number } | null>(null);
   const [ready, setReady] = useState(false);
   const [mode, setMode] = useState<'live' | 'player'>('live');
   const [playing, setPlaying] = useState(false);
@@ -203,6 +218,15 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   /** The seed browser is a lab tool: open where the lab page is the whole
    * screen, folded behind the valley's own name where the world is a hero. */
   const [worldOpen, setWorldOpen] = useState(!embed);
+  /**
+   * Only ever consulted on a phone. A screen that small is nearly all world, so
+   * the transport folds down into a single chip and the valley gets the band it
+   * was drawn for; the wide layout below 620px ignores this entirely and keeps
+   * the bar where it has always been.
+   */
+  const [barOpen, setBarOpen] = useState(false);
+  const chipRef = useRef<HTMLButtonElement | null>(null);
+  const foldRef = useRef<HTMLButtonElement | null>(null);
 
   /** The seed the date hands out; "Today" is whatever this is. Moves on by
    * itself when a LIVE world rolls over into the next day. */
@@ -276,16 +300,42 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     if (!el) return;
     const read = () => {
       const r = el.getBoundingClientRect();
+      const dpr = deviceRatio();
       setSize((prev) =>
-        prev && Math.abs(prev.w - r.width) < 1 && Math.abs(prev.h - r.height) < 1
+        prev &&
+        prev.dpr === dpr &&
+        Math.abs(prev.w - r.width) < 1 &&
+        Math.abs(prev.h - r.height) < 1
           ? prev
-          : { w: Math.max(1, r.width), h: Math.max(1, r.height) }
+          : { w: Math.max(1, r.width), h: Math.max(1, r.height), dpr }
       );
     };
     read();
     const ro = new ResizeObserver(read);
     ro.observe(el);
-    return () => ro.disconnect();
+
+    // A window dragged onto a different monitor, or a browser zoom, changes the
+    // ratio without changing the element's size at all, so the observer alone
+    // would leave the canvas at the wrong resolution. The media query has to be
+    // re-armed each time, because it only ever matches the ratio it was made for.
+    let mq: MediaQueryList | null = null;
+    function onRatio() {
+      read();
+      watchRatio();
+    }
+    function watchRatio() {
+      mq?.removeEventListener?.('change', onRatio);
+      mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      // Old Safari has no listener on a MediaQueryList; it simply never hears
+      // about a ratio change, which is the behaviour it had before any of this.
+      mq.addEventListener?.('change', onRatio);
+    }
+    watchRatio();
+
+    return () => {
+      ro.disconnect();
+      mq?.removeEventListener?.('change', onRatio);
+    };
   }, []);
 
   /* --------------------------- world + the loop -------------------------- */
@@ -357,13 +407,30 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     let scene = sceneRef.current!;
     let amb = ambRef.current!;
 
+    // The viewport is `vw × vh` CSS pixels and `dw × dh` real ones. Every camera
+    // number below stays in CSS pixels — that is what a pointer, a wheel and a
+    // layout all speak — and only the render crosses over into device pixels.
+    const dpr = size.dpr;
     const vw = Math.max(1, Math.round(size.w));
     const vh = Math.max(1, Math.round(size.h));
-    canvas.width = vw;
-    canvas.height = vh;
+    const dw = Math.max(1, Math.round(vw * dpr));
+    const dh = Math.max(1, Math.round(vh * dpr));
+    canvas.width = dw;
+    canvas.height = dh;
     canvas.style.width = `${vw}px`;
     canvas.style.height = `${vh}px`;
     ctx.imageSmoothingEnabled = false;
+
+    /**
+     * Snap a wished-for zoom onto the device-pixel grid. At or above one device
+     * pixel per world pixel the magnification has to be a whole number or the
+     * blit resamples and the art softens; below it we are downsampling anyway,
+     * and no whole number is available to snap to.
+     *
+     * At 1× this is the identity on every rung the ladder used to have, so a
+     * desktop's zoom steps are untouched; at 3× it turns them into thirds.
+     */
+    const snapZoom = (z: number) => (z * dpr >= 1 ? Math.round(z * dpr) / dpr : z);
 
     /* ---- zoom ladder: fitted overview, then whole-pixel steps ---------- */
     // Both are derived from the *current* map, so a new valley reframes and
@@ -373,14 +440,19 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       const contentW = Math.max(1, (c.u1 - c.u0) * (TW / 2));
       const contentH = Math.max(1, (c.v1 - c.v0) * (TH / 2));
       const raw = Math.min(vw / contentW, vh / contentH);
-      // Above 1× the art wants whole-number magnification or the tile edges go
-      // uneven; below it, any scale is fine because we are downsampling.
-      const overview = raw >= 1 ? Math.max(1, Math.floor(raw)) : Math.max(0.24, raw);
+      // Above one *device* pixel per world pixel the art wants whole-number
+      // magnification or the tile edges go uneven; below it, any scale is fine
+      // because we are downsampling. On a 3× phone the fitted overview is
+      // therefore a third of a CSS pixel per world pixel — exactly one panel
+      // pixel — rather than the arbitrary fraction it used to be.
+      const overview =
+        raw * dpr >= 1 ? Math.floor(raw * dpr) / dpr : Math.max(0.24, raw);
       const ladder: number[] = [overview];
       for (const z of [0.5, 1, 2, 3, 4]) {
-        if (z > ladder[ladder.length - 1] * 1.15) ladder.push(z);
+        const r = snapZoom(z);
+        if (r > ladder[ladder.length - 1] * 1.15) ladder.push(r);
       }
-      while (ladder.length < 4) ladder.push(ladder[ladder.length - 1] * 2);
+      while (ladder.length < 4) ladder.push(snapZoom(ladder[ladder.length - 1] * 2));
       ladderRef.current = ladder;
       return {
         zoom: overview,
@@ -411,7 +483,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       const qz = Number(q.get('zoom'));
       const qx = Number(q.get('cx'));
       const qy = Number(q.get('cy'));
-      if (q.has('zoom') && qz > 0) camRef.current.zoom = qz;
+      if (q.has('zoom') && qz > 0) camRef.current.zoom = snapZoom(qz);
       if (q.has('cx') && isFinite(qx)) camRef.current.cx = qx - vw / camRef.current.zoom / 2;
       if (q.has('cy') && isFinite(qy)) camRef.current.cy = qy - vh / camRef.current.zoom / 2;
     }
@@ -599,7 +671,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     function paintOnce() {
       const cam = camRef.current!;
       const t0 = perf ? performance.now() : 0;
-      renderGenesis(ctx!, scene, amb, snapRef.current!, { ...cam, vw, vh }, clock);
+      renderGenesis(ctx!, scene, amb, snapRef.current!, { ...cam, vw, vh, dpr }, clock);
       dirtyRef.current = false;
       if (!perf) return;
       const ms = performance.now() - t0;
@@ -609,6 +681,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         console.error(
           `PERF render avg ${(pSum / pN).toFixed(2)}ms max ${pMax.toFixed(2)}ms ` +
             `(${(1000 / (pSum / pN)).toFixed(0)} fps ceiling) zoom ${camRef.current!.zoom} ` +
+            `dpr ${dpr} devscale ${(camRef.current!.zoom * dpr).toFixed(3)} ` +
             `t=${tRef.current.toFixed(2)} trees=${scene.map.trees.length}`
         );
         pN = 0;
@@ -781,6 +854,20 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     syncUrl(seedRef.current, PACES[n], true);
   }, [syncUrl]);
 
+  /**
+   * The disclosure swaps one control for the other, so whichever one the hand
+   * (or the tab key) was on is about to stop existing: hand focus straight to
+   * its counterpart. On a wide screen both are display:none — `offsetParent`
+   * catches that — and nothing moves at all.
+   */
+  const showBar = useCallback((open: boolean) => {
+    setBarOpen(open);
+    requestAnimationFrame(() => {
+      const el = open ? foldRef.current : chipRef.current;
+      if (el && el.offsetParent !== null) el.focus();
+    });
+  }, []);
+
   const goLive = useCallback(() => {
     modeRef.current = 'live';
     setMode('live');
@@ -821,7 +908,10 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   const hush = tDisp >= 23.7 || tDisp < 0.25;
 
   return (
-    <div className={`genesis${embed ? ' gen-embed' : ''}`} ref={wrapRef}>
+    <div
+      className={`genesis${embed ? ' gen-embed' : ''}${barOpen ? ' gen-open' : ''}`}
+      ref={wrapRef}
+    >
       <style>{CSS}</style>
       <canvas
         ref={canvasRef}
@@ -929,7 +1019,28 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         )}
       </div>
 
-      <div className="gen-bar" role="group" aria-label="World clock">
+      {/* The folded transport, and the only chrome along the base of a phone:
+          the hour, whether the world is on the wall clock, and a way back to
+          the controls. A wide screen never sees it — the bar is always there. */}
+      <button
+        type="button"
+        ref={chipRef}
+        className={`gen-chip${mode === 'live' ? ' on' : ''}`}
+        onClick={() => showBar(true)}
+        aria-expanded={barOpen}
+        aria-controls="gen-transport"
+        aria-label={`${fmtClock(tDisp)}${
+          mode === 'live' ? ', live' : ''
+        } — show the world clock controls`}
+      >
+        <b aria-hidden="true">{fmtClock(tDisp)}</b>
+        <span className="gen-chiplive" aria-hidden="true">
+          LIVE
+        </span>
+        <i aria-hidden="true">▴</i>
+      </button>
+
+      <div className="gen-bar" id="gen-transport" role="group" aria-label="World clock">
         <button
           type="button"
           className="gen-ico"
@@ -1000,6 +1111,17 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
           title="Follow the wall clock"
         >
           LIVE
+        </button>
+
+        <button
+          type="button"
+          ref={foldRef}
+          className="gen-ico gen-fold"
+          onClick={() => showBar(false)}
+          aria-label="Hide the world clock controls"
+          title="Hide the controls"
+        >
+          ▾
         </button>
       </div>
     </div>
@@ -1136,6 +1258,10 @@ const CSS = `
   font-weight: 700;
 }
 .gen-live.on { background: #63c9a8; color: #17301f; }
+
+/* Both halves of the phone disclosure sit idle on a wide screen: the bar is
+   simply always open there, so neither the chip nor its fold button exists. */
+.gen-chip, .gen-fold { display: none; }
 
 .gen-corner {
   position: absolute;
@@ -1296,11 +1422,66 @@ const CSS = `
   .gen-hint { display: none; }
 }
 
-/* A phone cannot hold the transport in one pill without clipping the end off
-   it, so the bar stops being a pill: the controls keep the top row, the day
-   gets the full width underneath to scrub along, and the buttons grow to
-   something a thumb can actually hit. */
+/* A phone is nearly all world, so the chrome earns its space or goes.
+ *
+ * The ledger goes: three toasts across the bottom-left were most of the valley
+ * on a 390pt screen. Nothing is lost — every line still reaches the aria-live
+ * mirror below, which is where a screen reader was reading them from anyway.
+ *
+ * The transport folds: what is left at rest is one chip with the hour on it,
+ * and a tap brings back the whole bar. The bar itself cannot hold the transport
+ * in one pill at this width without clipping the end off, so when it is open it
+ * stops being a pill: the controls keep the top row, the day gets the full
+ * width underneath to scrub along, and the buttons grow to something a thumb
+ * can actually hit.
+ *
+ * The zoom column and the nameplate stay put through all of it — they are two
+ * small things against the top-right corner, they never cover the settlement
+ * (which fits and centres itself), and folding them away too would leave a
+ * phone with no way to look closer at the one thing it came for. */
 @media (max-width: 620px) {
+  .gen-ticker { display: none; }
+
+  .gen-chip {
+    position: absolute;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    height: 40px;
+    padding: 0 8px 0 15px;
+    border-radius: 999px;
+    font: inherit;
+    color: #413a55;
+    background: rgba(253, 248, 239, 0.94);
+    border: 1px solid rgba(65, 58, 85, 0.14);
+    box-shadow: 0 8px 26px rgba(31, 28, 45, 0.28);
+    backdrop-filter: blur(6px);
+    cursor: pointer;
+  }
+  .gen-chip b { font-size: 0.98rem; font-variant-numeric: tabular-nums; }
+  .gen-chiplive {
+    padding: 3px 7px;
+    border-radius: 999px;
+    font-size: 0.58rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    background: rgba(65, 58, 85, 0.1);
+    color: #6b6684;
+  }
+  .gen-chip.on .gen-chiplive { background: #63c9a8; color: #17301f; }
+  .gen-chip i { font-style: normal; font-size: 0.7rem; opacity: 0.5; }
+
+  /* The disclosure itself. Everything else in this block describes the bar as
+     it looks *once it is open*. */
+  .gen-bar { display: none; }
+  .genesis.gen-open .gen-bar { display: flex; }
+  .genesis.gen-open .gen-chip { display: none; }
+  .gen-fold { display: block; }
+
   .gen-bar {
     left: 10px;
     right: 10px;
@@ -1318,7 +1499,6 @@ const CSS = `
   /* The one control that has to sit at the far end of the row. */
   .gen-live { margin-left: auto; }
   .gen-scrub { order: 2; flex: 1 0 100%; min-width: 0; height: 26px; }
-  .gen-ticker { max-width: 62vw; bottom: 108px; }
   .gen-wid span { display: none; }
   .gen-world button { font-size: 0.68rem; padding: 0 7px; }
   .gen-corner { right: 10px; top: 10px; gap: 6px; }

@@ -304,6 +304,12 @@ export interface GView {
   zoom: number;
   vw: number;
   vh: number;
+  /**
+   * Device pixels per CSS pixel — the canvas backing store is `vw*dpr` wide.
+   * `zoom * dpr` is therefore the real magnification the panel sees, and it is
+   * that product the zoom ladder keeps whole. Absent means 1.
+   */
+  dpr?: number;
 }
 
 /* -------------------------------- geometry ------------------------------- */
@@ -1384,8 +1390,23 @@ export function renderGenesis(
   clock: number
 ): void {
   const { zoom, vw, vh } = view;
-  const bw = Math.max(1, Math.ceil(vw / zoom));
-  const bh = Math.max(1, Math.ceil(vh / zoom));
+  /**
+   * Two coordinate systems meet here. The world buffer is in *world* pixels —
+   * one unit is one pixel of art. Everything the viewport does, from the blit
+   * onwards, is in *device* pixels: the canvas backing store is the CSS box
+   * times the display's ratio, so a retina phone is drawn at its real
+   * resolution instead of being blown up by the browser afterwards.
+   *
+   * `scale` is the bridge — device pixels per world pixel. The zoom ladder
+   * keeps it a whole number whenever it is at or above 1, which is the whole
+   * reason the art stays hard-edged.
+   */
+  const dpr = view.dpr && view.dpr > 0 ? view.dpr : 1;
+  const scale = zoom * dpr;
+  const dw = Math.max(1, Math.round(vw * dpr));
+  const dh = Math.max(1, Math.round(vh * dpr));
+  const bw = Math.max(1, Math.ceil(dw / scale));
+  const bh = Math.max(1, Math.ceil(dh / scale));
   const f = scene.frame;
   if (f.width !== bw || f.height !== bh) {
     f.width = bw;
@@ -1400,6 +1421,11 @@ export function renderGenesis(
   scene.relight = 4;
   syncVeg(scene, snap);
 
+  // Whole world pixels, always: the buffer is drawn at 1 unit = 1 art pixel, so
+  // a fractional camera would land sprites and spans off the buffer's own grid
+  // and soften them before the blit ever happens. With `scale` whole, a whole
+  // world pixel is also a whole device pixel, so this is the device-pixel
+  // alignment as well.
   const cx = Math.round(view.cx);
   const cy = Math.round(view.cy);
 
@@ -1745,10 +1771,12 @@ export function renderGenesis(
   drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1, sky.night);
 
   /* ---- blit the world buffer to the viewport --------------------------- */
+  // From here down the viewport is measured in device pixels; no transform is
+  // set on `ctx`, so every coordinate below is a real pixel of the panel.
   g.setTransform(1, 0, 0, 1, 0, 0);
   ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, vw, vh);
-  ctx.drawImage(f, 0, 0, bw, bh, 0, 0, bw * zoom, bh * zoom);
+  ctx.clearRect(0, 0, dw, dh);
+  ctx.drawImage(f, 0, 0, bw, bh, 0, 0, bw * scale, bh * scale);
 
   /* ---- the sky, over the finished frame -------------------------------- */
   // Deliberately *not* in the world buffer: this is one screen-sized fill
@@ -1759,20 +1787,20 @@ export function renderGenesis(
     ctx.globalCompositeOperation = 'multiply';
     ctx.globalAlpha = sky.a;
     ctx.fillStyle = sky.css;
-    ctx.fillRect(0, 0, vw, vh);
+    ctx.fillRect(0, 0, dw, dh);
     ctx.restore();
   }
   if (sky.lift > 0.004) {
     // A wash of low sun (or the first grey of the morning) off the horizon.
     const cool = snap.t < 12;
-    const grad = ctx.createLinearGradient(0, 0, 0, vh);
+    const grad = ctx.createLinearGradient(0, 0, 0, dh);
     grad.addColorStop(0, cool ? 'rgba(126,158,214,1)' : 'rgba(255,180,99,1)');
     grad.addColorStop(1, cool ? 'rgba(126,158,214,0)' : 'rgba(255,180,99,0)');
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = sky.lift;
     ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, vw, vh);
+    ctx.fillRect(0, 0, dw, dh);
     ctx.restore();
   }
   if (halos.length && sky.lamps > 0.02) {
@@ -1781,10 +1809,12 @@ export function renderGenesis(
     ctx.globalCompositeOperation = 'lighter';
     ctx.imageSmoothingEnabled = true;
     for (const h of halos) {
-      const sx = (h.x - cx) * zoom;
-      const sy = (h.y - cy) * zoom;
-      const r = h.r * zoom;
-      if (sx + r < 0 || sx - r > vw || sy + r < 0 || sy - r > vh) continue;
+      // Soft by design — these are the one thing that *wants* smoothing, so
+      // drawing them larger at device resolution only makes them smoother.
+      const sx = (h.x - cx) * scale;
+      const sy = (h.y - cy) * scale;
+      const r = h.r * scale;
+      if (sx + r < 0 || sx - r > dw || sy + r < 0 || sy - r > dh) continue;
       ctx.globalAlpha = h.a;
       ctx.drawImage(sp, sx - r, sy - r, r * 2, r * 2);
     }
