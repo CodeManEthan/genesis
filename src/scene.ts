@@ -108,7 +108,9 @@ function pool<T>(n: number, make: (i: number) => T): T[] {
   return Array.from({ length: n }, (_, i) => make(i));
 }
 
-function makePools(): Record<string, Sprite[]> {
+/** The scenery sprite pools, one entry per prop/tree kind. Exported so the
+ * catalog page can enumerate every kind the simulation can draw. */
+export function makePools(): Record<string, Sprite[]> {
   return {
     oak: pool(6, (i) => buildTree(0, 11 + i * 37)),
     pine: pool(6, (i) => buildTree(1, 23 + i * 41)),
@@ -378,7 +380,7 @@ function segDist(px: number, py: number, a: Vec2, b: Vec2): number {
 }
 
 /** Quad strip along a tile-space polyline, in world pixels. */
-function strip(ctx: Ctx, pts: Vec2[], halfW: number, color: string): void {
+export function strip(ctx: Ctx, pts: Vec2[], halfW: number, color: string): void {
   for (let i = 0; i + 1 < pts.length; i++) {
     const [ax, ay] = pts[i];
     const [bx, by] = pts[i + 1];
@@ -397,6 +399,39 @@ function strip(ctx: Ctx, pts: Vec2[], halfW: number, color: string): void {
       [isoX(ax - nx - ex, ay - ny - ey), isoY(ax - nx - ex, ay - ny - ey)],
     ];
     poly(ctx, q, color);
+  }
+}
+
+/**
+ * One road, painted along a tile-space polyline: verge, edge, carriageway, a
+ * paler centre for a highway, then loose stones seeded from `stoneSeed` so the
+ * ruts do not crawl frame to frame. Exported so the catalog can draw a sample
+ * of each road kind with exactly the renderer's own strips.
+ */
+export function paintRoad(
+  ctx: Ctx,
+  pts: Vec2[],
+  kind: RoadSpec['kind'],
+  width: number,
+  stoneSeed: number
+): void {
+  strip(ctx, pts, width + 0.55, mix(PAL.grassEdge, PAL.dirt, 0.55));
+  strip(ctx, pts, width + 0.16, PAL.dirtEdge);
+  strip(ctx, pts, width, PAL.dirt);
+  strip(ctx, pts, width * 0.42, kind === 'highway' ? PAL.dirtPale : PAL.dirtAlt);
+  const rr = mulberry32(stoneSeed);
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const steps = Math.max(
+      2,
+      Math.round(Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) * 1.2)
+    );
+    for (let k = 0; k < steps; k++) {
+      const t = (k + rr()) / steps;
+      const gx = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t;
+      const gy = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t;
+      const off = (rr() - 0.5) * width * 1.6;
+      rect(ctx, isoX(gx, gy) + off * 16, isoY(gx, gy) + off * 6, 2 + rr() * 3, 1, PAL.dirtEdge);
+    }
   }
 }
 
@@ -1461,26 +1496,7 @@ export function renderGenesis(
     const geo = scene.roadGeo.get(road.id)!;
     const pts = cutPolyline(road.pts, geo, frac);
     if (pts.length < 2) continue;
-    strip(g, pts, road.width + 0.55, mix(PAL.grassEdge, PAL.dirt, 0.55));
-    strip(g, pts, road.width + 0.16, PAL.dirtEdge);
-    strip(g, pts, road.width, PAL.dirt);
-    strip(g, pts, road.width * 0.42, road.kind === 'highway' ? PAL.dirtPale : PAL.dirtAlt);
-    // Loose stones and ruts. Seeded per road, so they do not crawl frame to
-    // frame; the tail of the strip simply stops advancing with `frac`.
-    const rr = mulberry32(2024 + road.id.length * 31);
-    for (let i = 0; i + 1 < pts.length; i++) {
-      const steps = Math.max(
-        2,
-        Math.round(Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) * 1.2)
-      );
-      for (let k = 0; k < steps; k++) {
-        const t = (k + rr()) / steps;
-        const gx = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t;
-        const gy = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t;
-        const off = (rr() - 0.5) * road.width * 1.6;
-        rect(g, isoX(gx, gy) + off * 16, isoY(gx, gy) + off * 6, 2 + rr() * 3, 1, PAL.dirtEdge);
-      }
-    }
+    paintRoad(g, pts, road.kind, road.width, 2024 + road.id.length * 31);
     // A ribboned stake marks the head of an unfinished road.
     if (frac < 0.995) {
       const head = pts[pts.length - 1];
@@ -1822,7 +1838,8 @@ export function renderGenesis(
   }
 }
 
-function drawBridge(
+/** A bridge at one of its three build stages. Exported for the catalog. */
+export function drawBridge(
   ctx: Ctx,
   river: Vec2[],
   gx: number,

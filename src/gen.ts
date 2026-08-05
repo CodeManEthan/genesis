@@ -302,14 +302,14 @@ function relaxTurns(line: Pt[], maxDeg: number, passes: number): Pt[] {
  * after the original fourteen fill the gaps that list left in the hue wheel:
  * yellow-green, spring green, periwinkle and orchid.
  */
-const ACCENTS = [
+export const ACCENTS = [
   '#ef7f93', '#f5a25d', '#f0c75e', '#6cc4d9', '#9b8fe8', '#63c9a8', '#e98fc3',
   '#7fb2ef', '#d9a066', '#8fd68f', '#c78ff0', '#5fbfa8', '#efb0a0', '#a8c96e',
   '#c3d768', '#6fd18c', '#8fa5ee', '#dd8ae0',
 ];
 
 /** One landmark per site, rotated so no two towns share a silhouette. */
-const LANDMARK_ROLES: StructureRole[] = [
+export const LANDMARK_ROLES: StructureRole[] = [
   'hall', 'mill', 'chapel', 'granary', 'tower', 'smithy', 'barn', 'brewhouse',
 ];
 
@@ -318,7 +318,7 @@ const LANDMARK_ROLES: StructureRole[] = [
  * — they are landmark silhouettes, and three chapels in one hamlet reads as a
  * bug rather than as variety.
  */
-const COMMON_ROLES: StructureRole[] = [
+export const COMMON_ROLES: StructureRole[] = [
   'cottage', 'cottage', 'cottage', 'cottage', 'house', 'house', 'house',
   'store', 'store', 'workshop', 'workshop', 'shed', 'shed', 'barn',
   'granary', 'smithy', 'mill', 'bakery', 'bakery',
@@ -348,10 +348,10 @@ const LABELS: Record<StructureRole, string[]> = {
   brewhouse: ['The Brewhouse', 'The Oast House', 'The Malting', 'Hop Yard'],
 };
 
-const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', 'homestead']);
+export const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', 'homestead']);
 
 /** Flavour dressing that shows up as a town matures. */
-const FLAVOUR_PROPS = ['crop', 'haystack', 'crates', 'barrels', 'cart', 'shed'];
+export const FLAVOUR_PROPS = ['crop', 'haystack', 'crates', 'barrels', 'cart', 'shed'];
 
 /** Base woodland mix per biome, before the day's forest character is applied. */
 const BASE_TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
@@ -383,6 +383,9 @@ const WOOD_CHARACTERS: { name: string; kind: TreeKind; boost: number }[] = [
 
 const woodChar = (seed: number) =>
   WOOD_CHARACTERS[Math.floor(mulberry32((seed ^ 0x2f6a88c3) >>> 0)() * WOOD_CHARACTERS.length)];
+
+/** Every forest character a day can be drawn from, by name. */
+export const WOOD_CHARACTER_NAMES: string[] = WOOD_CHARACTERS.map((c) => c.name);
 
 /** The day's forest character, by name. Exported for the test harness. */
 export const woodCharacter = (seed: number): string => woodChar(seed).name;
