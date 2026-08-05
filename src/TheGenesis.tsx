@@ -159,7 +159,18 @@ interface Cam {
 
 /* ------------------------------- component ------------------------------- */
 
-export default function TheGenesis() {
+export interface GenesisProps {
+  /**
+   * The island is sitting in a page that scrolls. Vertical wheel and space/arrow
+   * keys then belong to the document, not the map: zoom moves behind ctrl/⌘ (the
+   * gesture every web map uses), the keyboard transport only answers once focus
+   * is actually inside the world, and the seed browser starts folded away so it
+   * cannot argue with the page's own copy.
+   */
+  embed?: boolean;
+}
+
+export default function TheGenesis({ embed = false }: GenesisProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -173,6 +184,9 @@ export default function TheGenesis() {
   const [seed, setSeed] = useState(0);
   const [paceIdx, setPaceIdx] = useState(1);
   const [lines, setLines] = useState<{ t: number; text: string }[]>([]);
+  /** The seed browser is a lab tool: open where the lab page is the whole
+   * screen, folded behind the valley's own name where the world is a hero. */
+  const [worldOpen, setWorldOpen] = useState(!embed);
 
   /** The seed the date hands out; "Today" is whatever this is. Moves on by
    * itself when a LIVE world rolls over into the next day. */
@@ -660,13 +674,17 @@ export default function TheGenesis() {
     const el = canvasRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      // Embedded, a plain wheel is the visitor scrolling the page and the map
+      // has no business swallowing it; ctrl/⌘ + wheel is the zoom gesture, and
+      // it is also what a trackpad pinch arrives as.
+      if (embed && !e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
       const r = el.getBoundingClientRect();
       api.current?.stepZoom(e.deltaY < 0 ? 1 : -1, e.clientX - r.left, e.clientY - r.top);
     };
     el.addEventListener('wheel', onWheel, { passive: false });
     return () => el.removeEventListener('wheel', onWheel);
-  }, [ready]);
+  }, [ready, embed]);
 
   /* ------------------------------ transport ------------------------------ */
   const detach = useCallback(() => {
@@ -732,6 +750,9 @@ export default function TheGenesis() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' && e.key === ' ') return;
+      // On a scrolling page space and the arrows are the page's, right up until
+      // the visitor has actually put focus inside the world.
+      if (embed && !wrapRef.current?.contains(document.activeElement)) return;
       if (e.key === ' ') {
         e.preventDefault();
         togglePlay();
@@ -745,7 +766,7 @@ export default function TheGenesis() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, seek]);
+  }, [togglePlay, seek, embed]);
 
   const latest = lines.length ? lines[lines.length - 1].text : '';
   const pct = (clamp(tDisp, 0, 24) / 24) * 100;
@@ -753,11 +774,14 @@ export default function TheGenesis() {
   const hush = tDisp >= 23.7 || tDisp < 0.25;
 
   return (
-    <div className="genesis" ref={wrapRef}>
+    <div className={`genesis${embed ? ' gen-embed' : ''}`} ref={wrapRef}>
       <style>{CSS}</style>
       <canvas
         ref={canvasRef}
         className="gen-canvas"
+        // Embedded, the world is one stop on a page: it takes focus so the
+        // transport keys have somewhere to belong before they fire.
+        tabIndex={embed ? 0 : undefined}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -780,59 +804,82 @@ export default function TheGenesis() {
         {latest}
       </p>
 
-      <div className="gen-world" role="group" aria-label="Which valley">
-        <div className="gen-wrow">
-          <button
-            type="button"
-            className="gen-wshuffle"
-            onClick={() => pickSeed(randomSeed())}
-            title="Generate a valley from a random seed"
-          >
-            New valley
+      {/* One top-right column: zoom, then the valley's own nameplate, which is
+          also the door to the seed browser. The top *left* is left clear for
+          whatever page the world is embedded in wants to say. */}
+      <div className="gen-corner">
+        <div className="gen-zoom">
+          <button type="button" onClick={() => api.current?.stepZoom(1)} aria-label="Zoom in">
+            +
           </button>
-          <button
-            type="button"
-            className="gen-wstep"
-            onClick={() => pickSeed(stepSeed(seedRef.current, -1))}
-            aria-label="Previous seed"
-            title="Previous seed"
-          >
-            ‹
+          <button type="button" onClick={() => api.current?.stepZoom(-1)} aria-label="Zoom out">
+            −
           </button>
-          <button
-            type="button"
-            className="gen-wstep"
-            onClick={() => pickSeed(stepSeed(seedRef.current, 1))}
-            aria-label="Next seed"
-            title="Next seed"
-          >
-            ›
-          </button>
-          <button
-            type="button"
-            className={`gen-wtoday${seed === todayRef.current ? ' on' : ''}`}
-            onClick={() => pickSeed(todayRef.current)}
-            aria-pressed={seed === todayRef.current}
-            title="Back to the valley this date generates"
-          >
-            Today
+          <button type="button" onClick={() => api.current?.fit()}>
+            Fit
           </button>
         </div>
-        <p className="gen-wid">
-          {valley || '…'} <span>· seed {seed}</span>
-        </p>
-      </div>
 
-      <div className="gen-zoom">
-        <button type="button" onClick={() => api.current?.stepZoom(1)} aria-label="Zoom in">
-          +
-        </button>
-        <button type="button" onClick={() => api.current?.stepZoom(-1)} aria-label="Zoom out">
-          −
-        </button>
-        <button type="button" onClick={() => api.current?.fit()}>
-          Fit
-        </button>
+        <div className="gen-world" role="group" aria-label="Which valley">
+          <button
+            type="button"
+            className={`gen-wid${worldOpen ? ' on' : ''}`}
+            onClick={() => setWorldOpen((v) => !v)}
+            aria-expanded={worldOpen}
+            aria-label={`${valley || 'This valley'}, seed ${seed}. Browse other valleys`}
+            title="Browse other valleys"
+          >
+            <b>{valley || '…'}</b>
+            <span>· seed {seed}</span>
+            <i aria-hidden="true">{worldOpen ? '▴' : '▾'}</i>
+          </button>
+
+          {worldOpen && (
+            <div className="gen-wrow">
+              <button
+                type="button"
+                className="gen-wshuffle"
+                onClick={() => pickSeed(randomSeed())}
+                title="Generate a valley from a random seed"
+              >
+                New valley
+              </button>
+              <button
+                type="button"
+                className="gen-wstep"
+                onClick={() => pickSeed(stepSeed(seedRef.current, -1))}
+                aria-label="Previous seed"
+                title="Previous seed"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                className="gen-wstep"
+                onClick={() => pickSeed(stepSeed(seedRef.current, 1))}
+                aria-label="Next seed"
+                title="Next seed"
+              >
+                ›
+              </button>
+              <button
+                type="button"
+                className={`gen-wtoday${seed === todayRef.current ? ' on' : ''}`}
+                onClick={() => pickSeed(todayRef.current)}
+                aria-pressed={seed === todayRef.current}
+                title="Back to the valley this date generates"
+              >
+                Today
+              </button>
+            </div>
+          )}
+        </div>
+
+        {embed && (
+          <p className="gen-hint" aria-hidden="true">
+            drag to roam · ctrl + scroll to zoom
+          </p>
+        )}
       </div>
 
       <div className="gen-bar" role="group" aria-label="World clock">
@@ -923,7 +970,8 @@ const CSS = `
   background: #3f7f66;
   color: #413a55;
   font-family: system-ui, sans-serif;
-  touch-action: none;
+  /* Vertical page scrolling always wins on touch; horizontal drags roam. */
+  touch-action: pan-y;
 }
 .gen-canvas {
   display: block;
@@ -931,8 +979,10 @@ const CSS = `
   height: 100%;
   cursor: grab;
   image-rendering: pixelated;
+  outline: none;
 }
 .gen-canvas:active { cursor: grabbing; }
+.gen-canvas:focus-visible { box-shadow: inset 0 0 0 3px rgba(99, 201, 168, 0.85); }
 
 .gen-bar {
   position: absolute;
@@ -1040,10 +1090,17 @@ const CSS = `
 }
 .gen-live.on { background: #63c9a8; color: #17301f; }
 
-.gen-zoom {
+.gen-corner {
   position: absolute;
   right: 16px;
   top: 16px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+.gen-zoom {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1063,13 +1120,10 @@ const CSS = `
 .gen-zoom button:hover { background: #fff; }
 
 .gen-world {
-  position: absolute;
-  left: 16px;
-  top: 16px;
   display: flex;
   flex-direction: column;
   gap: 5px;
-  align-items: flex-start;
+  align-items: flex-end;
 }
 .gen-wrow {
   display: flex;
@@ -1096,21 +1150,47 @@ const CSS = `
 .gen-world button:hover { background: rgba(99, 201, 168, 0.36); }
 .gen-wstep { width: 24px; padding: 0 !important; font-size: 0.85rem !important; }
 .gen-wtoday.on { background: #63c9a8; color: #17301f; font-weight: 700; }
-.gen-wid {
+/* The nameplate doubles as the disclosure for the seed browser: the valley
+   always says who it is, and the tools for swapping it stay one click away. */
+.gen-world button.gen-wid {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  height: auto;
   margin: 0;
-  padding: 3px 8px;
-  border-radius: 7px;
+  padding: 4px 9px;
+  border-radius: 8px;
   font-size: 0.68rem;
   line-height: 1.3;
   font-weight: 700;
   color: #413a55;
-  background: rgba(253, 248, 239, 0.82);
-  border: 1px solid rgba(65, 58, 85, 0.1);
+  background: rgba(253, 248, 239, 0.92);
+  border: 1px solid rgba(65, 58, 85, 0.14);
+  box-shadow: 0 3px 10px rgba(31, 28, 45, 0.2);
 }
+.gen-world button.gen-wid:hover { background: #fff; }
 .gen-wid span {
   font-weight: 400;
   opacity: 0.6;
   font-variant-numeric: tabular-nums;
+}
+.gen-wid i {
+  font-style: normal;
+  font-size: 0.6rem;
+  opacity: 0.55;
+  margin-left: 1px;
+}
+
+.gen-hint {
+  margin: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(253, 248, 239, 0.72);
+  border: 1px solid rgba(65, 58, 85, 0.12);
+  color: #6b6684;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  pointer-events: none;
 }
 
 .gen-ticker {
@@ -1164,10 +1244,16 @@ const CSS = `
   border: 0;
 }
 
+/* Roughly where pointers become fingers: there is no wheel and no ctrl key. */
+@media (max-width: 820px) {
+  .gen-hint { display: none; }
+}
+
 @media (max-width: 620px) {
   .gen-clock { display: none; }
   .gen-ticker { max-width: 62vw; bottom: 74px; }
   .gen-wid span { display: none; }
   .gen-world button { font-size: 0.68rem; padding: 0 7px; }
+  .gen-corner { right: 10px; top: 10px; gap: 6px; }
 }
 `;
