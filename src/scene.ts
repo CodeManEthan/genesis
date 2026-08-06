@@ -62,6 +62,7 @@ import {
   buildFlowerPatch,
   buildForestPattern,
   buildHaystack,
+  buildJetty,
   buildLamp,
   buildLumber,
   buildMarketStall,
@@ -69,6 +70,7 @@ import {
   buildQuarryBlocks,
   buildReeds,
   buildRock,
+  buildRowboat,
   /* ---- ruins (additive) ---- */
   buildRubble,
   buildRuinWall,
@@ -536,6 +538,11 @@ export interface GenesisScene {
   day: DayInfo;
   /** Flat colour under the woodland pattern, seasoned to match it. */
   beyond: string;
+  /* ---- boats and jetties (additive) ------------------------------------ */
+  /** Every rowboat in the valley, moored or adrift. Drawn per frame, not baked. */
+  boats: Boat[];
+  /** Every pier, with the point on its deck the crowd can stand on. */
+  jetties: JettySpot[];
   /* ---- ruins (additive) ------------------------------------------------- */
   /**
    * Yesterday's ghost, or null. Not part of the map — see ghost.ts — so it is
@@ -562,6 +569,46 @@ export interface GenesisScene {
    * should see.
    */
   fest: number;
+}
+
+/**
+ * A rowboat on the water — moored at a jetty head as site dressing, or adrift
+ * on a big lake as wild scatter.
+ *
+ * This is the one prop the scenery layer does not bake. A boat that never moves
+ * looks beached even when it is plainly floating, so `paintGenesis` pushes each
+ * one through the ordinary depth-sorted item pass with a whole-pixel bob off
+ * the ambient clock. There are at most a handful in any valley.
+ */
+export interface Boat {
+  gx: number;
+  gy: number;
+  dir: number;
+  seed: number;
+  /** Dressing id — the boat waits for its pier. Null for a free lake boat. */
+  id: string | null;
+  /** Sort depth of the pier it is moored to, 0 for a free boat. See JettySpot. */
+  deck: number;
+}
+
+/** A pier, and the plank at the end of it somebody can stand on. */
+export interface JettySpot {
+  id: string;
+  siteId: string;
+  /** Head of the deck, tile space. */
+  gx: number;
+  gy: number;
+  /**
+   * Sort depth for anything standing ON this deck.
+   *
+   * The pier is a baked sprite anchored at its LANDWARD root, so its rect
+   * covers the whole deck while its depth is the depth of the bank. Somebody
+   * out at the head is shallower than that, and the occlusion repair — which is
+   * rect-and-depth, not per-pixel — would dutifully repaint the planks back
+   * over them. Standing on a deck means sorting with the deck, so a fisherman
+   * takes this depth instead of their own.
+   */
+  depth: number;
 }
 
 export interface GView {
@@ -1107,6 +1154,45 @@ export function* buildGenesisSceneSteps(
   const siteProps = new Map<string, { p: PropSpec; accent: string }>();
   for (const s of map.sites) for (const p of s.props) siteProps.set(p.id, { p, accent: s.accent });
 
+  /* ---- boats and jetties (additive) ------------------------------------- */
+  // Two small indexes off the map, so the per-frame pass and the crowd do not
+  // rescan every prop in the valley looking for water.
+  const boats: Boat[] = [];
+  const jetties: JettySpot[] = [];
+  const asBoat = (p: PropSpec, id: string | null, deck: number): Boat => ({
+    gx: p.gx,
+    gy: p.gy,
+    dir: p.dir ?? 0,
+    seed: p.seed,
+    id,
+    deck,
+  });
+  for (const p of map.scatter) if (p.kind === 'rowboat') boats.push(asBoat(p, null, 0));
+  for (const s of map.sites) {
+    // The pier is pushed ahead of the boat moored to it, so by the time the
+    // boat comes round its deck depth is already known.
+    let deck = 0;
+    for (const p of s.props) {
+      if (p.kind === 'rowboat') boats.push(asBoat(p, p.id, deck));
+      else if (p.kind === 'jetty') {
+        // Three quarters of the way out: on the planks, not off the end.
+        const k = (p.len ?? 2.2) * 0.76;
+        const pu = p.gx - p.gy + Math.cos(p.dir ?? 0) * k;
+        const pv = p.gx + p.gy + Math.sin(p.dir ?? 0) * k;
+        deck = isoY(p.gx, p.gy) + 2;
+        jetties.push({
+          id: p.id,
+          siteId: s.id,
+          gx: (pv + pu) / 2,
+          gy: (pv - pu) / 2,
+          depth: deck,
+        });
+      }
+    }
+  }
+  boats.sort((a, b) => (a.id ?? '').localeCompare(b.id ?? '') || a.seed - b.seed);
+  jetties.sort((a, b) => a.id.localeCompare(b.id));
+
   // The endless woodland beyond the map is mostly conifer, so it only half
   // turns — but it has to turn, or the map sits in a summer frame all winter.
   const surround = buildForestPattern();
@@ -1140,6 +1226,8 @@ export function* buildGenesisSceneSteps(
     relight: 0,
     day,
     beyond: seasonGround('#3f7f66', day.season),
+    boats,
+    jetties,
     /* ---- ruins (additive) ---- */
     ghost,
     /* ---- end ruins (additive) ---- */
@@ -1250,7 +1338,7 @@ function* buildVeg(
   let pi = 0;
   for (const site of scene.map.sites) {
     for (const p of site.props) {
-      const sp = propSprite(scene, p.kind, p.seed, site.accent);
+      const sp = propSprite(scene, p.kind, p.seed, site.accent, p.dir, p.len);
       if (sp) {
         props[pi] = add(sp, p.gx, p.gy, R_PROP, pi);
         on.push(false);
@@ -1486,11 +1574,22 @@ function rgbHex(rgb: [number, number, number]): string {
 
 /* ------------------------------ sprite lookup ---------------------------- */
 
+/**
+ * `dir`/`len` are the oriented kinds' extra geometry, straight off the
+ * PropSpec: a jetty is baked per bearing rather than pooled, because there is
+ * no useful pool of piers when every one of them points a different way.
+ *
+ * `rowboat` deliberately returns NULL. It is the one prop the scenery layer
+ * does not bake at all — the per-frame pass draws it so it can bob, and a null
+ * here is exactly how `buildVeg` is already told "this kind has no static art".
+ */
 function propSprite(
   scene: GenesisScene,
   kind: string,
   seed: number,
-  accent: string
+  accent: string,
+  dir?: number,
+  len?: number
 ): Sprite | null {
   switch (kind) {
     case 'nameboard':
@@ -1501,6 +1600,15 @@ function propSprite(
       return cached(scene, `sk:${accent}:${seed % 3}`, () => buildStake(accent, seed));
     case 'crane':
       return cached(scene, `cn:${accent}`, () => buildCrane(accent));
+    case 'jetty': {
+      // Quantised to whole degrees and hundredths of a unit so two piers that
+      // happen to line up share one bake.
+      const a = Math.round(((dir ?? 0) * 180) / Math.PI);
+      const l = Math.round((len ?? 2.2) * 100);
+      return cached(scene, `jt:${a}:${l}`, () => buildJetty((a * Math.PI) / 180, l / 100, seed));
+    }
+    case 'rowboat':
+      return null;
     default: {
       const p = scene.pools[kind];
       if (!p) return null;
@@ -1667,6 +1775,29 @@ interface Task {
   /** Yard point a carrier shuttles back to. */
   ygx: number;
   ygy: number;
+  /** Stand exactly on the mark rather than a tile off it — see `siteTasks`. */
+  exact?: boolean;
+}
+
+/**
+ * Is anybody fishing off `siteId`'s pier at hour `t`?
+ *
+ * Fishing is a stretch of the day, not a shift: the day is cut into blocks and
+ * a hash of the town and the block decides. Deterministic in (site, hour), so
+ * it survives a scrub in either direction, and daylight only — nobody stands on
+ * wet planks at three in the morning.
+ */
+function fishingAt(siteId: string, t: number): boolean {
+  if (t < 5.6 || t > 20.6) return false;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < siteId.length; i++) {
+    h ^= siteId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  // Through mulberry32 rather than off a raw FNV byte: "s1" and "s2" differ in
+  // two low bits, and the plain hash's top bytes barely notice — every town in
+  // the valley ended up fishing on exactly the same schedule.
+  return mulberry32((h ^ Math.imul(Math.floor(t / 2.5) + 1, 0x9e3779b1)) >>> 0)() < 0.58;
 }
 
 /**
@@ -1723,6 +1854,16 @@ function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Ta
   for (const p of site.props) {
     if (p.kind !== 'well' || !snap.props.has(p.id)) continue;
     out.push({ gx: p.gx, gy: p.gy, action: 'carry', ygx: site.gx, ygy: site.gy });
+    break;
+  }
+  // ADDITIVE — boats and jetties. Bottom of the list, under every errand: a
+  // town only ever spares somebody for the pier once the real work is covered,
+  // which is exactly the right priority for a morning's fishing. `exact`,
+  // because the usual tile of jitter would put them off the planks.
+  for (const j of scene.jetties) {
+    if (j.siteId !== site.id || !snap.props.has(j.id)) continue;
+    if (!fishingAt(site.id, snap.t)) break;
+    out.push({ gx: j.gx, gy: j.gy, action: 'fish', ygx: j.gx, ygy: j.gy, exact: true });
     break;
   }
   return out;
@@ -2118,15 +2259,18 @@ export function stepAmbient(
       const task = tasks.length ? tasks[i % tasks.length] : null;
 
       if (task) {
-        const goal: Vec2 =
-          task.action === 'carry' && bot.leg === 1
+        const goal: Vec2 = task.exact
+          ? [task.gx, task.gy]
+          : task.action === 'carry' && bot.leg === 1
             ? [task.ygx + bot.jx, task.ygy + bot.jy]
             : [task.gx + bot.jx * 0.9 + 1.1, task.gy + bot.jy * 0.9 + 1.1];
         bot.tx = goal[0];
         bot.ty = goal[1];
         const moved = moveTo(bot, dt, task.action === 'carry' ? 'carry' : 'walk', rate);
         if (!moved) {
-          if (task.action === 'carry') {
+          if (task.action === 'fish') {
+            bot.action = 'fish';
+          } else if (task.action === 'carry') {
             bot.action = 'carry';
             bot.timer -= dt;
             if (bot.timer <= 0) {
@@ -3182,6 +3326,39 @@ export function renderGenesis(
     }
   }
 
+  /* ---- boats (additive) -------------------------------------------------- *
+   * The scenery layer skips these on purpose. A boat is baked art like any
+   * other prop, but it is drawn here so it can ride a whole-pixel bob off the
+   * ambient clock — a boat pinned dead still to the water reads as beached, and
+   * one pixel at half a hertz is the whole difference. Sub-pixel motion is not
+   * an option in a world blitted at integer magnification, so the bob is a
+   * rounded offset and the boat simply sits a pixel lower on half its cycle.
+   *
+   * They go in ahead of `moversFrom` deliberately: they float on open water,
+   * where there is nothing to occlude them, so they are the first thing the
+   * repair pass should give up on.
+   * ------------------------------------------------------------------------ */
+  for (const boat of scene.boats) {
+    if (boat.id !== null && !snap.props.has(boat.id)) continue;
+    const x = isoX(boat.gx, boat.gy);
+    const y = isoY(boat.gx, boat.gy);
+    if (!inView(x, y)) continue;
+    const sp = cached(scene, `bt:${Math.round((boat.dir * 180) / Math.PI)}:${boat.seed}`, () =>
+      buildRowboat(boat.dir, boat.seed)
+    );
+    const bob = Math.round(Math.sin(clock * 1.15 + boat.seed * 0.37) * 0.9);
+    const bx = Math.round(x - sp.ox);
+    const by = Math.round(y - sp.oy) + bob;
+    items.push({
+      depth: Math.max(y, boat.deck),
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => c.drawImage(sp.c, bx, by),
+    });
+  }
+
   // Everything from here on moves every frame. The occlusion repair below runs
   // over these first, so that if it ever hits its budget it is the scenery that
   // goes unrepaired, never the crowd.
@@ -3236,12 +3413,25 @@ export function renderGenesis(
     const px = Math.round(x);
     const py = Math.round(y);
     const { color, faceRight, action, phase } = bot;
+    // A rod reaches a good way past the shoulder, and the occlusion rect has to
+    // own every pixel the draw touches or a repair will clip the far half off.
+    // A fisherman also sorts with the deck under their feet — see JettySpot.
+    const rod = action === 'fish';
+    let deck = 0;
+    if (rod) {
+      for (const j of scene.jetties) {
+        if (j.siteId === bot.site) {
+          deck = j.depth;
+          break;
+        }
+      }
+    }
     items.push({
-      depth: y + 1,
-      bx: px - 7,
-      by: py - 20,
-      bw: 15,
-      bh: 22,
+      depth: deck || y + 1,
+      bx: px - (rod && !faceRight ? 20 : 7),
+      by: py - (rod ? 32 : 20),
+      bw: rod ? 28 : 15,
+      bh: rod ? 34 : 22,
       draw: (c) => {
         drawBot(c, px, py, color, faceRight, action, phase);
         if (action === 'work' && Math.sin(phase * 11) > 0.85) {
@@ -5255,9 +5445,17 @@ function stepFish(scene: GenesisScene, wl: Wildlife, dt: number, sky: Sky): void
       // A handful an hour, and none of them in the dark.
       wl.fishT = 14 + wl.rng() * 22;
       if (sky.night < 0.55 && wl.fish.length < 2) {
-        const at = alongPolyline(river, geo, wl.rng() * geo.len);
+        // ADDITIVE — boats and jetties. Every third rise or so happens off the
+        // end of a pier instead of somewhere anonymous upstream, which is where
+        // anybody watching is already looking. Same jump, same ring, same
+        // budget: only the spot it is drawn from changes.
+        const piers = scene.jetties;
+        const pier = piers.length && wl.rng() < 0.34 ? piers[Math.floor(wl.rng() * piers.length)] : null;
+        const at: Vec2 = pier
+          ? [pier.gx, pier.gy]
+          : alongPolyline(river, geo, wl.rng() * geo.len);
         wl.fish.push({
-          x: isoX(at[0], at[1]) + (wl.rng() - 0.5) * 8,
+          x: isoX(at[0], at[1]) + (wl.rng() - 0.5) * (pier ? 22 : 8),
           y: isoY(at[0], at[1]),
           base: isoY(at[0], at[1]),
           vx: (wl.rng() - 0.5) * 22,
