@@ -3605,9 +3605,21 @@ export function buildFox(pose: 0 | 1, faceRight: boolean): Sprite {
  * three pixels across instead of seven — a flying frame parked on a roof ridge
  * reads as a bird stuck mid-flap, which is the one thing a perch must not do.
  */
-export function buildPerchedBird(faceRight: boolean): Sprite {
+export function buildPerchedBird(faceRight: boolean, hunkered = false): Sprite {
   return makeSprite(10, 10, 5, 6, (ctx) => {
     if (!faceRight) ctx.scale(-1, 1);
+    if (hunkered) {
+      // ADDITIVE. A bird sitting out weather it does not understand: fluffed a
+      // pixel wider, head down into the shoulders, tail dropped and the feet
+      // gone under it altogether. Same footprint, same six-pixel origin, so it
+      // sits on exactly the ridge line the standing one does.
+      rect(ctx, -2, -3, 4, 3, FUR.bird); // body, hunched over its own feet
+      rect(ctx, -2, -3, 3, 2, FUR.birdWing); // folded wing, drawn over more of it
+      rect(ctx, 1, -4, 2, 2, FUR.bird); // head, no neck showing
+      rect(ctx, 3, -3, 1, 1, FUR.birdWing); // beak, tucked and level
+      rect(ctx, -3, -2, 1, 1, FUR.bird); // tail, short and down
+      return;
+    }
     rect(ctx, -1, -3, 3, 3, FUR.bird); // body
     rect(ctx, -1, -3, 2, 2, FUR.birdWing); // folded wing
     rect(ctx, 1, -5, 2, 2, FUR.bird); // head
