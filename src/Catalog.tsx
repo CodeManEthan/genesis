@@ -742,14 +742,19 @@ const COVERAGE: { head: string; body: string }[] = [
       'seasonCanvas runs over the six DECIDUOUS pools and the ground tint. crop, haystack, reeds and flowers are summer art in every month, so a winter valley still has a green cornfield in it.',
   },
   {
-    head: 'Trees have two states and a nudge',
+    head: 'A tree still falls in one nudge',
     body:
-      'standing / stump, with felling drawn as the standing sprite shoved ±2px. No half-fallen trunk, no felled log on the ground, no sapling.',
+      'The ladder now runs standing → felling → stump → stump with its log → stump, and three to five saplings come up on cleared ground in the evening. The fall itself is still the standing sprite shoved ±2px: there is no half-fallen trunk, no lean, and nothing between “upright” and “gone”.',
   },
   {
-    head: 'Props are one sprite each',
+    head: 'Crops ripen; nothing else does',
     body:
-      'crop never ripens, haystack never shrinks, crates never stack higher as a town grows. Progress is expressed by buildings alone.',
+      'crop is three sprites now and moves through them on the clock. haystack, crates, barrels and cart are still one sprite for the whole day — a haystack never grows as it is built up, and a store’s crates never stack higher as the town around them does. Everything except the fields still expresses progress through buildings alone.',
+  },
+  {
+    head: 'The log is hauled by nobody',
+    body:
+      'A felled trunk lies for 90 world-minutes and then stops existing. No carrier walks out to it, no cart takes it, and the lumber pile in the yard does not grow by one when it goes — the two halves of the valley’s timber economy are drawn, and never joined up.',
   },
 ];
 
@@ -918,6 +923,40 @@ export default function Catalog() {
 
   const props = useMemo(() => poolItems(PROP_POOLS, 'pp'), [pools]);
   const treasure = useMemo(() => poolItems(TREASURE_POOLS, 'tz'), [pools]);
+
+  /* ---- living details (additive) ---------------------------------------- */
+
+  /** One field at three ages. Pool index is shared, so a plot keeps its
+   * colour and its earth as it ripens; two of the four seeds shown. */
+  const cropStages = useMemo(() => {
+    const out: Item[] = [];
+    const stages: [string, string][] = [
+      ['crop-sprout', 'sprout · before 10:00'],
+      ['crop', 'rows · 10:00–16:00'],
+      ['crop-tall', 'tall · after 16:00'],
+    ];
+    for (let v = 0; v < 2; v++) {
+      for (const [kind, sub] of stages) {
+        const p = pools[kind] ?? [];
+        if (p[v]) out.push(item(`cs-${v}-${kind}`, kind, spriteCanvas(p[v]), { sub }));
+      }
+    }
+    return out;
+  }, [pools]);
+
+  /** What a felling leaves on the ground, and what comes up after it. */
+  const treeAfter = useMemo(() => {
+    const out: Item[] = [];
+    (pools.log ?? []).forEach((sp, i) =>
+      out.push(item(`lg-${i}`, 'log', spriteCanvas(sp), { sub: TREE_KINDS[i] ?? `kind ${i}` }))
+    );
+    (pools.sapling ?? []).forEach((sp, i) =>
+      out.push(item(`sa-${i}`, 'sapling', spriteCanvas(sp), { sub: `seed ${i + 1}` }))
+    );
+    return out;
+  }, [pools]);
+
+  /* ---- end living details (additive) ------------------------------------ */
 
   const extras = useMemo(() => {
     const out: Item[] = [];
@@ -1286,8 +1325,8 @@ export default function Catalog() {
 
   const counts = {
     structures: structures.length + materials.length + stages.length + roofs.length,
-    trees: trees.length + treeStates.length,
-    props: props.length + treasure.length + extras.length,
+    trees: trees.length + treeStates.length + treeAfter.length,
+    props: props.length + treasure.length + extras.length + cropStages.length,
     inhabitants: anims.length,
     wildlife: wildlife.length,
     infra: bridges.length + roads.length + grounds.length,
@@ -1349,7 +1388,7 @@ export default function Catalog() {
           id="trees"
           title="Trees"
           count={counts.trees}
-          blurb="buildTree(kind, seed) — seven kinds, four seeds each, plus the two states a tree can be caught in."
+          blurb="buildTree(kind, seed) — seven kinds, four seeds each, the states a tree can be caught in, and what its felling leaves behind."
         >
           <Row title={`Kinds (${TREE_KINDS.length})`} items={trees} />
           <Row
@@ -1357,15 +1396,29 @@ export default function Catalog() {
             note="A tree under the axe is the standing sprite offset ±2px; once felled it is replaced by a stump."
             items={treeStates}
           />
+          {/* ---- living details (additive) ---- */}
+          <Row
+            title={`After the axe (${treeAfter.length})`}
+            note="The trunk lies beside its stump for 90 world-minutes and is then hauled off to the yards — one log per tree kind, because the bark is all that tells them apart at this size. Three to five saplings come up on the day's cleared ground after 18:00, each beside a stump the day actually made."
+            items={treeAfter}
+          />
+          {/* ---- end living details (additive) ---- */}
         </Section>
 
         <Section
           id="props"
           title="Props & scatter"
           count={counts.props}
-          blurb="Every pooled kind from makePools(), all pool variants, plus the four built on demand by propSprite(). “unused” means gen.ts never emits it."
+          blurb="Every pooled kind from makePools(), all pool variants, plus the four built on demand by propSprite(). “unused” means gen.ts never emits it. The log and sapling pools are shelved with the trees, whose felling is the only thing that asks for them."
         >
           <Row title={`Pools (${PROP_POOLS.length} kinds)`} items={props} />
+          {/* ---- living details (additive) ---- */}
+          <Row
+            title="Crop stages (3)"
+            note="The one prop that is not a single sprite. A plot is sprouts before ~10:00, the rows that have always been here until ~16:00, and tall gold after — the stage is a pure function of the clock and a ±40-minute jitter off the plot's own seed, so a valley's fields do not all turn on the same stroke. All three stages share a pool index, so a field keeps its colour and its earth as it ripens."
+            items={cropStages}
+          />
+          {/* ---- end living details (additive) ---- */}
           <Row
             title={`Treasure (${TREASURE_POOLS.length} states)`}
             note="Pooled, but never a PropSpec: chests are their own list on the map. The timeline walks a found chest along all three — mound, prised open, emptied."

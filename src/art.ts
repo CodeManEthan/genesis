@@ -3944,3 +3944,160 @@ export function giltStructure(sp: Sprite, spec: StructureSpec): void {
 }
 
 /* ---- end the prospector (additive) --------------------------------------- */
+
+/* ======================= living details (additive) ======================== *
+ * Props that used to be one sprite for the whole day, given the frames they
+ * need to move through it: a crop plot before and after the one that already
+ * existed, the trunk a felled tree leaves lying beside its stump, and the
+ * sapling that comes up on the cleared ground in the evening.
+ *
+ * ADDITIVE. Nothing above this line changed — in particular `buildCropRow` is
+ * still exactly the sprite it was, and is still the MIDDLE of the three crop
+ * stages, so every existing pool index, anchor and depth stays put.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The tilled plot the three crop stages share.
+ *
+ * Lifted verbatim out of `buildCropRow` rather than refactored into it: the
+ * middle stage is load-bearing art that other work is merging around, and the
+ * cheapest way to guarantee the three stages sit on pixel-identical earth is to
+ * paint the earth from one place and leave the original alone.
+ */
+function cropPlot(ctx: Ctx): void {
+  poly(ctx, diamond(0, 1, 66), PAL.tillDark);
+  poly(ctx, diamond(0, 0, 60), PAL.till);
+  poly(ctx, diamond(0, -1, 52), shade(PAL.till, 0.14));
+}
+
+/** The 4x7 lattice `buildCropRow` plants on, as screen offsets. */
+function cropRows(f: (x: number, y: number, r: number, i: number) => void): void {
+  for (let r = 0; r < 4; r++) {
+    const gy = -0.62 + r * 0.41;
+    for (let i = 0; i < 7; i++) {
+      const gx = -0.78 + i * 0.26;
+      f(Math.round((gx - gy) * 16), Math.round((gx + gy) * 8), r, i);
+    }
+  }
+}
+
+/**
+ * Crop stage 0 — just up. The same seed picks the same base colour off
+ * `PAL.crop` as `buildCropRow` does, so a field keeps its identity as it
+ * ripens; the young growth is that colour pulled towards new green.
+ */
+export function buildCropSprout(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const base = PAL.crop[Math.floor(rng() * PAL.crop.length)];
+  const crop = shade(mix(base, '#8fcf6a', 0.6), 0.12);
+  return makeSprite(76, 48, 38, 36, (ctx) => {
+    cropPlot(ctx);
+    // The drills are still the loudest thing in the plot at this stage.
+    cropRows((x, y, r) => {
+      if (r % 2 === 0) rect(ctx, x - 1, y, 3, 1, shade(PAL.till, -0.1));
+    });
+    cropRows((x, y) => {
+      rect(ctx, x, y - 1, 1, 1, crop);
+      rect(ctx, x, y - 2, 1, 1, shade(crop, 0.2));
+    });
+  });
+}
+
+/**
+ * Crop stage 2 — tall and gold, a week off the sickle. Same lattice, but the
+ * stalks carry an ear, lean a pixel with the row, and put a dark side down
+ * their length, so the plot reads as standing corn rather than paint.
+ */
+export function buildCropTall(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const base = PAL.crop[Math.floor(rng() * PAL.crop.length)];
+  const crop = mix(base, '#d9c05e', 0.8);
+  const ear = shade(mix(crop, '#f0e0a0', 0.5), 0.06);
+  const dark = shade(crop, -0.26);
+  return makeSprite(76, 48, 38, 36, (ctx) => {
+    cropPlot(ctx);
+    cropRows((x, y, r, i) => {
+      const h = 8 + ((i + r) % 3);
+      const lean = (i + r) % 2 ? 1 : 0;
+      rect(ctx, x, y - h, 1, h, crop);
+      rect(ctx, x - 1, y - h + 2, 1, h - 3, dark);
+      rect(ctx, x + lean, y - h - 3, 1, 3, crop);
+      rect(ctx, x + lean - 1, y - h - 4, 3, 2, ear);
+      rect(ctx, x + lean, y - h - 5, 1, 1, ear);
+    });
+  });
+}
+
+/** Bark for a felled trunk, by `buildTree` kind index. */
+const LOG_BARK: [string, string][] = [
+  [PAL.wood, PAL.woodDark], // 0 oak
+  [shade(PAL.wood, -0.14), shade(PAL.woodDark, -0.1)], // 1 pine
+  [PAL.woodLight, PAL.wood], // 2 blossom
+  [PAL.woodDark, shade(PAL.woodDark, -0.22)], // 3 hedgerow
+  ['#efe9dc', '#cbc2b0'], // 4 birch — the chalk trunk, lying down
+  [PAL.wood, PAL.woodDark], // 5 willow
+  [shade(PAL.woodDark, -0.12), shade(PAL.woodDark, -0.34)], // 6 fir
+];
+
+/**
+ * The trunk a felled tree leaves on the ground: a barked cylinder lying along
+ * the screen's 2:1 slope with its cut end towards the camera, so the pale
+ * end-grain is what catches the eye from across the valley. One sprite per tree
+ * kind — the bark is the only thing that tells an oak log from a fir one at
+ * this size.
+ */
+export function buildLog(kind: 0 | 1 | 2 | 3 | 4 | 5 | 6, seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const [bark, barkDark] = LOG_BARK[kind] ?? LOG_BARK[0];
+  const len = 22 + Math.floor(rng() * 6);
+  const grain = kind === 4 ? '#f6f1e6' : PAL.woodLight;
+  return makeSprite(len + 14, 20, (len + 14) / 2, 13, (ctx) => {
+    // Two runs of pixels stepping one down for every two across — the same
+    // slope every other lying thing in the valley is drawn on.
+    const x0 = -len / 2;
+    // The shadow follows the trunk rather than pooling under it: a lying thing
+    // this long under one diamond reads as a ramp, not a log.
+    for (let i = -1; i <= len; i++) {
+      rect(ctx, Math.round(x0 + i) + 1, -6 + Math.round(i / 2) + 6, 1, 2, PAL.shadow);
+    }
+    for (let i = 0; i < len; i++) {
+      const x = Math.round(x0 + i);
+      const y = -6 + Math.round(i / 2);
+      rect(ctx, x, y, 1, 5, bark);
+      rect(ctx, x, y + 4, 1, 2, barkDark);
+      if (kind === 4 && i % 5 === 2) rect(ctx, x, y + 1, 1, 2, PAL.ink);
+      else if (i % 7 === 3) rect(ctx, x, y + 1, 1, 1, shade(bark, -0.18));
+    }
+    // The cut end, towards the camera.
+    const ex = Math.round(x0 - 1);
+    rect(ctx, ex - 2, -5, 3, 6, grain);
+    rect(ctx, ex - 1, -4, 1, 4, shade(grain, -0.16));
+    // …and the ragged far end, where the crown was taken off.
+    const fx = Math.round(x0 + len);
+    rect(ctx, fx, -6 + Math.round(len / 2), 2, 3, barkDark);
+    if (rng() < 0.5) rect(ctx, ex - 4, 0, 3, 1, PAL.moss);
+  });
+}
+
+/**
+ * A sapling: two leaves and a stem, small enough that it reads as a promise
+ * rather than a tree. Deliberately about a sixth the height of the stump it
+ * comes up beside — the valley outliving the day only works if it is obvious
+ * this one is not going to be shade for years.
+ */
+export function buildSapling(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const leaf = shade(PAL.leaf[Math.floor(rng() * PAL.leaf.length)], 0.22);
+  const tall = rng() < 0.5 ? 1 : 0;
+  return makeSprite(16, 20, 8, 14, (ctx) => {
+    poly(ctx, diamond(1, 1, 9), PAL.shadowSoft);
+    rect(ctx, 0, -7 - tall, 1, 7 + tall, shade(leaf, -0.36));
+    // Two seed leaves, one a little above the other, so it is a sprout at a
+    // glance and not a blade of grass.
+    blob(ctx, -3, -10 - tall, [3, 5, 4, 2], leaf);
+    blob(ctx, 4, -12 - tall, [2, 4, 5, 3], shade(leaf, -0.16));
+    rect(ctx, 0, -11 - tall, 1, 2, shade(leaf, 0.3));
+  });
+}
+
+/* ===================== end living details (additive) ===================== */

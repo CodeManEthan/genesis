@@ -610,6 +610,9 @@ export function fixtureEmptySnapshot(map: GenesisMap): WorldSnapshot {
   return {
     t: 0,
     trees: new Map(),
+    /* ---- living details (additive) ---- */
+    felled: new Map(),
+    /* ---- end living details (additive) ---- */
     buildings,
     roads: new Map(),
     bridges: new Map(),
@@ -657,6 +660,9 @@ function applyEvent(snap: WorldSnapshot, ev: GenesisEvent): void {
       break;
     case 'chop-done':
       snap.trees.set(ev.treeId, 'stump');
+      /* ---- living details (additive) ---- */
+      snap.felled.set(ev.treeId, ev.t);
+      /* ---- end living details (additive) ---- */
       break;
     case 'survey':
       snap.buildings.set(ev.buildingId, { status: 'surveyed', progress: 0.05 });

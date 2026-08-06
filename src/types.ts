@@ -550,6 +550,21 @@ export interface WorldSnapshot {
   t: number;
   /** every tree id -> state (missing = standing) */
   trees: Map<string, TreeState>;
+  /* ---- living details (additive) ------------------------------------- *
+   * WHEN each tree went over, not just that it did. `trees` already says a
+   * tree is a stump; nothing said how long it had been one, so anything the
+   * felling leaves behind — the log lying beside the stump, waiting to be
+   * hauled — had no honest clock to run on. Scene-side that could only be
+   * approximated as "the frame I noticed the slot flip", which is a different
+   * world after a scrub to an arbitrary t; recorded here it is a pure
+   * function of (seed, t) like everything else.
+   *
+   * Written by the existing `chop-done` event — no new event type, so
+   * TYPE_RANK is untouched — and, like `trees`, it only ever grows forward.
+   * ------------------------------------------------------------------- */
+  /** tree id -> the t of its `chop-done` (missing = still standing/felling) */
+  felled: Map<string, number>;
+  /* ---- end living details (additive) --------------------------------- */
   buildings: Map<string, { status: BuildingStatus; progress: number }>;
   roads: Map<string, number>; // id -> built frac (missing = 0)
   bridges: Map<string, 0 | 1 | 2 | 3>;

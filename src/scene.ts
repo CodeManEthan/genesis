@@ -61,6 +61,12 @@ import {
   /* ---- stone past the walls (additive) ---- */
   buildDrystone,
   /* ---- end stone past the walls (additive) ---- */
+  /* ---- living details (additive) ---- */
+  buildCropSprout,
+  buildCropTall,
+  buildLog,
+  buildSapling,
+  /* ---- end living details (additive) ---- */
   buildFence,
   buildFlowerPatch,
   buildForestPattern,
@@ -273,6 +279,24 @@ export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
     'chest-closed': pool(2, (i) => buildChest(false, 223 + i * 17)),
     'chest-open': pool(2, (i) => buildChest(true, 227 + i * 19)),
     'quarry-blocks': pool(3, (i) => buildQuarryBlocks(139 + i * 21)),
+    /* ---- living details (additive) -------------------------------------- *
+     * A crop is three sprites now, not one. `crop` above is still the middle
+     * of them and still built from exactly the seeds it always was; these two
+     * are built from the SAME seeds in the SAME order, so pool index `i` is
+     * the same field at three ages — which is what lets `syncVeg` swap one
+     * for another without the plot changing colour or moving.
+     * --------------------------------------------------------------------- */
+    'crop-sprout': pool(4, (i) => buildCropSprout(73 + i * 7)),
+    'crop-tall': pool(4, (i) => buildCropTall(73 + i * 7)),
+    /**
+     * The trunk a felled tree leaves behind, for the hour and a half before
+     * the yards haul it. Indexed by TREE KIND, not by seed — the pool is one
+     * entry per `buildTree` kind, in `TREE_LOG` order below.
+     */
+    log: pool(7, (i) => buildLog(i as 0 | 1 | 2 | 3 | 4 | 5 | 6, 149 + i * 13)),
+    /** Regrowth on the evening's cleared ground. */
+    sapling: pool(4, (i) => buildSapling(157 + i * 11)),
+    /* ---- end living details (additive) ---------------------------------- */
   };
   if (season !== 'summer') {
     for (const k of DECIDUOUS) for (const sp of pools[k]) seasonCanvas(sp.c, season);
@@ -300,6 +324,63 @@ const TREE_POOL: Record<string, string> = {
   willow: 'willow',
   fir: 'fir',
 };
+
+/* ---- living details (additive) ------------------------------------------ */
+
+/** Tree kind -> index into the `log` pool, i.e. the `buildTree` kind index. */
+const TREE_LOG: Record<string, number> = {
+  oak: 0,
+  pine: 1,
+  blossom: 2,
+  hedgerow: 3,
+  birch: 4,
+  willow: 5,
+  fir: 6,
+};
+
+/**
+ * The whole of the ripening clock.
+ *
+ * A crop plot is `sprout` before ~10:00, `rows` (the sprite that has always
+ * been there) until ~16:00, and `tall` after. The jitter is ±40 world-minutes
+ * off the plot's own seed, so a valley's fields do not all turn on the same
+ * stroke — which is the difference between weather and a light switch.
+ *
+ * Pure in (t, seed) and nothing else: no memory, no "since last frame". Scrub
+ * to 13:00 from either direction and the same plots are at the same stage.
+ */
+const CROP_ROWS_AT = 10;
+const CROP_TALL_AT = 16;
+/** ±40 minutes. */
+const CROP_JITTER = 40 / 60;
+
+function cropJitter(seed: number): number {
+  return (mulberry32((seed ^ 0x0c7a9f31) >>> 0)() * 2 - 1) * CROP_JITTER;
+}
+
+function cropStage(t: number, jitter: number): 0 | 1 | 2 {
+  const tt = t - jitter;
+  return tt < CROP_ROWS_AT ? 0 : tt < CROP_TALL_AT ? 1 : 2;
+}
+
+/**
+ * How long a felled trunk lies beside its stump before the yards haul it —
+ * ninety world-minutes, measured from the `chop-done` the snapshot now
+ * records. Not from "the frame the renderer noticed", which is the same thing
+ * only while nobody touches the scrubber.
+ */
+const LOG_LIFE = 1.5;
+
+/** Is `id`'s trunk still on the ground at `snap.t`? */
+function logLive(snap: WorldSnapshot, id: string): boolean {
+  const ft = snap.felled?.get(id);
+  return ft !== undefined && snap.t >= ft && snap.t - ft < LOG_LIFE;
+}
+
+/** The earliest a sapling breaks ground; each one jitters up from here. */
+const SAPLING_FROM = 18;
+
+/* ---- end living details (additive) -------------------------------------- */
 
 /* --------------------------------- types --------------------------------- */
 
@@ -491,7 +572,55 @@ export interface VegLayer {
   stalls: number[];
   /** Are the stalls currently painted into the layer? */
   stallOn: boolean;
+  /* ---- living details (additive) -------------------------------------- *
+   * Three additions, all of them slot lists allocated at bake time like
+   * everything else here, and all of them reconciled STATELESSLY: the desired
+   * on/off is recomputed from (snapshot, t) every sync and compared against
+   * `on`, so there is no cached "current stage" to get out of step with a
+   * scrub in either direction. See `syncVeg` for the contract note.
+   * --------------------------------------------------------------------- */
+  /** Ripening crop plots: three stage slots each, at most one ever painted. */
+  crops: CropPlot[];
+  /**
+   * The felled trunk that lies beside a stump, as an item slot per map tree —
+   * `-1` for the great majority of trees, which the map never promises to
+   * anybody's axe and which therefore can never have a log.
+   */
+  logs: Int32Array;
+  /**
+   * Tree indexes whose trunk is on the ground right now. A log turns ON only
+   * where a stump turns on (both tree paths below), but it turns OFF on the
+   * clock alone, which no fingerprint can see — so this short list is swept
+   * every sync. It is short by construction: ninety minutes of felling.
+   */
+  logOn: number[];
+  /** Evening regrowth over the day's cleared ground. */
+  saplings: Sapling[];
+  /* ---- end living details (additive) ----------------------------------- */
 }
+
+/* ---- living details (additive) ------------------------------------------ */
+
+/** One crop plot, with an item slot for each of its three ages. */
+interface CropPlot {
+  /** sprout / rows / tall, in stage order. */
+  slot: [number, number, number];
+  /** Site-dressing prop id; `null` for a plot that exists from t=0. */
+  propId: string | null;
+  /** ±40 world-minutes off the plot's own seed. */
+  jitter: number;
+}
+
+/** One sapling, and the felling that earned it. */
+interface Sapling {
+  slot: number;
+  /** It only comes up once this tree is actually a stump. */
+  treeId: string;
+  /** The minute it breaks ground. */
+  t: number;
+}
+
+/* ---- end living details (additive) -------------------------------------- */
 
 /**
  * The finished road network, painted once.
@@ -1380,8 +1509,26 @@ function* buildVeg(
     return items.length - 1;
   };
 
+  /* ---- living details (additive) -------------------------------------- *
+   * The trees the map has already promised to somebody's axe: a plot's
+   * `clears` and a road's. `timeline.ts` emits chop events from exactly those
+   * two lists and from nowhere else, so this is the complete set of trees that
+   * can ever become a stump — which is the only set that needs a felled-log
+   * slot, and the only set a sapling may anchor to. Everything else in a
+   * valley of two thousand trees stays a two-slot tree and costs nothing.
+   * --------------------------------------------------------------------- */
+  const doomed = new Set<string>();
+  for (const s of scene.map.sites) {
+    for (const b of s.buildings) for (const id of b.clears) doomed.add(id);
+  }
+  for (const r of scene.map.roads) for (const c of r.clears ?? []) doomed.add(c.tree);
+  /* ---- end living details (additive) ----------------------------------- */
+
   const trees = scene.map.trees;
   const slots = new Int32Array(trees.length * 2);
+  /* ---- living details (additive) ---- */
+  const logs = new Int32Array(trees.length).fill(-1);
+  /* ---- end living details (additive) ---- */
   const on: boolean[] = [];
   for (let k = 0; k < trees.length; k++) {
     const tr = trees[k];
@@ -1391,8 +1538,53 @@ function* buildVeg(
     const st = scene.pools.stump;
     slots[k * 2 + 1] = add(st[Math.abs(tr.seed) % st.length], tr.gx, tr.gy, R_STUMP, k);
     on.push(false);
+    /* ---- living details (additive) ---- */
+    // The trunk, a stride or so off the stump on the tree's own bearing. Same
+    // rank as the stump, so it sorts against everything else by depth alone.
+    if (doomed.has(tr.id)) {
+      const lr = mulberry32((tr.seed ^ 0x10c17e5d) >>> 0);
+      const a = lr() * Math.PI * 2;
+      const d = 0.85 + lr() * 0.5;
+      const lp = scene.pools.log;
+      logs[k] = add(
+        lp[TREE_LOG[tr.kind] ?? 0],
+        tr.gx + Math.cos(a) * d,
+        tr.gy + Math.sin(a) * d,
+        R_STUMP,
+        k
+      );
+      on.push(false);
+    }
+    /* ---- end living details (additive) ---- */
   }
+  /* ---- living details (additive) ---- */
+  // Crop plots are three slots, not one — see `addCrop` below.
+  const crops: CropPlot[] = [];
+  const addCrop = (
+    gx: number,
+    gy: number,
+    seed: number,
+    propId: string | null,
+    ord: number
+  ): void => {
+    const idx = Math.abs(seed) % scene.pools.crop.length;
+    const slot: [number, number, number] = [
+      add(scene.pools['crop-sprout'][idx], gx, gy, R_PROP, ord),
+      add(scene.pools.crop[idx], gx, gy, R_PROP, ord),
+      add(scene.pools['crop-tall'][idx], gx, gy, R_PROP, ord),
+    ];
+    on.push(false, false, false);
+    crops.push({ slot, propId, jitter: cropJitter(seed) });
+  };
+  /* ---- end living details (additive) ---- */
   for (const p of scene.map.scatter) {
+    /* ---- living details (additive) ---- */
+    // A wild crop plot ripens like a farmed one, and exists from t=0.
+    if (p.kind === 'crop') {
+      addCrop(p.gx, p.gy, p.seed, null, trees.length + on.length);
+      continue;
+    }
+    /* ---- end living details (additive) ---- */
     const sp = propSprite(scene, p.kind, p.seed, '#63c9a8');
     if (sp) {
       add(sp, p.gx, p.gy, R_WOOD, trees.length + on.length);
@@ -1407,6 +1599,18 @@ function* buildVeg(
   let pi = 0;
   for (const site of scene.map.sites) {
     for (const p of site.props) {
+      /* ---- living details (additive) ---- */
+      // A crop plot takes three slots and leaves `props[pi]` at -1, so the
+      // generic prop reconcile below never touches it: `syncVeg` drives the
+      // whole plot — appearance AND ripeness — through `veg.crops` instead.
+      // `pi` still advances exactly once per PropSpec, so the `ord` sequence
+      // the MARKET block continues with `pi++` is unchanged.
+      if (p.kind === 'crop') {
+        addCrop(p.gx, p.gy, p.seed, p.id, pi);
+        pi++;
+        continue;
+      }
+      /* ---- end living details (additive) ---- */
       const sp = propSprite(scene, p.kind, p.seed, site.accent, p.dir, p.len);
       if (sp) {
         props[pi] = add(sp, p.gx, p.gy, R_PROP, pi);
@@ -1457,6 +1661,61 @@ function* buildVeg(
     on.push(true);
   }
   /* ---- end standing stones (additive) ------------------------------------ */
+  /* ---- living details (additive): saplings -------------------------------
+   * Three to five of them, on the ground the day's axes cleared. Anchored to
+   * trees the map has promised to a plot or a road — the only trees that can
+   * end the day as stumps — and each one still gated at sync time on its
+   * anchor ACTUALLY being a stump, so a pace that never got round to that
+   * corner of the valley does not sprout regrowth on standing wood.
+   *
+   * MERGE NOTE: this block is after the market stalls, so it indexes with
+   * `on.length`, never with `pi++`.
+   * ---------------------------------------------------------------------- */
+  const saplings: Sapling[] = [];
+  {
+    // Anchors are ROAD clears standing clear of every town: the trees that came
+    // down to let a lane through the wood, and not the ones that came down
+    // because a house is going where they stood. A sapling on a plot would be
+    // under a roof by dusk, which is a different picture entirely — regrowth
+    // belongs on the ground nobody took.
+    const roadCut = new Set<string>();
+    for (const r of scene.map.roads) for (const c of r.clears ?? []) roadCut.add(c.tree);
+    const clearOfTowns = (t: { gx: number; gy: number }) => {
+      for (const s of scene.map.sites) {
+        if (Math.hypot(s.gx - t.gx, s.gy - t.gy) < s.radius + 2) return false;
+      }
+      return true;
+    };
+    let anchors = trees.filter((t) => roadCut.has(t.id) && clearOfTowns(t));
+    // A one-town valley on a short day may have no lane through the wood at
+    // all; rather than drop the gesture, fall back to any felling there is.
+    if (!anchors.length) anchors = trees.filter((t) => doomed.has(t.id));
+    if (anchors.length) {
+      const rr = mulberry32((scene.map.seed ^ 0x5ab1149) >>> 0);
+      const want = Math.min(anchors.length, 3 + Math.floor(rr() * 3));
+      const picked = new Set<number>();
+      for (let guard = 0; guard < 64 && picked.size < want; guard++) {
+        picked.add(Math.floor(rr() * anchors.length));
+      }
+      for (const i of [...picked].sort((a, b) => a - b)) {
+        const tr = anchors[i];
+        const sr = mulberry32((tr.seed ^ 0x5a91117b) >>> 0);
+        const a = sr() * Math.PI * 2;
+        const d = 1 + sr() * 0.8;
+        const sp = scene.pools.sapling;
+        const slot = add(
+          sp[Math.abs(tr.seed) % sp.length],
+          tr.gx + Math.cos(a) * d,
+          tr.gy + Math.sin(a) * d,
+          R_PROP,
+          on.length
+        );
+        on.push(false);
+        saplings.push({ slot, treeId: tr.id, t: SAPLING_FROM + sr() * 0.9 });
+      }
+    }
+  }
+  /* ---- end living details (additive): saplings ---------------------------- */
 
   yield;
   // Sorted by depth, then by the rank the old per-frame pass implied, then by
@@ -1479,6 +1738,15 @@ function* buildVeg(
   for (let i = 0; i < slots.length; i++) slots[i] = pos[slots[i]];
   for (let i = 0; i < props.length; i++) if (props[i] >= 0) props[i] = pos[props[i]];
   for (let i = 0; i < stalls.length; i++) stalls[i] = pos[stalls[i]];
+  /* ---- living details (additive) ---- */
+  for (const cp of crops) {
+    cp.slot[0] = pos[cp.slot[0]];
+    cp.slot[1] = pos[cp.slot[1]];
+    cp.slot[2] = pos[cp.slot[2]];
+  }
+  for (let i = 0; i < logs.length; i++) if (logs[i] >= 0) logs[i] = pos[logs[i]];
+  for (const sp of saplings) sp.slot = pos[sp.slot];
+  /* ---- end living details (additive) ---- */
 
   yield;
   const grid = new Map<number, number[]>();
@@ -1510,6 +1778,12 @@ function* buildVeg(
     propSize: -1,
     stalls,
     stallOn: false,
+    /* ---- living details (additive) ---- */
+    crops,
+    logs,
+    logOn: [],
+    saplings,
+    /* ---- end living details (additive) ---- */
   };
   yield;
   bakeVeg(scene, veg);
@@ -1580,6 +1854,26 @@ export function invalidateVeg(scene: GenesisScene): void {
  * renderer wants anyway. Site dressing only ever appears, so `snap.props.size`
  * is a complete fingerprint of the whole set. Both are exact forwards; a
  * backwards scrub comes through `invalidateVeg` above and rescans everything.
+ *
+ * LIVING DETAILS — what the two fingerprints do NOT cover, and how each one is
+ * caught instead. The contract they encode is "nothing changes unless the
+ * snapshot grew", and three things here change on the CLOCK with the snapshot
+ * standing still, so each of them carries its own sweep:
+ *
+ *   crop ripeness   every plot, every sync, three `want`s each. A valley has a
+ *                   dozen or two plots, so this is cheaper than any fingerprint
+ *                   would be, and it is exact in both scrub directions because
+ *                   it caches nothing at all.
+ *   felled logs     ON only where a stump turns on, so both tree paths above
+ *                   pick it up and the tree fingerprint still covers it. OFF is
+ *                   pure clock, so `veg.logOn` — the trunks currently on the
+ *                   ground, ninety minutes' worth — is swept every sync.
+ *   saplings        three to five of them; recomputed outright every sync.
+ *
+ * None of the three keeps a "current state" of its own: every one of them
+ * recomputes what it wants from (snapshot, t) and lets `want` compare that
+ * against `veg.on`, which is the layer's only truth. That is what makes a
+ * backward scrub need nothing beyond what `invalidateVeg` already does.
  */
 export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
   const veg = scene.veg;
@@ -1594,13 +1888,26 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
     veg.size = snap.trees.size;
     const trees = scene.map.trees;
     const felling: number[] = [];
+    /* ---- living details (additive) ---- */
+    const logOn: number[] = [];
+    /* ---- end living details (additive) ---- */
     for (let k = 0; k < trees.length; k++) {
       const st = snap.trees.get(trees[k].id);
       if (st === 'felling') felling.push(k);
       want(veg.slots[k * 2], st === undefined || st === 'standing');
       want(veg.slots[k * 2 + 1], st === 'stump');
+      /* ---- living details (additive) ---- */
+      if (veg.logs[k] >= 0) {
+        const lg = st === 'stump' && logLive(snap, trees[k].id);
+        want(veg.logs[k], lg);
+        if (lg) logOn.push(k);
+      }
+      /* ---- end living details (additive) ---- */
     }
     veg.felling = felling;
+    /* ---- living details (additive) ---- */
+    veg.logOn = logOn;
+    /* ---- end living details (additive) ---- */
   } else if (veg.felling.length) {
     const trees = scene.map.trees;
     const felling: number[] = [];
@@ -1612,9 +1919,35 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
       }
       want(veg.slots[k * 2], st === undefined || st === 'standing');
       want(veg.slots[k * 2 + 1], st === 'stump');
+      /* ---- living details (additive) ---- */
+      // The axe just came down: the trunk goes on the ground, and joins the
+      // sweep below that will take it away again in ninety minutes. A tree
+      // leaves `felling` exactly once, so this cannot double-list it.
+      if (veg.logs[k] >= 0 && st === 'stump' && logLive(snap, trees[k].id)) {
+        want(veg.logs[k], true);
+        veg.logOn.push(k);
+      }
+      /* ---- end living details (additive) ---- */
     }
     veg.felling = felling;
   }
+
+  /* ---- living details (additive): the hauling ----------------------------
+   * The one transition in the layer that no fingerprint can see, because
+   * nothing in the snapshot moves when it happens: the day simply gets ninety
+   * minutes older and the yards take the timber. Swept off a list that is
+   * empty for most of the day and a dozen long at its busiest.
+   * ---------------------------------------------------------------------- */
+  if (veg.logOn.length) {
+    const trees = scene.map.trees;
+    const keep: number[] = [];
+    for (const k of veg.logOn) {
+      if (logLive(snap, trees[k].id)) keep.push(k);
+      else want(veg.logs[k], false);
+    }
+    veg.logOn = keep;
+  }
+  /* ---- end living details (additive) ------------------------------------- */
 
   if (veg.propSize !== snap.props.size) {
     veg.propSize = snap.props.size;
@@ -1634,6 +1967,26 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
       for (const i of veg.stalls) want(i, open);
     }
   }
+
+  /* ---- living details (additive): the fields and the regrowth ------------
+   * Both stateless. A crop plot names its own stage from (t, its jitter); the
+   * three `want`s then say which of its three slots is the painted one, so
+   * arriving at 13:00 from 08:00 and from 19:00 puts the same pixels down.
+   * A plot that is site dressing is also gated on the timeline having raised
+   * it at all, exactly as the generic prop reconcile above would have.
+   * ---------------------------------------------------------------------- */
+  for (const cp of veg.crops) {
+    const stage = cp.propId && !snap.props.has(cp.propId) ? -1 : cropStage(snap.t, cp.jitter);
+    want(cp.slot[0], stage === 0);
+    want(cp.slot[1], stage === 1);
+    want(cp.slot[2], stage === 2);
+  }
+  for (const sp of veg.saplings) {
+    // Appear-only as the day runs forward — nothing takes a sapling away —
+    // but still derived, so a scrub back to noon has the ground bare again.
+    want(sp.slot, snap.t >= sp.t && snap.trees.get(sp.treeId) === 'stump');
+  }
+  /* ---- end living details (additive) ------------------------------------- */
 
   if (!changed.length) return;
   for (const i of changed) veg.on[i] = !veg.on[i];

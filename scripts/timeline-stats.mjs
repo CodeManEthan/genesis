@@ -312,6 +312,9 @@ function serialize(snap) {
   return JSON.stringify({
     t: snap.t,
     trees: m(snap.trees),
+    // living details: fell times. Listed explicitly, because (j) compares
+    // serialisations and anything left out of here is silently not checked.
+    felled: m(snap.felled ?? new Map()),
     buildings: m(snap.buildings),
     roads: m(snap.roads),
     bridges: m(snap.bridges),
@@ -592,6 +595,26 @@ function run(label, map, pace = 1) {
   const hop3 = emptySnapshot(map);
   for (let t = 0.5; t <= 24.0001; t += 0.5) advance(hop3, tl, Math.min(t, 24));
   if (serialize(hop3) !== serialize(end)) bad(`(j) 48-hop advance != snapshotAt(24)`);
+
+  /* (j2) living details: fell times agree with the chop-done events, and with
+   * `trees` — the felled log's whole clock hangs off this map, so a stump with
+   * no fell time (or a fell time with no stump) is a log that never lies down
+   * or never gets hauled. Checked at mid-day too, where `felled` is partial. */
+  for (const [id, t] of end.felled ?? []) {
+    if (chopDone.get(id) !== t) bad(`(j2) felled[${id}] = ${t}, chop-done at ${chopDone.get(id)}`);
+    if (end.trees.get(id) !== 'stump') bad(`(j2) felled[${id}] but tree is ${end.trees.get(id)}`);
+  }
+  for (const [id, st] of end.trees) {
+    if (st === 'stump' && !(end.felled ?? new Map()).has(id))
+      bad(`(j2) tree ${id} is a stump at t=24 with no fell time`);
+  }
+  {
+    const mid = snapshotAt(map, tl, 12);
+    for (const [id, t] of mid.felled ?? []) {
+      if (!(t <= 12 + 1e-9)) bad(`(j2) felled[${id}] = ${t} present in the t=12 snapshot`);
+      if (mid.trees.get(id) !== 'stump') bad(`(j2) t=12: felled[${id}] but tree is not a stump`);
+    }
+  }
 
   /* (l) road felling: nothing is left standing on finished road surface */
   for (const r of map.roads) {
