@@ -66,6 +66,13 @@ export const PAL = {
   stone: '#cec7ba',
   stoneDark: '#a49d90',
   stoneLight: '#e2ddd2',
+  /* dressed masonry — a quarry town's walls. Deliberately cooler and a good
+     two steps darker than `wall`, because the whole job of the material is to
+     be legible against a cream town from the fitted overview. */
+  masonry: '#c2bfb6',
+  masonryShade: '#9d9990',
+  /* the grey the slate roofs of a stone town are pulled towards */
+  slate: '#69717f',
   wood: '#b3855b',
   woodDark: '#8a6340',
   woodLight: '#d8b688',
@@ -246,6 +253,13 @@ export type StructureRole =
   | 'brewhouse'
   | 'homestead';
 
+/**
+ * What the walls are made of. Additive and optional: absent means 'timber',
+ * which is the render-and-frame cream wall every caller drew before quarry
+ * towns existed, so the vale is untouched by this.
+ */
+export type BuildMaterial = 'timber' | 'stone';
+
 export interface StructureSpec {
   role: StructureRole;
   accent: string;
@@ -263,6 +277,8 @@ export interface StructureSpec {
   awning?: boolean;
   banner?: boolean;
   lit?: boolean;
+  /** Absent === 'timber'. 'stone' gives coursed masonry walls and slate. */
+  material?: BuildMaterial;
   seed: number;
 }
 
@@ -287,7 +303,17 @@ function qR(W: number, t0: number, t1: number, h0: number, h1: number): Pt[] {
   return [rightPt(W, t0, h1), rightPt(W, t1, h1), rightPt(W, t1, h0), rightPt(W, t0, h0)];
 }
 
-function drawWindow(ctx: Ctx, W: number, side: 'l' | 'r', tc: number, hc: number, lit: boolean): void {
+function drawWindow(
+  ctx: Ctx,
+  W: number,
+  side: 'l' | 'r',
+  tc: number,
+  hc: number,
+  lit: boolean,
+  /** When set, a dressed stone lintel over the head and a sill under the
+   * cill, in this colour. Absent leaves the timber-framed window untouched. */
+  lintel?: string
+): void {
   const q = side === 'l' ? qL : qR;
   const dt = 6 / W;
   poly(ctx, q(W, tc - dt, tc + dt, hc - 3.5, hc + 3.5), PAL.woodDark);
@@ -295,6 +321,49 @@ function drawWindow(ctx: Ctx, W: number, side: 'l' | 'r', tc: number, hc: number
   poly(ctx, inner, lit ? PAL.glassLit : side === 'l' ? PAL.glass : PAL.glassDark);
   const glint = q(W, tc - dt * 0.68, tc - dt * 0.08, hc + 0.5, hc + 2.6);
   poly(ctx, glint, lit ? shade(PAL.glassLit, 0.35) : shade(PAL.glass, 0.4));
+  if (lintel) {
+    poly(ctx, q(W, tc - dt * 1.45, tc + dt * 1.45, hc + 3.5, hc + 5.4), lintel);
+    poly(ctx, q(W, tc - dt * 1.3, tc + dt * 1.3, hc - 5.1, hc - 3.5), shade(lintel, -0.14));
+  }
+}
+
+/**
+ * Coursed masonry over a wall face pair: a mortar seam every course, vertical
+ * joints staggered half a block from one course to the next, and quoins
+ * alternating up the near corner.
+ *
+ * The seams are what make it read as stone at zoom 2+; the wall colour alone is
+ * what makes it read as stone from the fitted overview, where a one-pixel seam
+ * is not there at all. Both matter, and they are doing different jobs.
+ */
+function drawCourses(ctx: Ctx, W: number, h0: number, h1: number, wl: string, wr: string): void {
+  const COURSE = 4.2;
+  const seamL = shade(wl, -0.17);
+  const seamR = shade(wr, -0.17);
+  const quoinL = shade(wl, 0.15);
+  const quoinR = shade(wr, 0.15);
+  /** One block, in face-parameter units. */
+  const BLOCK = 9 / W;
+  const JOINT = 1.2 / W;
+  let row = 0;
+  for (let hh = h0; hh < h1 - 0.6; hh += COURSE, row++) {
+    const top = Math.min(h1, hh + COURSE);
+    // vertical joints, offset half a block on alternate courses
+    const off = row & 1 ? BLOCK * 0.5 : 0;
+    for (let t = off + BLOCK; t < 1 - JOINT; t += BLOCK) {
+      poly(ctx, qL(W, t - JOINT, t + JOINT, hh, top), seamL);
+      poly(ctx, qR(W, t - JOINT, t + JOINT, hh, top), seamR);
+    }
+    // the bed joint on top of the course
+    if (top < h1 - 0.4) {
+      poly(ctx, qL(W, 0, 1, top - 0.5, top + 0.5), seamL);
+      poly(ctx, qR(W, 0, 1, top - 0.5, top + 0.5), seamR);
+    }
+    // quoins: a long stone alternating which face it presents at the corner
+    const dq = 5.5 / W;
+    if (row & 1) poly(ctx, qL(W, 1 - dq, 1, hh + 0.6, top - 0.6), quoinL);
+    else poly(ctx, qR(W, 0, dq, hh + 0.6, top - 0.6), quoinR);
+  }
 }
 
 /** Stacked-box scaffolding drawn against the front-left face. */
@@ -322,12 +391,21 @@ function drawRoof(
   wallH: number,
   style: RoofStyle,
   accent: string,
-  condition: number
+  condition: number,
+  /** 'stone' pulls the roof towards slate. Absent behaves as 'timber'. */
+  material?: BuildMaterial
 ): number {
   const eave = 4;
   const RW = W + eave * 2;
   const ry = -wallH;
-  const base = style === 'thatch' ? PAL.thatch : accent;
+  // A stone town roofs in slate — but slate mixed *from* the town's own accent,
+  // so the greys still differ town to town and the ledger colour still reads.
+  const base =
+    style === 'thatch'
+      ? PAL.thatch
+      : material === 'stone'
+        ? mix(accent, PAL.slate, 0.66)
+        : accent;
   const col = mix(base, '#8d9a86', (1 - condition) * 0.45);
   const dark = shade(col, -0.3);
   const mid = shade(col, -0.14);
@@ -501,27 +579,38 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
     }
 
     /* ---- walls ------------------------------------------------------ */
-    const woody = role === 'barn' || role === 'shed' || role === 'granary';
-    const baseL = woody ? PAL.woodLight : PAL.wall;
-    const baseR = woody ? PAL.wood : PAL.wallShade;
+    // Stone rises here and nowhere earlier: the footing and the frame above are
+    // the same timber scaffold whatever the building will end up being made of,
+    // which is both what a mason's site looks like and what keeps every
+    // progress stage working for free.
+    const stone = spec.material === 'stone';
+    const woody = !stone && (role === 'barn' || role === 'shed' || role === 'granary');
+    const baseL = stone ? PAL.masonry : woody ? PAL.woodLight : PAL.wall;
+    const baseR = stone ? PAL.masonryShade : woody ? PAL.wood : PAL.wallShade;
     const wl = mix(baseL, '#b9b2a4', (1 - condition) * 0.4);
     const wr = mix(baseR, '#a49d90', (1 - condition) * 0.4);
     const built = p >= 0.62 ? wallH : Math.round(wallH * (0.52 + (p - 0.45) * 2.82));
     poly(ctx, qL(W, 0, 1, footH, built), wl);
     poly(ctx, qR(W, 0, 1, footH, built), wr);
+    // Courses go on before the storey bands and the openings, so a floor line
+    // or a lintel still reads as a thing laid over the masonry.
+    if (stone) drawCourses(ctx, W, footH, built, wl, wr);
 
-    if (role === 'barn') {
+    if (role === 'barn' && !stone) {
       // plank seams
       for (let t = 0.12; t < 1; t += 0.16) {
         poly(ctx, qL(W, t, t + 0.012, footH, built), shade(wl, -0.16));
         poly(ctx, qR(W, t, t + 0.012, footH, built), shade(wr, -0.16));
       }
     }
+    // Floor line: a string course on stone, a painted band on render.
+    const bandL = stone ? shade(wl, -0.3) : PAL.wallDark;
+    const bandR = stone ? shade(wr, -0.3) : shade(PAL.wallDark, -0.12);
     for (let f = 1; f < floors; f++) {
       const hh = f * STORY;
       if (hh > built) break;
-      poly(ctx, qL(W, 0, 1, hh - 1, hh + 0.6), PAL.wallDark);
-      poly(ctx, qR(W, 0, 1, hh - 1, hh + 0.6), shade(PAL.wallDark, -0.12));
+      poly(ctx, qL(W, 0, 1, hh - 1, hh + 0.6), bandL);
+      poly(ctx, qR(W, 0, 1, hh - 1, hh + 0.6), bandR);
     }
     rect(ctx, 0, H / 2 - built, 1, built, shade(wl, 0.1));
 
@@ -547,6 +636,8 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
 
     if (p >= 0.62) {
       /* ---- openings ------------------------------------------------- */
+      const lintelL = stone ? shade(wl, 0.2) : undefined;
+      const lintelR = stone ? shade(wr, 0.2) : undefined;
       const cols = Math.max(1, Math.floor(W / 22));
       for (let f = 0; f < floors; f++) {
         const hc = f * STORY + STORY * 0.6;
@@ -554,8 +645,10 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
           const t = cols === 1 ? 0.5 : 0.18 + (0.64 * i) / (cols - 1);
           const doorSlot = f === 0 && Math.abs(t - 0.5) < 0.16;
           const lit = spec.lit || rng() < 0.2;
-          if (!doorSlot) drawWindow(ctx, W, 'l', t, hc, lit);
-          if (role !== 'barn' || f > 0) drawWindow(ctx, W, 'r', t, hc, spec.lit || rng() < 0.16);
+          if (!doorSlot) drawWindow(ctx, W, 'l', t, hc, lit, lintelL);
+          if (role !== 'barn' || f > 0) {
+            drawWindow(ctx, W, 'r', t, hc, spec.lit || rng() < 0.16, lintelR);
+          }
         }
       }
 
@@ -571,6 +664,11 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
         rect(ctx, knob[0], knob[1], 1, 1, PAL.glassLit);
       }
       poly(ctx, qL(W, 0.5 - dt * 1.6, 0.5 + dt * 1.6, -1.5, 0.4), PAL.stone);
+      // A dressed lintel across the door head: the one stone detail big enough
+      // to survive the fitted overview, so it is worth spending the pixels on.
+      if (stone) {
+        poly(ctx, qL(W, 0.5 - dt * 1.8, 0.5 + dt * 1.8, dh + 1, dh + 3.2), shade(wl, 0.2));
+      }
 
       if (spec.awning) {
         const a0 = leftPt(W, 0.5 - dt * 2.4, 13);
@@ -600,7 +698,7 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
     /* ---- roof ------------------------------------------------------- */
     let roofH = 0;
     if (p >= 0.62) {
-      roofH = drawRoof(ctx, W, wallH, roof, accent, condition);
+      roofH = drawRoof(ctx, W, wallH, roof, accent, condition, spec.material);
     } else {
       // Ring beam and bare rafters, sitting on the frame at its final plate
       // height — the roof is what is missing, not the storey.
@@ -1170,6 +1268,74 @@ export function buildSheep(seed: number): Sprite {
     blob(ctx, 0, -9, [7, 10, 11, 10, 8], '#f4efe6');
     blob(ctx, -1, -9, [4, 5], '#ffffff');
     rect(ctx, 5 * flip, -9, 3, 3, '#4c4658');
+  });
+}
+
+/**
+ * A quarry town's stone yard: dressed blocks stacked and waiting to go up,
+ * with the chisel and a wedge still lying on the top course. Genesis-only and
+ * additive — the vale never asks for this kind.
+ *
+ * It has to read as *cut* stone rather than as boulders, so every face is a
+ * flat quad with a hard highlight on the top: a rounded blob at this size is
+ * indistinguishable from `buildRock`, which is exactly what these are not.
+ */
+export function buildQuarryBlocks(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  /** One dressed block, drawn as an iso box of on-screen width `w`. */
+  const block = (ctx: Ctx, cx: number, cy: number, w: number, h: number, tint: number) => {
+    // The three faces are pushed a long way apart in value on purpose: a
+    // dressed block is defined by its flat lit top, and a gentle ramp between
+    // top and side is exactly what makes a stack of these read as boulders.
+    const top = shade(PAL.masonry, 0.34 + tint);
+    const left = shade(PAL.masonry, tint);
+    const right = shade(PAL.masonryShade, -0.14 + tint);
+    poly(ctx, [[cx - w / 2, cy], [cx, cy - w / 4], [cx + w / 2, cy], [cx, cy + w / 4]], top);
+    poly(ctx, [
+      [cx - w / 2, cy],
+      [cx, cy + w / 4],
+      [cx, cy + w / 4 + h],
+      [cx - w / 2, cy + h],
+    ], left);
+    poly(ctx, [
+      [cx, cy + w / 4],
+      [cx + w / 2, cy],
+      [cx + w / 2, cy + h],
+      [cx, cy + w / 4 + h],
+    ], right);
+    // a hard shadow line under the block, so a stack reads as courses
+    poly(ctx, [
+      [cx - w / 2, cy + h],
+      [cx, cy + w / 4 + h],
+      [cx + w / 2, cy + h],
+      [cx + w / 2, cy + h + 1],
+      [cx, cy + w / 4 + h + 1],
+      [cx - w / 2, cy + h + 1],
+    ], shade(PAL.masonryShade, -0.34));
+    // one chiselled arris, so the block has an edge rather than a seam
+    poly(ctx, [
+      [cx - w / 2, cy],
+      [cx, cy - w / 4],
+      [cx, cy - w / 4 + 1],
+      [cx - w / 2, cy + 1],
+    ], shade(PAL.masonry, 0.5));
+  };
+  const tall = rng() < 0.5;
+  return makeSprite(34, 30, 17, 24, (ctx) => {
+    poly(ctx, diamond(1, 1, 26), PAL.shadow);
+    block(ctx, -5, -1, 16, 6, -0.05);
+    block(ctx, 6, 2, 16, 6, 0.02);
+    block(ctx, 0, -8, 16, 6, 0.06);
+    if (tall) block(ctx, 1, -15, 13, 5, -0.02);
+    // chisel and wedge left on the top course
+    const ty = tall ? -19 : -12;
+    rect(ctx, -2, ty - 4, 1, 5, PAL.woodDark);
+    rect(ctx, -2, ty - 5, 2, 1, PAL.stoneDark);
+    rect(ctx, 3, ty - 1, 4, 1, PAL.stoneLight);
+    // a scatter of chippings on the ground
+    for (let i = 0; i < 4; i++) {
+      rect(ctx, -12 + rng() * 22, 1 + rng() * 5, 2, 1, shade(PAL.masonryShade, -0.1));
+    }
   });
 }
 

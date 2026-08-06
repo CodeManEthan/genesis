@@ -19,7 +19,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { generateMap, generateMapUncached, woodCharacter } = await import(
+const { generateMap, generateMapUncached, woodCharacter, QUARRY_REACH } = await import(
   join(root, 'src/components/designs/genesis/gen.ts')
 );
 const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
@@ -36,7 +36,7 @@ const PROP_SPRITES = new Set([
   ...TREE_SPRITES,
   'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
   'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
-  'sheep', 'campfire',
+  'sheep', 'campfire', 'quarry-blocks',
   // resolved by name in propSprite() rather than from a pool
   'nameboard', 'signpost', 'stake', 'crane',
 ]);
@@ -92,6 +92,64 @@ const plen = (line) => {
 const fpR = (w) => w / TW;
 const f1 = (n) => n.toFixed(1);
 
+/* --------------------------------- lakes --------------------------------- */
+
+// The lake tests below are written entirely against `lk.pts`, the stored
+// outline, and never against the analytic rx/ry/rot — deliberately. `pts` is
+// what the renderer fills, so testing it is testing what a visitor sees; and a
+// bug in the generator's own distance approximation cannot hide behind a
+// harness that reuses the same approximation.
+
+/** The outline in u/v, scaled about the lake's centre — same as scene.ts. */
+function lakeRingUV(lk, k = 1) {
+  const c = uvOf(lk);
+  return lk.pts.map((p) => {
+    const q = toUV(p);
+    return [c[0] + (q[0] - c[0]) * k, c[1] + (q[1] - c[1]) * k];
+  });
+}
+
+/** Exact even-odd point-in-polygon. */
+function inPoly(p, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const yi = poly[i][1];
+    const yj = poly[j][1];
+    if (yi > p[1] !== yj > p[1]) {
+      const x = ((poly[j][0] - poly[i][0]) * (p[1] - yi)) / (yj - yi) + poly[i][0];
+      if (p[0] < x) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Signed shore distance from the outline: negative inside the water. */
+function lakeShoreDist(p, ring) {
+  let best = Infinity;
+  for (let i = 0; i < ring.length; i++) {
+    best = Math.min(best, segDist(p, ring[i], ring[(i + 1) % ring.length]));
+  }
+  return inPoly(p, ring) ? -best : best;
+}
+
+/** Nearest shore over every lake; +Infinity when the valley has none. */
+function lakesShoreDist(p, rings) {
+  let best = Infinity;
+  for (const ring of rings) best = Math.min(best, lakeShoreDist(p, ring));
+  return best;
+}
+
+/** Perimeter of a closed polygon. */
+const ringLen = (ring) => {
+  let s = 0;
+  for (let i = 0; i < ring.length; i++) s += d2(ring[i], ring[(i + 1) % ring.length]);
+  return s;
+};
+
+/** A town builds in stone iff every plot on its roster says so. */
+const isQuarryTown = (s) =>
+  s.buildings.length > 0 && s.buildings.every((b) => b.material === 'stone');
+
 /* ------------------------------- reporting ------------------------------- */
 
 function report(seed) {
@@ -117,13 +175,48 @@ function report(seed) {
       `mouths (${f1(river[0][0])},${f1(river[0][1])}) -> (${f1(river.at(-1)[0])},${f1(river.at(-1)[1])})`
   );
 
+  const rings = (map.lakes ?? []).map((lk) => lakeRingUV(lk));
+  say(`\nLAKES (${map.lakes?.length ?? 0})`);
+  for (let i = 0; i < (map.lakes ?? []).length; i++) {
+    const lk = map.lakes[i];
+    const c = uvOf(lk);
+    const ring = rings[i];
+    let wu = 0;
+    let wv = 0;
+    for (const q of ring) {
+      wu = Math.max(wu, Math.abs(q[0] - c[0]) * 2);
+      wv = Math.max(wv, Math.abs(q[1] - c[1]) * 2);
+    }
+    say(
+      `  ${lk.id} u,v ${f1(c[0]).padStart(6)},${f1(c[1]).padStart(6)}  ` +
+        `axes ${f1(lk.rx * 2)}x${f1(lk.ry * 2)}  extent ${f1(wu)}x${f1(wv)}  ` +
+        `perimeter ${f1(ringLen(ring))}  ${lk.pts.length} pts  ` +
+        `river ${f1(polyDist(c, river))} ${lk.fed ? 'RIVER-FED' : 'standalone'}`
+    );
+  }
+
+  say(`\nOUTCROPS (${map.outcrops?.length ?? 0})`);
+  for (const o of map.outcrops ?? []) {
+    const c = uvOf(o);
+    const near = map.sites
+      .map((s) => ({ s, d: d2(c, uvOf(s)) - o.radius - s.radius }))
+      .sort((a, b) => a.d - b.d || (a.s.id < b.s.id ? -1 : 1))[0];
+    say(
+      `  ${o.id} u,v ${f1(c[0]).padStart(6)},${f1(c[1]).padStart(6)}  r ${f1(o.radius)}  ` +
+        `nearest town ${near ? `${near.s.id} at ${f1(near.d)}` : 'none'}` +
+        `${near && near.d <= QUARRY_REACH ? '  -> QUARRY' : ''}`
+    );
+  }
+
   say(`\nSITES (${map.sites.length})`);
   for (const s of map.sites) {
     const p = uvOf(s);
     say(
       `  ${s.id} ${s.name.padEnd(20)} u,v ${f1(p[0]).padStart(6)},${f1(p[1]).padStart(6)}  ` +
-        `r ${f1(s.radius)}  river ${f1(polyDist(p, river))}  ${s.accent}  ` +
-        `${s.buildings.length} bldg / ${s.props.length} props`
+        `r ${f1(s.radius)}  river ${f1(polyDist(p, river))}  ` +
+        `lake ${rings.length ? f1(lakesShoreDist(p, rings)) : '-'}  ${s.accent}  ` +
+        `${s.buildings.length} bldg / ${s.props.length} props` +
+        `${isQuarryTown(s) ? '  STONE' : ''}`
     );
   }
 
@@ -343,8 +436,11 @@ function checks(seed, map, scale = 1) {
     const ok =
       map.trees.length >= 1400 &&
       map.trees.length <= 2400 &&
+      // The upper bound carries the lake shores and the boulder fields as well
+      // as the wild scatter: two lakes ringed with reeds and two outcrops laid
+      // out in stone is a legitimate ~120 props on top of the base 100..180.
       map.scatter.length >= 90 &&
-      map.scatter.length <= 220 &&
+      map.scatter.length <= 340 &&
       map.sites.length >= 2 &&
       map.sites.length <= 16 &&
       s0b >= 3 &&
@@ -466,6 +562,193 @@ function checks(seed, map, scale = 1) {
     );
   }
 
+  /* --------------------------- lakes and stone --------------------------- */
+
+  const rings = (map.lakes ?? []).map((lk) => lakeRingUV(lk));
+
+  /* (t) lakes are terrain: byte-identical however much the day builds.
+     Run once per seed (at scale 1) rather than once per scale, because the
+     comparison is between scales and doing it five times says nothing new. */
+  if (scale === 1) {
+    const a = JSON.stringify(generateMapUncached(seed, 0.25).lakes);
+    const b = JSON.stringify(generateMapUncached(seed, 4).lakes);
+    const c = JSON.stringify(map.lakes);
+    const oa = JSON.stringify(generateMap(seed, 0.25).outcrops);
+    const ob = JSON.stringify(generateMap(seed, 4).outcrops);
+    check(
+      't  lakes/outcrops identical 0.25x..4x',
+      a === b && a === c && oa === ob,
+      `${map.lakes.length} lakes (${a.length} B), ${map.outcrops.length} outcrops`
+    );
+  }
+
+  /* (u) the lake shape itself is sane: closed, non-degenerate, in bounds */
+  {
+    let bad = 0;
+    let detail = '';
+    for (let i = 0; i < (map.lakes ?? []).length; i++) {
+      const lk = map.lakes[i];
+      const ring = rings[i];
+      const c = uvOf(lk);
+      const across = 2 * Math.max(...ring.map((q) => d2(q, c)));
+      if (ring.length < 12) bad++;
+      // 4..9 units across on the axes is the spec; the wobble is allowed to
+      // bulge a little past that at whichever angle it peaks.
+      if (!(lk.rx * 2 >= 4 && lk.rx * 2 <= 9 && lk.ry * 2 >= 2.6 && lk.ry <= lk.rx)) {
+        bad++;
+        detail += ` ${lk.id} axes ${f1(lk.rx * 2)}x${f1(lk.ry * 2)}`;
+      }
+      if (across > 12) {
+        bad++;
+        detail += ` ${lk.id} bulges to ${f1(across)}`;
+      }
+      if (!(lk.rx > 0 && lk.ry > 0)) bad++;
+      for (const q of ring) {
+        if (q[0] < map.bounds.u0 || q[0] > map.bounds.u1) bad++;
+        if (q[1] < map.bounds.v0 || q[1] > map.bounds.v1) bad++;
+      }
+      // Lakes never overlap one another.
+      for (let j = i + 1; j < map.lakes.length; j++) {
+        if (lakeShoreDist(uvOf(map.lakes[j]), ring) < 0) bad++;
+      }
+    }
+    check(
+      'u  lake outlines well formed',
+      bad === 0,
+      `${map.lakes?.length ?? 0} lakes${detail}`
+    );
+  }
+
+  /* (v) nothing stands in the water: no tree, roof, prop, scatter or town */
+  if (rings.length) {
+    let bad = 0;
+    let worst = Infinity;
+    let who = '';
+    const test = (p, margin, tag) => {
+      const d = lakesShoreDist(p, rings);
+      if (d - margin < worst) {
+        worst = d - margin;
+        who = tag;
+      }
+      if (d < margin) bad++;
+    };
+    // Margins are the generator's, less a hair of slack for the fact that the
+    // generator measures against its analytic shape and this measures against
+    // the resolved polygon — a chord always sits marginally inside the curve.
+    for (const t of map.trees) test(uvOf(t), 0.6, `tree ${t.id}`);
+    for (const p of map.scatter) test(uvOf(p), 0.25, `scatter ${p.id}`);
+    for (const s of map.sites) {
+      test(uvOf(s), s.radius + 1.9, `site ${s.id}`);
+      for (const b of s.buildings) test(uvOf(b), fpR(b.w) + 0.9, `bldg ${b.id}`);
+      for (const p of s.props) test(uvOf(p), 0.8, `prop ${p.id}`);
+    }
+    check(
+      'v  nothing stands in a lake',
+      bad === 0,
+      `${bad} in the water, least slack ${f1(worst)} at ${who}`
+    );
+  } else {
+    check('v  nothing stands in a lake', true, 'no lakes');
+  }
+
+  /* (w) no road ever crosses lake water — not a vertex, not a segment */
+  if (rings.length) {
+    let bad = 0;
+    let worst = Infinity;
+    let who = '';
+    for (const r of map.roads) {
+      const line = roadUV.get(r.id);
+      for (let i = 0; i + 1 < line.length; i++) {
+        // Sample the segment as well as its ends: a straight chord can slice a
+        // narrow neck of water with both endpoints comfortably on dry land.
+        const steps = Math.max(2, Math.ceil(d2(line[i], line[i + 1]) * 3));
+        for (let k = 0; k <= steps; k++) {
+          const t = k / steps;
+          const p = [
+            line[i][0] + (line[i + 1][0] - line[i][0]) * t,
+            line[i][1] + (line[i + 1][1] - line[i][1]) * t,
+          ];
+          const d = lakesShoreDist(p, rings);
+          if (d < worst) {
+            worst = d;
+            who = r.id;
+          }
+          if (d < 0) bad++;
+        }
+      }
+    }
+    check(
+      'w  roads never cross lake water',
+      bad === 0,
+      `${bad} samples in the water, closest approach ${f1(worst)} on ${who}`
+    );
+  } else {
+    check('w  roads never cross lake water', true, 'no lakes');
+  }
+
+  /* (x) quarry towns: stone is all-or-nothing per town, earned by an outcrop,
+     never thatched, and always kitted out with the stone yard */
+  {
+    let bad = 0;
+    let detail = [];
+    for (const s of map.sites) {
+      const stone = s.buildings.filter((b) => b.material === 'stone').length;
+      const timber = s.buildings.filter((b) => b.material !== undefined && b.material !== 'stone').length;
+      if (timber) {
+        bad++;
+        detail.push(`${s.id} explicit-timber`);
+      }
+      if (stone && stone !== s.buildings.length) {
+        bad++;
+        detail.push(`${s.id} mixed ${stone}/${s.buildings.length}`);
+      }
+      if (!stone) continue;
+      // Earned: an outcrop within reach of the rim.
+      const near = Math.min(
+        ...(map.outcrops ?? []).map((o) => d2(uvOf(s), uvOf(o)) - o.radius - s.radius)
+      );
+      if (!(near <= QUARRY_REACH + 1e-6)) {
+        bad++;
+        detail.push(`${s.id} stone but nearest rock ${f1(near)}`);
+      }
+      if (s.buildings.some((b) => b.roof === 'thatch')) {
+        bad++;
+        detail.push(`${s.id} thatch on stone`);
+      }
+      if (!s.props.some((p) => p.kind === 'quarry-blocks')) {
+        bad++;
+        detail.push(`${s.id} no stone yard`);
+      }
+    }
+    const stoneTowns = map.sites.filter(isQuarryTown).length;
+    check(
+      'x  quarry towns coherent',
+      bad === 0,
+      detail.length ? detail.join(', ') : `${stoneTowns}/${map.sites.length} stone towns`
+    );
+  }
+
+  /* (y) outcrops sit clear of the towns that quarry them, and of the water */
+  {
+    let bad = 0;
+    let worst = Infinity;
+    for (const o of map.outcrops ?? []) {
+      const c = uvOf(o);
+      for (const s of map.sites) {
+        const gap = d2(c, uvOf(s)) - o.radius - s.radius;
+        worst = Math.min(worst, gap);
+        if (gap < 0) bad++;
+      }
+      if (polyDist(c, river) < o.radius) bad++;
+      if (rings.length && lakesShoreDist(c, rings) < o.radius) bad++;
+    }
+    check(
+      'y  outcrops clear of towns and water',
+      bad === 0,
+      `${map.outcrops?.length ?? 0} outcrops, tightest town gap ${worst === Infinity ? '-' : f1(worst)}`
+    );
+  }
+
   const pass = results.every((r) => r.ok);
   console.log(`\nINVARIANTS  seed ${seed}  scale ${scale}`);
   for (const r of results) {
@@ -490,7 +773,7 @@ function subsetChecks(seed) {
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
   // Terrain is scale-invariant, full stop.
-  for (const field of ['river', 'riverWidth', 'chunks', 'trees', 'scatter', 'bounds', 'content', 'valleyName']) {
+  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'bounds', 'content', 'valleyName']) {
     const ok = maps.every((m) => same(m[field], maps[0][field]));
     check(`terrain: ${field} identical`, ok);
   }
