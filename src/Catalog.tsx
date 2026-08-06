@@ -20,6 +20,9 @@ import {
   buildDog,
   buildGrazingSheep,
   buildJetty,
+  /* ---- the ferry (additive) ---- */
+  buildPunt,
+  /* ---- end the ferry (additive) ---- */
   buildNameBoard,
   buildRowboat,
   buildSignpost,
@@ -729,7 +732,7 @@ const COVERAGE: { head: string; body: string }[] = [
   {
     head: 'Nothing uses the water',
     body:
-      'Lakes and river carry fish, ripples and foam, and not one thing anybody built: no boat, no jetty, no moored punt, no ford besides the bridge. A lake is scenery a town happens to stand next to rather than something it works.',
+      'CLOSED. Boats and jetties gave the water piers and moored hulls, fords gave the tracks a way through it, and BOATS UNDERWAY gave the hulls somewhere to go: a rowing loop on the river, a drift across a lake, and — on the seeds whose river runs a long way from any bridge — a ferry punt shuttling between two landing stages with passengers who walk down, ride over, and walk away up the far bank.',
   },
   {
     head: 'The wildlife is four animals and no predators',
@@ -1000,6 +1003,20 @@ export default function Catalog() {
           tag: 'generated',
           tagKind: 'info',
         })
+      );
+    }
+    // ADDITIVE — the ferry. A punt is not in `PropSpec.kind` at all: it is not
+    // dressing, it is the moving half of `GenesisMap.ferry`, and the renderer
+    // bakes one per quantised bearing. Two here, because the crossing is drawn
+    // going over and coming back.
+    for (const [q, name] of [[0, 'crossing out'], [4, 'coming back']] as const) {
+      out.push(
+        item(
+          `ex-punt-${q}`,
+          'punt (ferry)',
+          spriteCanvas(buildPunt(Math.PI / 4 + (q * Math.PI) / 4, 11)),
+          { sub: name, tag: 'generated', tagKind: 'info' }
+        )
       );
     }
     return out;

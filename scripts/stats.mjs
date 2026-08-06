@@ -28,6 +28,14 @@ const {
   JETTY_LEN,
   JETTY_REACH,
   JETTY_LAKE_REACH,
+  /* ---- the ferry (additive) ---- */
+  FERRY_CLEAR,
+  FERRY_REACH,
+  FERRY_FAR,
+  FERRY_LEN,
+  FERRY_SPAN_MIN,
+  FERRY_SPAN_MAX,
+  /* ---- end the ferry (additive) ---- */
   /* ---- standing stones (additive) ---- */
   STONE_NAME_REACH,
   /* ---- end standing stones (additive) ---- */
@@ -1305,6 +1313,110 @@ function checks(seed, map, scale = 1) {
     );
   }
 
+  /* (aa) THE FERRY. A ferry is not part of the crossing pass — check (c) above
+     already proved every road x river crossing is carried by a bridge or a
+     ford and that nothing is left over, and a ferry carries no road, so it
+     cannot satisfy or disturb that. What it must be instead is a real crossing
+     of its own: two stages rooted on OPPOSITE dry banks with live water the
+     whole way between their heads, far from every bridge and ford the roads
+     do make, near enough a town to be worth running, and on the river rather
+     than on a lake (a stage on standing water is a jetty, and check (z) owns
+     those). Every field is terrain, so the same crossing must survive at every
+     pace — that half is pinned by subsetChecks. */
+  {
+    const fy = map.ferry ?? null;
+    const bad = [];
+    if (fy) {
+      const riverHalf = map.riverWidth * Math.SQRT2;
+      const wet = (p) => Math.min(polyDist(p, river) - riverHalf, lakesShoreDist(p, rings));
+      const A = [fy.ax - fy.ay, fy.ax + fy.ay];
+      const B = [fy.bx - fy.by, fy.bx + fy.by];
+      const M = [fy.gx - fy.gy, fy.gx + fy.gy];
+
+      // The two roots are on dry land; the middle of the crossing is not.
+      if (wet(A) <= 0) bad.push('the A landing is rooted in the water');
+      if (wet(B) <= 0) bad.push('the B landing is rooted in the water');
+      if (wet(M) >= 0) bad.push('the crossing does not cross any water');
+
+      // Geometry agrees with itself.
+      const span = d2(A, B);
+      if (Math.abs(span - fy.span) > 1e-6) bad.push(`span ${f1(fy.span)} != ${f1(span)}`);
+      if (span < FERRY_SPAN_MIN - 1e-9 || span > FERRY_SPAN_MAX + 1e-9) bad.push(`span ${f1(span)} out of range`);
+      const dir = Math.atan2(B[1] - A[1], B[0] - A[0]);
+      if (Math.abs(Math.atan2(Math.sin(dir - fy.dir), Math.cos(dir - fy.dir))) > 1e-6)
+        bad.push('dir does not point from A to B');
+      if (Math.abs(fy.len - FERRY_LEN) > 1e-9) bad.push(`stage ${f1(fy.len)} != FERRY_LEN`);
+      if (fy.len >= span / 2) bad.push('the two stages would meet in the middle');
+
+      // Each stage decks out over live water, and everything strictly between
+      // the two heads is water — which is what makes the punt's course legal.
+      const ca = Math.cos(fy.dir);
+      const sa = Math.sin(fy.dir);
+      const hA = [A[0] + ca * fy.len, A[1] + sa * fy.len];
+      const hB = [B[0] - ca * fy.len, B[1] - sa * fy.len];
+      if (wet(hA) >= 0) bad.push('the A stage decks out over dry land');
+      if (wet(hB) >= 0) bad.push('the B stage decks out over dry land');
+      const steps = Math.max(6, Math.ceil(d2(hA, hB) * 6));
+      for (let i = 0; i <= steps; i++) {
+        const k = i / steps;
+        const p = [hA[0] + (hB[0] - hA[0]) * k, hA[1] + (hB[1] - hA[1]) * k];
+        if (wet(p) >= 0) {
+          bad.push(`the punt runs aground ${(k * 100) | 0}% of the way over`);
+          break;
+        }
+      }
+      // On the river, not on a lake: a lake crossing is somebody else's feature.
+      if (rings.length && lakesShoreDist(M, rings) < 2 - 1e-9) bad.push('the crossing is on a lake');
+
+      // Far from every crossing the roads DO make. The harness only sees the
+      // roads this scale kept, which is a subset of the roster gen measured
+      // against, so the bound holds here a fortiori.
+      let near = Infinity;
+      let who = '';
+      for (const b of map.bridges) {
+        const d = d2(M, uvOf(b));
+        if (d < near) { near = d; who = b.id; }
+      }
+      for (const f of map.fords ?? []) {
+        const d = d2(M, uvOf(f));
+        if (d < near) { near = d; who = f.id; }
+      }
+      if (near < FERRY_CLEAR - 1e-9) bad.push(`only ${f1(near)} from ${who}`);
+      // …and not on top of somebody's pier either.
+      for (const s of map.sites) {
+        for (const p of s.props) {
+          if (p.kind === 'jetty' && d2(M, uvOf(p)) < 3.5 - 1e-9) bad.push(`${p.id} is alongside`);
+        }
+      }
+
+      // Worth running: the town named is a real roster index, and where that
+      // town is in today's roster, its rim is inside the reach that earned the
+      // crossing. (siteIndex is over the FULL roster, so a small pace may have
+      // left the town out of the day entirely — the stages stand regardless.)
+      if (fy.siteId !== `s${fy.siteIndex}`) bad.push(`siteId ${fy.siteId} != s${fy.siteIndex}`);
+      const runner = map.sites[fy.siteIndex];
+      if (runner && runner.id === fy.siteId) {
+        const rim = Math.min(d2(A, uvOf(runner)), d2(B, uvOf(runner))) - runner.radius;
+        if (rim > FERRY_REACH + 1e-9) bad.push(`${runner.id} is ${f1(rim)} off its own ferry`);
+        const far = Math.max(d2(A, uvOf(runner)), d2(B, uvOf(runner))) - runner.radius;
+        if (far > FERRY_FAR + FERRY_SPAN_MAX) bad.push(`the far stage lands ${f1(far)} from anywhere`);
+      }
+
+      // Nothing of the town's stands on a landing.
+      for (const s of map.sites) {
+        for (const b of s.buildings) {
+          const r = fpR(b.w) + 1.0;
+          if (d2(A, uvOf(b)) < r - 1e-9 || d2(B, uvOf(b)) < r - 1e-9) bad.push(`${b.id} stands on a landing`);
+        }
+      }
+    }
+    check(
+      'aa ferry lands on two dry banks',
+      bad.length === 0,
+      bad.length ? bad.join(', ') : fy ? `${fy.id} spans ${f1(fy.span)} for ${fy.siteId}` : 'no ferry'
+    );
+  }
+
   const pass = results.every((r) => r.ok);
   console.log(`\nINVARIANTS  seed ${seed}  scale ${scale}`);
   for (const r of results) {
@@ -1343,7 +1455,11 @@ function subsetChecks(seed) {
   // comparison below, which includes the name.
   // (The GHOST is not map data at all — it is a function of two seeds and lives
   // in ghost.ts, outside `GenesisMap`, so it is not checked here.)
-  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'ruins', 'stones', 'bounds', 'content', 'valleyName']) {
+  // `ferry` is in here for the same reason as `chests` and `stones`, and one
+  // more: the town that RUNS it is picked off the full roster and the reach it
+  // had to beat was measured against the full crossing roster, so neither the
+  // stages nor the name on them may move when the pace control trims the day.
+  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'ruins', 'stones', 'ferry', 'bounds', 'content', 'valleyName']) {
     const ok = maps.every((m) => same(m[field], maps[0][field]));
     check(`terrain: ${field} identical`, ok);
   }
@@ -1617,6 +1733,73 @@ function stoneReport(n) {
 
 /* ---- end standing stones (additive) -------------------------------------- */
 
+/* ---- the ferry (additive) ------------------------------------------------ */
+
+/**
+ * How often a valley keeps a ferry, and — the figure that actually matters —
+ * how often the town that runs it is FOUNDED at the baseline pace. A crossing
+ * with nobody on either bank is scenery; a crossing at the edge of a town that
+ * exists today is a feature.
+ */
+function ferryReport(n) {
+  let days = 0;
+  let runnerShown = 0;
+  let bothBanks = 0;
+  let clearSum = 0;
+  let spanSum = 0;
+  const sample = [];
+  for (let s = 1; s <= n; s++) {
+    const map = generateMap(s);
+    const fy = map.ferry;
+    if (!fy) continue;
+    days++;
+    spanSum += fy.span;
+    const M = [fy.gx - fy.gy, fy.gx + fy.gy];
+    let near = Infinity;
+    for (const b of map.bridges) near = Math.min(near, d2(M, uvOf(b)));
+    for (const f of map.fords ?? []) near = Math.min(near, d2(M, uvOf(f)));
+    if (Number.isFinite(near)) clearSum += near;
+    const A = [fy.ax - fy.ay, fy.ax + fy.ay];
+    const B = [fy.bx - fy.by, fy.bx + fy.by];
+    // Two DIFFERENT towns nearest the two stages: the river genuinely divides
+    // somebody here rather than cutting one town's own corner.
+    const nearest = (p) => {
+      let best = null;
+      let bd = Infinity;
+      for (const st of map.sites) {
+        const d = d2(p, uvOf(st)) - st.radius;
+        if (d < bd) { bd = d; best = st.id; }
+      }
+      return best;
+    };
+    if (nearest(A) !== nearest(B)) bothBanks++;
+    const runner = map.sites.find((x) => x.id === fy.siteId);
+    if (runner) {
+      runnerShown++;
+      if (sample.length < 6) sample.push(`${runner.name} (seed ${s})`);
+    }
+  }
+  const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : '--');
+  console.log(`\nTHE FERRY over ${n} seeds`);
+  console.log(`  a crossing on:  ${days} days (${pct(days, n)})`);
+  console.log(
+    `  its town founded at the baseline pace: ${runnerShown}/${days} (${pct(runnerShown, days)}), ` +
+      `${pct(runnerShown, n)} of all days`
+  );
+  console.log(
+    `  a different town on each bank: ${bothBanks}/${days} (${pct(bothBanks, days)})`
+  );
+  if (days) {
+    console.log(
+      `  mean span ${f1(spanSum / days)}u, mean walk to the nearest bridge or ford ` +
+        `${f1(clearSum / days)}u (floor ${FERRY_CLEAR})`
+    );
+  }
+  if (sample.length) console.log(`  e.g. ${sample.join(', ')}`);
+}
+
+/* ---- end the ferry (additive) -------------------------------------------- */
+
 /* ---------------------------------- main --------------------------------- */
 
 const argv = process.argv.slice(2);
@@ -1667,8 +1850,16 @@ if (argv[0] === '--sweep') {
   /* ---- standing stones (additive) ---- */
   stoneReport(n);
   /* ---- end standing stones (additive) ---- */
+
+  /* ---- the ferry (additive) ---- */
+  ferryReport(n);
+  /* ---- end the ferry (additive) ---- */
 } else {
-  const seeds = argv.length ? argv.map(Number) : [1, 42, 20260802];
+  // 24 is in the default set on purpose: it is the first seed with a FERRY on
+  // it, and without one in here check (aa) reports "no ferry" three times and
+  // never runs its body. Every other feature already has a live example among
+  // the first three.
+  const seeds = argv.length ? argv.map(Number) : [1, 42, 24, 20260802];
   for (const s of seeds) {
     report(s);
     for (const scale of SCALES) {
