@@ -1419,3 +1419,205 @@ export function drawWheel(ctx: Ctx, x: number, y: number, t: number): void {
   ctx.fillStyle = PAL.stone;
   ctx.fillRect(cx - 1, cy - 1, 2, 2);
 }
+
+/* ------------------------------- wildlife ------------------------------- *
+ * Ambient animal life, added for Genesis. Everything below this line is
+ * additive: nothing above it calls anything here, so the vale's own scenes
+ * draw exactly the pixels they always did.
+ *
+ * Scale reference is `buildSheep` — a grazing animal is ~12px tall and reads
+ * as a pale speck from the overview. A deer is a shade taller and much
+ * thinner; a dog is half a sheep; a bird is five pixels of silhouette.
+ * Mirroring is done with `ctx.scale(-1, 1)` around the sprite anchor, which is
+ * exact for the axis-aligned integer rectangles everything here is made of.
+ * ------------------------------------------------------------------------ */
+
+/** Earth-and-leaf coats, in the same register as PAL's wood and sand. */
+const FUR = {
+  deer: '#b07a49',
+  deerDark: '#8a5c34',
+  deerPale: '#e6d2ae',
+  // A road dog is drawn on a dirt road, so a brown one is an invisible one:
+  // this is a collie, dark with white points, and it reads at every zoom.
+  dog: '#5b5170',
+  dogDark: '#413a55',
+  dogPale: '#f4efe6',
+  bird: '#463f5c',
+  birdWing: '#5d5675',
+  fish: '#8fb9cc',
+  fishDark: '#6d95a8',
+} as const;
+
+/**
+ * A bird in flight: two frames of a flap, five pixels wide, symmetrical so it
+ * needs no facing. Drawn small enough that only the wing beat reads at
+ * distance — which is the whole point of it.
+ */
+export function buildBird(frame: 0 | 1): Sprite {
+  return makeSprite(10, 10, 5, 5, (ctx) => {
+    // body
+    rect(ctx, -1, 0, 3, 1, FUR.bird);
+    rect(ctx, 1, -1, 1, 1, FUR.bird);
+    if (frame === 0) {
+      // wings up
+      rect(ctx, -2, -1, 1, 1, FUR.birdWing);
+      rect(ctx, -3, -2, 1, 1, FUR.bird);
+      rect(ctx, 2, -1, 1, 1, FUR.birdWing);
+      rect(ctx, 3, -2, 1, 1, FUR.bird);
+    } else {
+      // wings down
+      rect(ctx, -2, 1, 1, 1, FUR.birdWing);
+      rect(ctx, -3, 2, 1, 1, FUR.bird);
+      rect(ctx, 2, 1, 1, 1, FUR.birdWing);
+      rect(ctx, 3, 2, 1, 1, FUR.bird);
+    }
+  });
+}
+
+/**
+ * A deer, in the three poses the treeline needs: 0 head up and alert, 1 head
+ * down and grazing, 2 bolting for the wood. `seed` only decides whether it is
+ * a stag, so a pair at the same spot is not a pair of twins.
+ */
+export function buildDeer(pose: 0 | 1 | 2, faceRight: boolean, seed: number): Sprite {
+  const antlers = mulberry32(seed)() < 0.45;
+  return makeSprite(22, 20, 9, 17, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(0, 1, 12), PAL.shadowSoft);
+
+    if (pose === 2) {
+      // legs thrown out fore and aft
+      rect(ctx, 5, -4, 1, 2, FUR.deerDark);
+      rect(ctx, 6, -2, 2, 1, FUR.deerDark);
+      rect(ctx, 3, -5, 1, 4, FUR.deer);
+      rect(ctx, -5, -4, 1, 2, FUR.deerDark);
+      rect(ctx, -7, -2, 2, 1, FUR.deerDark);
+      rect(ctx, -3, -5, 1, 4, FUR.deer);
+      blob(ctx, 0, -9, [7, 9, 9, 7], FUR.deer);
+      blob(ctx, 0, -9, [5], shade(FUR.deer, 0.16));
+      rect(ctx, -1, -6, 6, 1, FUR.deerPale);
+      rect(ctx, -6, -11, 1, 3, FUR.deerPale); // tail up
+      rect(ctx, 4, -12, 2, 4, FUR.deer); // neck, thrown forward
+      rect(ctx, 5, -13, 4, 2, FUR.deer);
+      rect(ctx, 8, -12, 2, 1, FUR.deerDark);
+      rect(ctx, 5, -14, 1, 1, FUR.deerDark);
+      if (antlers) {
+        rect(ctx, 6, -15, 1, 2, FUR.deerPale);
+        rect(ctx, 8, -16, 1, 2, FUR.deerPale);
+      }
+      return;
+    }
+
+    // legs
+    rect(ctx, -4, -4, 1, 4, FUR.deerDark);
+    rect(ctx, -2, -4, 1, 4, FUR.deer);
+    rect(ctx, 2, -4, 1, 4, FUR.deer);
+    rect(ctx, 4, -4, 1, 4, FUR.deerDark);
+    // barrel
+    blob(ctx, 0, -9, [7, 9, 9, 8, 6], FUR.deer);
+    blob(ctx, 0, -9, [5], shade(FUR.deer, 0.16));
+    rect(ctx, -2, -5, 6, 1, FUR.deerPale);
+    rect(ctx, -5, -9, 1, 2, FUR.deerPale); // tail
+
+    if (pose === 0) {
+      rect(ctx, 3, -12, 2, 4, FUR.deer); // neck
+      rect(ctx, 4, -13, 4, 3, FUR.deer); // head
+      rect(ctx, 7, -12, 2, 2, FUR.deerDark); // muzzle
+      rect(ctx, 4, -14, 1, 1, FUR.deerDark); // ear
+      rect(ctx, 6, -12, 1, 1, PAL.ink); // eye
+      if (antlers) {
+        rect(ctx, 5, -16, 1, 3, FUR.deerPale);
+        rect(ctx, 7, -17, 1, 3, FUR.deerPale);
+        rect(ctx, 6, -16, 1, 1, FUR.deerPale);
+      }
+    } else {
+      rect(ctx, 3, -9, 2, 3, FUR.deer); // neck, dropped
+      rect(ctx, 5, -6, 2, 3, FUR.deer);
+      rect(ctx, 6, -4, 4, 3, FUR.deer); // head at the grass
+      rect(ctx, 9, -3, 1, 2, FUR.deerDark);
+      rect(ctx, 6, -5, 1, 1, FUR.deerDark); // ear
+      if (antlers) {
+        rect(ctx, 6, -8, 1, 3, FUR.deerPale);
+        rect(ctx, 8, -8, 1, 2, FUR.deerPale);
+      }
+    }
+  });
+}
+
+/** A small dog, two frames of a trot. Half a sheep tall, mostly tail. */
+export function buildDog(pose: 0 | 1, faceRight: boolean): Sprite {
+  return makeSprite(14, 14, 6, 11, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(0, 1, 9), PAL.shadowSoft);
+    const spread = pose === 0 ? 0 : 1;
+    rect(ctx, -2 - spread, -3, 1, 3, FUR.dogDark);
+    rect(ctx, 2 + spread, -3, 1, 3, FUR.dogPale);
+    rect(ctx, -1, -3, 1, 3, FUR.dogDark);
+    rect(ctx, 1, -3, 1, 3, FUR.dogPale);
+    blob(ctx, 0, -7, [5, 7, 6], FUR.dog);
+    rect(ctx, 1, -5, 4, 1, FUR.dogPale); // white chest and belly
+    rect(ctx, 3, -9, 3, 3, FUR.dog); // head
+    rect(ctx, 4, -9, 1, 3, FUR.dogPale); // blaze
+    rect(ctx, 5, -8, 2, 1, FUR.dogPale); // snout
+    rect(ctx, 3, -10, 1, 1, FUR.dogDark); // ear
+    rect(ctx, 5, -9, 1, 1, PAL.ink); // eye
+    rect(ctx, -4, -9 + pose, 1, 2, FUR.dog); // tail, wagging
+    rect(ctx, -5, -10 + pose, 1, 1, FUR.dogPale); // …with a white tip
+  });
+}
+
+/**
+ * The same animal `buildSheep` draws, but with its facing and its head chosen
+ * rather than rolled: a flock that actually moves needs to be able to turn
+ * round and to put its head in the grass.
+ */
+export function buildGrazingSheep(seed: number, faceRight: boolean, grazing: boolean): Sprite {
+  const rng = mulberry32(seed);
+  const w = 10 + Math.round(rng() * 2);
+  return makeSprite(18, 16, 9, 12, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(1, 1, 12), PAL.shadowSoft);
+    rect(ctx, -4, -3, 1, 3, PAL.ink);
+    rect(ctx, 2, -3, 1, 3, PAL.ink);
+    blob(ctx, 0, -9, [w - 3, w, w + 1, w, w - 2], '#f4efe6');
+    blob(ctx, -1, -9, [4, 5], '#ffffff');
+    if (grazing) {
+      rect(ctx, 4, -5, 3, 3, '#4c4658');
+      rect(ctx, 4, -6, 2, 1, '#4c4658');
+    } else {
+      rect(ctx, 5, -9, 3, 3, '#4c4658');
+    }
+  });
+}
+
+/** A fish clearing the water, tilted by whether it is still rising. */
+export function drawFishJump(ctx: Ctx, x: number, y: number, vy: number): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const tilt = vy < 0 ? -1 : 1;
+  ctx.fillStyle = FUR.fish;
+  ctx.fillRect(px - 2, py, 4, 2);
+  ctx.fillStyle = PAL.stoneLight;
+  ctx.fillRect(px - 1, py, 2, 1);
+  ctx.fillStyle = FUR.fishDark;
+  ctx.fillRect(px - 4, py + tilt, 2, 1);
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px + 1, py, 1, 1);
+}
+
+/**
+ * The ring a jump leaves behind: a dozen pixels on an isometric ellipse, so it
+ * lies down on the water the way a tile does.
+ */
+export function drawRipple(ctx: Ctx, x: number, y: number, r: number, alpha: number): void {
+  if (alpha <= 0.02 || r <= 0) return;
+  const prev = ctx.globalAlpha;
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = PAL.waterFoam;
+  const n = 10 + Math.round(r);
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    ctx.fillRect(Math.round(x + Math.cos(a) * r), Math.round(y + Math.sin(a) * r * 0.5), 1, 1);
+  }
+  ctx.globalAlpha = prev;
+}
