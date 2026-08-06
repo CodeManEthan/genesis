@@ -66,6 +66,10 @@ import {
   buildQuarryBlocks,
   buildReeds,
   buildRock,
+  /* ---- ruins (additive) ---- */
+  buildRubble,
+  buildRuinWall,
+  /* ---- end ruins (additive) ---- */
   buildSheep,
   buildShed,
   buildSignpost,
@@ -113,6 +117,9 @@ import {
   type LakeSpec,
   type PropSpec,
   type RoadSpec,
+  /* ---- ruins (additive) ---- */
+  type RuinSpec,
+  /* ---- end ruins (additive) ---- */
   type SiteSpec,
   type TreeSpec,
   type Vec2,
@@ -381,6 +388,11 @@ interface RoadGeo {
 const R_WOOD = 0;
 const R_STUMP = 1;
 const R_PROP = 2;
+/* ---- ruins (additive) ---- */
+/** Appended, never renumbered: a ruin is the last thing painted at equal depth
+ * because it is the only static that is bigger than everything around it. */
+const R_RUIN = 3;
+/* ---- end ruins (additive) ---- */
 
 /** One sprite that lives on the scenery layer. */
 interface VegItem {
@@ -508,6 +520,15 @@ export interface GenesisScene {
   day: DayInfo;
   /** Flat colour under the woodland pattern, seasoned to match it. */
   beyond: string;
+  /* ---- ruins (additive) ------------------------------------------------- */
+  /**
+   * Yesterday's ghost, or null. Not part of the map — see ghost.ts — so it is
+   * handed to the bake by the one caller that knows which seed came before, and
+   * it is baked with the other statics because, like every ruin, it is the same
+   * at one minute past midnight as it is at ten to.
+   */
+  ghost: RuinSpec | null;
+  /* ---- end ruins (additive) --------------------------------------------- */
 }
 
 export interface GView {
@@ -850,9 +871,15 @@ function syncRoads(scene: GenesisScene, snap: WorldSnapshot): void {
  *   ground tint and the leaf pools from here and nowhere else; the day type is
  *   kept on the scene for the overlays and the sky. Defaults to an ordinary
  *   summer day, which is the world exactly as it was before rare days existed.
+ * @param ghost Yesterday's ruin, from `ghostFor(map, prevSeed)` — additive, and
+ *   null for every caller that does not know (or care) what came before.
  */
-export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): GenesisScene {
-  const steps = buildGenesisSceneSteps(map, day);
+export function buildGenesisScene(
+  map: GenesisMap,
+  day: DayInfo = PLAIN_DAY,
+  ghost: RuinSpec | null = null
+): GenesisScene {
+  const steps = buildGenesisSceneSteps(map, day, ghost);
   for (;;) {
     const r = steps.next();
     if (r.done) return r.value;
@@ -877,7 +904,8 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
  */
 export function* buildGenesisSceneSteps(
   map: GenesisMap,
-  day: DayInfo = PLAIN_DAY
+  day: DayInfo = PLAIN_DAY,
+  ghost: RuinSpec | null = null
 ): Generator<void, GenesisScene, void> {
   const B = map.bounds;
   const x0 = B.u0 * (TW / 2);
@@ -1079,6 +1107,9 @@ export function* buildGenesisSceneSteps(
     relight: 0,
     day,
     beyond: seasonGround('#3f7f66', day.season),
+    /* ---- ruins (additive) ---- */
+    ghost,
+    /* ---- end ruins (additive) ---- */
   };
   scene.veg = yield* buildVeg(scene, W, H);
   yield;
@@ -1187,6 +1218,23 @@ function* buildVeg(
       pi++;
     }
   }
+
+  /* ---- ruins (additive) -------------------------------------------------- */
+  // Ruins are the easiest statics in the valley: they were here before the
+  // first house and they will be here after the last lamp, so they go on at
+  // build time and are never touched again. No slot, no reconcile, no patch —
+  // just an item that is on from the moment the layer exists. The ghost joins
+  // them on exactly the same terms; the only thing that makes it special is
+  // where its shape came from.
+  {
+    const ruins = scene.map.ruins ?? [];
+    const all = scene.ghost ? ruins.concat([scene.ghost]) : ruins;
+    for (const r of all) {
+      add(ruinSprite(scene, r), r.gx, r.gy, R_RUIN, on.length);
+      on.push(true);
+    }
+  }
+  /* ---- end ruins (additive) ---------------------------------------------- */
 
   yield;
   // Sorted by depth, then by the rank the old per-frame pass implied, then by
@@ -1393,6 +1441,39 @@ function propSprite(
     }
   }
 }
+
+/* ---- ruins (additive) ---------------------------------------------------- */
+
+/**
+ * How much of the old wall height a ruin still has standing.
+ *
+ * A wall corner keeps about a third of one — four courses, which is what is
+ * left when a building has been a quarry for its neighbours. A tower stub keeps
+ * a good deal more, because the bottom of a round tower is the part nobody can
+ * get the stones out of. The ghost is pinned at ~40%, whatever it used to be:
+ * yesterday's landmark is meant to be recognisable by its FOOTPRINT and its
+ * silhouette, not by being the tallest thing on the moor.
+ */
+const ruinStanding = (r: RuinSpec): number =>
+  r.id === 'ghost' ? 0.4 : r.kind === 'tower' ? 0.38 : 0.55;
+
+function ruinSprite(scene: GenesisScene, r: RuinSpec): Sprite {
+  const key = `ru:${r.kind}:${r.w}:${r.floors}:${r.material ?? 't'}:${r.seed}`;
+  return cached(scene, key, () =>
+    r.kind === 'rubble'
+      ? buildRubble(r.seed, r.w)
+      : buildRuinWall({
+          kind: r.kind,
+          w: r.w,
+          floors: r.floors,
+          standing: ruinStanding(r),
+          material: r.material,
+          seed: r.seed,
+        })
+  );
+}
+
+/* ---- end ruins (additive) ------------------------------------------------ */
 
 function cached(scene: GenesisScene, key: string, make: () => Sprite): Sprite {
   const hit = scene.extra.get(key);

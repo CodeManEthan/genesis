@@ -1958,3 +1958,322 @@ export function drawRipple(ctx: Ctx, x: number, y: number, r: number, alpha: num
   }
   ctx.globalAlpha = prev;
 }
+
+/* ========================================================================== */
+/*  ruins (additive)                                                          */
+/* ========================================================================== */
+
+/**
+ * Old stone, mossy, half swallowed.
+ *
+ * Genesis-only, and purely additive: the vale never asks for any of it. Two
+ * builders and one shared spill of loose stone, all of them working in the same
+ * face parameterisation `buildStructure` uses, so a ruin sits on the ground the
+ * same way a house does and its footprint means the same thing.
+ *
+ * The whole trick is the top edge. A wall that stops at a flat height reads as
+ * an unfinished building — which the valley is already full of — so every wall
+ * below is laid course by course, and each course is a little shorter than the
+ * one under it by an amount the seed jitters. What is left is ragged, and
+ * ragged is the entire difference between a ruin and a building site.
+ */
+
+/**
+ * Wall colours for stone that has been out in the weather for a century.
+ *
+ * Deliberately only lightly greened: moss goes on as *accents* — crowns, joints
+ * and the base — because a wall mixed all the way to moss is the same colour as
+ * the turf it is standing in, and the whole thing turns into one green pancake
+ * at any zoom below three. The two faces are held a long way apart in value for
+ * the same reason a house's are: that contrast is the silhouette.
+ */
+function ruinTones(material: BuildMaterial | undefined): { l: string; r: string } {
+  // A timber building leaves its stone footings and its chimney stack behind,
+  // so even a timber ruin is a stone ruin — just a warmer, poorer one.
+  const stone = material === 'stone';
+  return {
+    l: mix(stone ? PAL.masonry : PAL.stoneLight, PAL.moss, 0.1),
+    r: shade(mix(stone ? PAL.masonryShade : PAL.stoneDark, PAL.moss, 0.16), -0.12),
+  };
+}
+
+/** The ground a ruin stands on: turf gone back over an old floor. */
+function ruinGround(ctx: Ctx, W: number, rng: () => number): void {
+  poly(ctx, diamond(1, 2, W + 10), PAL.shadowSoft);
+  poly(ctx, diamond(0, 1, W + 6), mix(PAL.moss, PAL.tillDark, 0.42));
+  poly(ctx, diamond(0, 0, W + 1), shade(PAL.moss, -0.1));
+  // a few flags of the old floor still showing through the turf
+  for (let i = 0; i < 4; i++) {
+    const a = rng() * Math.PI * 2;
+    const r = rng() * (W * 0.34);
+    poly(
+      ctx,
+      diamond(Math.cos(a) * r, (Math.sin(a) * r) / 2, 3 + rng() * 4),
+      mix(PAL.stoneDark, PAL.moss, 0.3)
+    );
+  }
+}
+
+/** The plinth: two courses of footing all the way round, still square. */
+function ruinPlinth(ctx: Ctx, W: number, l: string, r: string): void {
+  // The floor inside the walls is in their shadow, and a good step darker than
+  // they are, so a wall standing on it has something to stand against.
+  poly(ctx, diamond(0, -3, W), shade(l, -0.2));
+  poly(ctx, qL(W, 0, 1, 0, 3), l);
+  poly(ctx, qR(W, 0, 1, 0, 3), r);
+  poly(ctx, qL(W, 0, 1, 1.4, 1.9), shade(l, -0.22));
+  poly(ctx, qR(W, 0, 1, 1.4, 1.9), shade(r, -0.22));
+}
+
+/** Loose stone spilled off a wall, plus the nettles that always follow it. */
+function ruinStones(
+  ctx: Ctx,
+  rng: () => number,
+  W: number,
+  n: number,
+  t: { l: string; r: string }
+): void {
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2;
+    const rad = W * (0.24 + rng() * 0.34);
+    const x = Math.cos(a) * rad;
+    const y = (Math.sin(a) * rad) / 2;
+    const s = 2 + Math.floor(rng() * 3);
+    rect(ctx, x - s / 2, y - s / 2 - 1, s, s * 0.7 + 1, rng() < 0.5 ? t.l : t.r);
+    if (rng() < 0.4) rect(ctx, x - s / 2, y - s / 2 - 1, s - 1, 1, PAL.moss);
+  }
+  for (let i = 0; i < 5; i++) {
+    const a = rng() * Math.PI * 2;
+    const rad = W * (0.3 + rng() * 0.3);
+    const x = Math.round(Math.cos(a) * rad);
+    const y = Math.round((Math.sin(a) * rad) / 2);
+    const h = 3 + Math.floor(rng() * 4);
+    rect(ctx, x, y - h, 1, h, PAL.leafDark);
+    if (rng() < 0.4) rect(ctx, x - 1, y - h - 1, 3, 1, PAL.moss);
+  }
+}
+
+/** Moss on a course that has been open to the sky for a long time. */
+function ruinCrown(ctx: Ctx, pts: Pt[], rng: () => number): void {
+  if (rng() < 0.45) return;
+  poly(ctx, pts, PAL.moss);
+}
+
+/**
+ * Dressed stone somebody has been quietly taking away for two hundred years,
+ * and the footing line it came off. The whole of a `rubble` ruin, and nothing
+ * that any other builder needs.
+ */
+export function buildRubble(seed: number, w = 32): Sprite {
+  const W = Math.max(16, Math.round(w / 4) * 4);
+  const rng = mulberry32(seed >>> 0);
+  const t = ruinTones(undefined);
+  return makeSprite(W + 26, W / 2 + 34, (W + 26) / 2, W / 2 + 20, (ctx) => {
+    ruinGround(ctx, W, rng);
+    // A footing that has lost most of its length: a run or two of low stone
+    // where the walls used to be, and nothing standing anywhere.
+    for (let side = 0; side < 2; side++) {
+      const q = side === 0 ? qL : qR;
+      const tone = side === 0 ? t.l : t.r;
+      const a = rng() * 0.4;
+      const b = 1 - rng() * 0.4;
+      if (b - a < 0.25) continue;
+      poly(ctx, q(W, a, b, 0, 2.2 + rng()), tone);
+      poly(ctx, q(W, a, b, 0, 0.7), shade(tone, -0.18));
+    }
+    ruinStones(ctx, rng, W, 9 + Math.floor(rng() * 5), t);
+  });
+}
+
+export interface RuinArt {
+  kind: 'corner' | 'tower' | 'rubble';
+  /** Footprint width in art px — what the building used to cover. */
+  w: number;
+  /** Storeys it used to have. */
+  floors: number;
+  /** How much of the old wall height is still up, 0..1. ~0.4 is a ruin. */
+  standing: number;
+  /** Absent === 'timber'; only changes the colour of the stone left behind. */
+  material?: BuildMaterial;
+  seed: number;
+}
+
+/**
+ * Broken wall corners and collapsed tower stubs.
+ *
+ * `corner` is two faces meeting at the front quoin, tallest where they meet and
+ * eaten away as they run out to either side. `tower` is a hollow drum with its
+ * rim notched through in two or three places — the bottom of something that was
+ * taller than anything else for a long way.
+ */
+export function buildRuinWall(spec: RuinArt): Sprite {
+  const W = Math.max(16, Math.round(spec.w / 4) * 4);
+  const rng = mulberry32(spec.seed >>> 0);
+  const t = ruinTones(spec.material);
+  const wallH = Math.max(1, spec.floors) * STORY;
+  // What the thing used to stand. A tower was never just its storeys — the
+  // shaft above them is the whole point of a tower — so it is measured the way
+  // `buildStructure` builds one, and 40% of a tower is a good deal more stone
+  // than 40% of a hall.
+  const oldH = spec.kind === 'tower' ? wallH * 1.5 + 16 : wallH;
+  // The floor is not decoration: below about sixteen pixels a wall stops
+  // reading as a wall at the fitted overview and turns into a stone platform.
+  const top = Math.max(16, Math.round(oldH * spec.standing));
+  const H = W / 2;
+
+  return makeSprite(W + 26, top + H + 44, (W + 26) / 2, top + H + 26, (ctx) => {
+    ruinGround(ctx, W, rng);
+    ruinPlinth(ctx, W, t.l, t.r);
+
+    if (spec.kind === 'tower') {
+      // The shaft goes on first, because in an isometric view the front corner
+      // of the building it stood in is nearer the eye than the middle of it.
+      ruinDrum(ctx, W, top, rng, t);
+      // A big footprint means a tower that belonged to something — a hall, a
+      // chapel, a mill house — so the ruin keeps a low ring of that building's
+      // walls around the shaft. It is what makes a ghost read as the ruin of
+      // yesterday's LANDMARK rather than as a generic stump on the moor.
+      if (W >= 40) ruinCornerWalls(ctx, W, 15, rng, t);
+      ruinStones(ctx, rng, W, 8 + Math.floor(rng() * 4), t);
+      return;
+    }
+
+    ruinCornerWalls(ctx, W, top, rng, t);
+    ruinStones(ctx, rng, W, 7 + Math.floor(rng() * 5), t);
+  });
+}
+
+/**
+ * Two wall faces meeting at the front quoin, tallest where they meet and eaten
+ * away as they run out to either side.
+ */
+function ruinCornerWalls(
+  ctx: Ctx,
+  W: number,
+  top: number,
+  rng: () => number,
+  t: { l: string; r: string }
+): void {
+  // The left face runs west corner -> front corner (t: 0 -> 1); the right face
+  // runs front corner -> east corner (t: 0 -> 1). So the shared quoin is t=1 on
+  // the left and t=0 on the right, and both walls taper away from it.
+  const CH = 2.2;
+  // Where each wall has already gone at ground level, and where it will have
+  // gone to by the time it reaches the top course.
+  const l0 = 0.02 + rng() * 0.14;
+  const l1 = 0.5 + rng() * 0.2;
+  const r0 = 0.86 - rng() * 0.14;
+  const r1 = 0.3 + rng() * 0.2;
+
+  for (let h = 3; h < top; h += CH) {
+    const f = (h - 3) / Math.max(1, top - 3);
+    const h1 = Math.min(top, h + CH);
+    const jl = (rng() - 0.5) * 0.1;
+    const jr = (rng() - 0.5) * 0.1;
+    const a = Math.min(0.94, l0 + (l1 - l0) * f + jl);
+    const b = Math.max(0.06, r0 + (r1 - r0) * f + jr);
+    poly(ctx, qL(W, a, 1, h, h1), t.l);
+    poly(ctx, qR(W, 0, b, h, h1), t.r);
+    // the joint under each course — the seam is what says "stone" at zoom 1
+    poly(ctx, qL(W, a, 1, h, h + 0.7), shade(t.l, -0.18));
+    poly(ctx, qR(W, 0, b, h, h + 0.7), shade(t.r, -0.18));
+    // and the weather gets in on top of whatever is left standing
+    if (h1 >= top - CH) {
+      ruinCrown(ctx, qL(W, a, 1, h1 - 0.9, h1), rng);
+      ruinCrown(ctx, qR(W, 0, b, h1 - 0.9, h1), rng);
+    }
+  }
+
+  // The quoin itself: corner stones are the last thing to come down, so they
+  // stand a course or two above everything either side of them.
+  const quoin = top + 2 + Math.round(rng() * 3);
+  for (let h = Math.max(3, top - CH); h < quoin; h += CH) {
+    const h1 = Math.min(quoin, h + CH);
+    poly(ctx, qL(W, 1 - 5 / W, 1, h, h1), t.l);
+    poly(ctx, qR(W, 0, 5 / W, h, h1), t.r);
+    poly(ctx, qL(W, 1 - 5 / W, 1, h, h + 0.7), shade(t.l, -0.2));
+    poly(ctx, qR(W, 0, 5 / W, h, h + 0.7), shade(t.r, -0.2));
+  }
+
+  // A window or a doorway, where the standing wall is tall enough to have had
+  // one. Nothing behind it but the inside of the far wall, in shadow.
+  if (top >= 11) {
+    const ot = 0.24 + rng() * 0.18;
+    poly(ctx, qR(W, ot, ot + 0.2, 3.5, Math.min(top - 2.5, 10.5)), shade(t.r, -0.5));
+    if (rng() < 0.6) {
+      const lt = 0.34 + rng() * 0.2;
+      poly(ctx, qL(W, lt, lt + 0.16, 4.5, Math.min(top - 2, 9.5)), shade(t.l, -0.5));
+    }
+  }
+}
+
+/** The tower stub: a hollow drum, rim notched through, standing on the plinth. */
+function ruinDrum(
+  ctx: Ctx,
+  W: number,
+  top: number,
+  rng: () => number,
+  t: { l: string; r: string }
+): void {
+  // Wide enough to read as a tower and not as a chimney, and capped so that a
+  // big footprint reads as a tower standing on a big base rather than as a
+  // ring of stone: a round tower is never as wide as the hall it belonged to.
+  const rx = Math.min(W * 0.46, 14);
+  const ry = rx / 2;
+  const cyBase = 1;
+  const cyTop = cyBase - top;
+  const inner = shade(t.r, -0.42);
+
+  /** Filled isometric ellipse — half as tall as it is wide, like a tile. */
+  const ell = (cy: number, r: number, color: string) => {
+    ctx.fillStyle = color;
+    const h = Math.max(1, Math.round(r / 2));
+    for (let i = -h; i <= h; i++) {
+      const k = Math.sqrt(Math.max(0, 1 - (i / h) ** 2));
+      const w = Math.round(r * k * 2);
+      if (w > 0) ctx.fillRect(Math.round(-w / 2), Math.round(cy + i), w, 1);
+    }
+  };
+
+  // the top of the drum, then the hollow inside it
+  ell(cyTop, rx, shade(t.l, 0.1));
+  ell(cyTop, Math.max(2, rx - 3.5), inner);
+
+  // The drum wall: the front arc of the top ellipse down to the front arc of
+  // the base, one pixel column at a time so the shading follows the curve.
+  for (let x = -Math.round(rx); x <= Math.round(rx); x++) {
+    const k = Math.sqrt(Math.max(0, 1 - (x / rx) ** 2));
+    const yT = cyTop + ry * k;
+    const yB = cyBase + ry * k;
+    if (yB <= yT) continue;
+    const lit = x < -rx * 0.15 ? shade(t.l, 0.06) : x < rx * 0.25 ? t.l : t.r;
+    rect(ctx, x, yT, 1, yB - yT, lit);
+    for (let y = Math.ceil(yT) + 3; y < yB; y += 3) rect(ctx, x, y, 1, 1, shade(lit, -0.2));
+  }
+
+  // Two or three bites out of the rim, taken right through the wall.
+  const bites = 2 + Math.floor(rng() * 2);
+  for (let i = 0; i < bites; i++) {
+    const x = Math.round((rng() - 0.5) * rx * 1.8);
+    const k = Math.sqrt(Math.max(0, 1 - (x / rx) ** 2));
+    const w = 2 + Math.floor(rng() * 4);
+    const d = 3 + Math.floor(rng() * 5);
+    rect(ctx, x - w / 2, cyTop + ry * k - 1, w, d, inner);
+  }
+
+  // moss down the shaded side, and a sapling out of the top
+  for (let i = 0; i < 5; i++) {
+    const x = Math.round((rng() - 0.5) * rx * 1.6);
+    const y = Math.round(cyBase - rng() * top * 0.7);
+    rect(ctx, x, y, 1 + Math.floor(rng() * 3), 1, PAL.moss);
+  }
+  if (rng() < 0.7) {
+    const x = Math.round((rng() - 0.5) * rx);
+    rect(ctx, x, cyTop - 5, 1, 5, PAL.leafDark);
+    blob(ctx, x, cyTop - 8, [3, 5, 4], PAL.leaf[0]);
+  }
+}
+
+/* ========================================================================== */
+/*  end ruins (additive)                                                      */
+/* ========================================================================== */

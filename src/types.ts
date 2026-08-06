@@ -280,6 +280,57 @@ export interface OutcropSpec {
   seed: number;
 }
 
+/* ============================ ruins (additive) ============================ */
+
+/**
+ * What is left of a wall.
+ *
+ *   corner   two faces of a rectangular building meeting at a quoin, standing
+ *            about four courses, everything above them gone.
+ *   tower    a round-ish stub — the bottom of something that was taller than
+ *            anything else for a long way.
+ *   rubble   no wall at all: a footing line under the moss and a spill of
+ *            dressed stone somebody has been quietly taking away for years.
+ */
+export type RuinKind = 'corner' | 'tower' | 'rubble';
+
+/**
+ * Overgrown remains, out in the wood or on the moor.
+ *
+ * RUINS ARE TERRAIN. Every field is a pure function of the seed and is
+ * byte-identical at 0.25x and at 4x — they are drawn from a derived substream
+ * (`mulberry32(seed ^ salt)`) that never touches gen.ts's main sequence. A day
+ * neither builds them nor pulls them down; the only thing the timeline has to
+ * say about one is that the new road went past it.
+ *
+ * THE GHOST is the one exception, and it is deliberately not in `GenesisMap`:
+ * see `ghostFor()` in ghost.ts. It is a RuinSpec like any other, but its shape
+ * comes from YESTERDAY'S seed, so it cannot be a pure function of this one.
+ */
+export interface RuinSpec {
+  id: string; // "ru0"; the ghost is always "ghost"
+  gx: number;
+  gy: number;
+  seed: number;
+  kind: RuinKind;
+  /** Footprint width in art px, multiple of 4 — what the thing used to be. */
+  w: number;
+  /** Storeys it once had. Nothing like that many are still standing. */
+  floors: 1 | 2 | 3;
+  /** The ground it stands in — 'forest' | 'moor' | 'meadow'. */
+  biome: Biome;
+  /** Ledger-ready name for the place: "the fir wood", "the high moor". */
+  where: string;
+  /** The ghost only: the seed whose valley this is the echo of. */
+  ghostOf?: number;
+  /** The ghost only: the landmark role its silhouette is quoting. */
+  role?: StructureRole;
+  /** The ghost only: was that landmark built of stone? */
+  material?: BuildMaterial;
+}
+
+/* ========================== end ruins (additive) ========================== */
+
 export interface GenesisMap {
   version: 1;
   seed: number;
@@ -305,6 +356,11 @@ export interface GenesisMap {
   /** 0..2 buried chests. Terrain: identical at every pace scale. Optional so
    * hand-written fixtures predating the feature still typecheck. */
   chests?: ChestSpec[];
+  /* ---- ruins (additive) ------------------------------------------------- */
+  /** 0..2 sets of overgrown remains. Terrain: identical at every pace scale.
+   * Optional so hand-written fixtures predating the feature still typecheck. */
+  ruins?: RuinSpec[];
+  /* ---- end ruins (additive) --------------------------------------------- */
   valleyName: string;
 }
 

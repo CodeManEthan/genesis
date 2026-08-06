@@ -20,7 +20,17 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { TH, TW, hashSeed, type GenesisMap, type Timeline, type WorldSnapshot } from './types';
+import {
+  TH,
+  TW,
+  hashSeed,
+  type GenesisMap,
+  /* ---- ruins (additive) ---- */
+  type RuinSpec,
+  /* ---- end ruins (additive) ---- */
+  type Timeline,
+  type WorldSnapshot,
+} from './types';
 import { dayInfo } from './daytype.ts';
 import {
   buildGenesisScene,
@@ -69,6 +79,9 @@ export interface World {
  *                          isolate a rendering bug from a generation bug.
  * ------------------------------------------------------------------------- */
 import { generateMap } from './gen';
+/* ---- ruins (additive) ---- */
+import { ghostFor } from './ghost';
+/* ---- end ruins (additive) ---- */
 import { advance, buildTimeline, emptySnapshot, snapshotAt } from './timeline';
 
 const USE_GENERATED = true;
@@ -197,6 +210,31 @@ function monthOfSeed(seed: number): number | null {
 
 /** What kind of day this seed is, and what time of year. */
 const dayFor = (seed: number) => dayInfo(seed, monthOfSeed(seed));
+
+/* ---- ruins (additive) ----------------------------------------------------
+ * Yesterday's seed, which is the whole of what the ghost needs.
+ *
+ * Same date-detection trick as `monthOfSeed` above, and for the same reason:
+ * this file is the only place that knows whether a seed came out of a calendar.
+ * A date-derived seed's predecessor is the day before it; a browsed seed's is
+ * simply seed - 1, which is exactly what ‹ steps back to. The window covers
+ * yesterday, today and tomorrow, so the world waiting on the other side of
+ * midnight gets today as ITS yesterday — the ghost of tomorrow's valley is the
+ * landmark of the one the visitor has just watched being built.
+ */
+function prevDaySeed(seed: number): number {
+  const now = new Date();
+  for (let k = -1; k <= 1; k++) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + k, 12);
+    if (daySeed(d) !== seed) continue;
+    return daySeed(new Date(now.getFullYear(), now.getMonth(), now.getDate() + k - 1, 12));
+  }
+  return stepSeed(seed, -1);
+}
+
+/** The ruin today's valley inherited, or null. Pure; see ghost.ts. */
+const ghostOf = (map: GenesisMap, seed: number) => ghostFor(map, prevDaySeed(seed));
+/* ---- end ruins (additive) ------------------------------------------------ */
 
 /** Tomorrow's seed, for pre-generating the world the clock is about to reach. */
 function nextDaySeed(): number {
@@ -401,7 +439,11 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       setTDisp(t0);
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
-      sceneRef.current = buildGenesisScene(world.map, dayFor(seed0));
+      sceneRef.current = buildGenesisScene(
+        world.map,
+        dayFor(seed0),
+        ghostOf(world.map, seed0)
+      );
       ambRef.current = makeAmbient(pace0);
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
       logSigRef.current = logSig(snapRef.current.log);
@@ -559,6 +601,12 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pace: number;
       map: GenesisMap | null;
       world: World | null;
+      /** Yesterday's ghost for the seed the clock is heading for — and
+       * `prevDaySeed(tomorrow)` is TODAY, so tomorrow's ghost is the landmark
+       * of the valley on screen right now. `undefined` = not worked out yet;
+       * `null` = worked out, and there is none. It gets a step of its own
+       * because working it out means generating the previous day's map. */
+      ghost?: RuinSpec | null;
       steps: Generator<void, GenesisScene, void> | null;
       scene: GenesisScene | null;
     }
@@ -574,7 +622,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       if (pending.scene) return;
       if (!pending.map) pending.map = loadMap(s, pending.pace);
       else if (!pending.world) pending.world = worldFor(pending.map);
-      else if (!pending.steps) pending.steps = buildGenesisSceneSteps(pending.map, dayFor(s));
+      else if (pending.ghost === undefined) pending.ghost = ghostOf(pending.map, s);
+      else if (!pending.steps)
+        pending.steps = buildGenesisSceneSteps(pending.map, dayFor(s), pending.ghost);
       else {
         const r = pending.steps.next();
         if (r.done) pending.scene = r.value;
@@ -600,7 +650,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pending = null;
       world = loadWorld(s, p);
       worldRef.current = world;
-      scene = buildGenesisScene(world.map, dayFor(s));
+      scene = buildGenesisScene(world.map, dayFor(s), ghostOf(world.map, s));
       sceneRef.current = scene;
       setAmbientPace(amb, p);
       snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
