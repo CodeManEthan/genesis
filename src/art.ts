@@ -2246,6 +2246,83 @@ export function buildRowboat(dir: number, seed = 0): Sprite {
   });
 }
 
+/**
+ * A ferry punt: a flat-bottomed box with a rubbing strake and a raked ramp at
+ * each end, so it reads the same going over as coming back and there is a plank
+ * to walk on and off at either landing.
+ *
+ * Deliberately NOT a rowboat. A rowboat is a curve with a bow; a punt is a
+ * rectangle. At this size that is the whole difference between "somebody's
+ * boat" and "the crossing" — the eye reads the flat ends as a thing that
+ * carries, and it is what stops the ferry looking like a fourth moored dinghy.
+ *
+ * The anchor is the waterline amidships, exactly as `buildRowboat`, and nothing
+ * here may depend on the clock: Genesis bakes one of these per quantised
+ * heading and draws the punter and the passengers over it per frame.
+ */
+export function buildPunt(dir: number, seed = 0): Sprite {
+  const at = bearing(dir);
+  const rng = mulberry32((seed ^ 0x2fe11b) >>> 0);
+  // Bare timber rather than a painted hull — a punt is a working platform, not
+  // somebody's boat — but pitched light on purpose, because the thing has to
+  // read against the river's own blues from the fitted overview.
+  const deck = rng() < 0.5 ? '#c9a06a' : '#c09466';
+  const L = 0.78; // half length, u/v — a good deal beamier than a rowboat
+  const HW = 0.34; // half beam
+  const LIFT = 3;
+  // Flat both ends, with the ramps raked out fore and aft.
+  const shape: Pt[] = [
+    [L, HW * 0.62],
+    [L * 0.78, HW],
+    [-L * 0.78, HW],
+    [-L, HW * 0.62],
+    [-L, -HW * 0.62],
+    [-L * 0.78, -HW],
+    [L * 0.78, -HW],
+    [L, -HW * 0.62],
+  ];
+  const box = spriteBox(shape.map(([a, b]) => at(a, b)), 6, LIFT + 7, 8);
+  return makeSprite(box.w, box.h, box.ox, box.oy, (ctx) => {
+    const P = (a: number, b: number, dy = 0): Pt => {
+      const p = at(a, b);
+      return [p[0], p[1] + dy];
+    };
+    const ring = (dy: number, k = 1) => shape.map(([a, b]) => P(a * k, b * k, dy));
+    poly(ctx, ring(1), PAL.shadow);
+    poly(ctx, ring(0), shade(deck, -0.42)); // the wetted sides
+    poly(ctx, ring(-LIFT), shade(deck, -0.24)); // the strake
+    poly(ctx, ring(-LIFT - 1, 0.92), shade(deck, 0.1)); // the deck itself
+    // Deck boards, athwartships — a punt is planked across, not along.
+    for (let a = -L * 0.72; a < L * 0.72; a += 0.2) {
+      poly(
+        ctx,
+        [
+          P(a, -HW * 0.84, -LIFT - 1),
+          P(a + 0.1, -HW * 0.84, -LIFT - 1),
+          P(a + 0.1, HW * 0.84, -LIFT - 1),
+          P(a, HW * 0.84, -LIFT - 1),
+        ],
+        rng() < 0.5 ? shade(deck, 0.22) : shade(deck, -0.04)
+      );
+    }
+    // A low rail down each side, so nobody's cart goes over the edge.
+    for (const side of [-1, 1]) {
+      const a = P(L * 0.7, side * HW * 0.94, -LIFT - 1);
+      const b = P(-L * 0.7, side * HW * 0.94, -LIFT - 1);
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const n = Math.max(2, Math.ceil(Math.hypot(dx, dy)));
+      for (let i = 0; i <= n; i++) {
+        rect(ctx, a[0] + (dx * i) / n, a[1] + (dy * i) / n - 2, 1, 2, PAL.woodDark);
+      }
+      for (const k of [0.62, -0.62]) {
+        const p = P(k * L, side * HW * 0.94, -LIFT - 1);
+        rect(ctx, p[0] - 1, p[1] - 4, 2, 4, PAL.wood);
+      }
+    }
+  });
+}
+
 /* ------------------------------- dynamics ------------------------------- */
 
 /**
@@ -2635,6 +2712,106 @@ export function drawFishJump(ctx: Ctx, x: number, y: number, vy: number): void {
   ctx.fillStyle = PAL.ink;
   ctx.fillRect(px + 1, py, 1, 1);
 }
+
+/* ---------------------------- boats underway ------------------------------ *
+ * The two figures that make a boat a boat going somewhere rather than a boat.
+ * Both are drawn per frame over an already-baked hull, at the hull's own
+ * waterline anchor, so nothing here enters a sprite cache and a heading may
+ * change as often as it likes without costing a bake.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Somebody rowing: a seated body, and two oars sweeping through a stroke.
+ *
+ * `dir` is the boat's heading in u/v radians and `phase` the stroke, 0..2pi.
+ * The oars are drawn in the boat's own frame — out to each side, swinging from
+ * a catch forward to a finish aft — so they read correctly on every bearing
+ * without a second projection.
+ */
+export function drawRower(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  dir: number,
+  phase: number,
+  color: string
+): void {
+  const at = bearing(dir);
+  const px = Math.round(x);
+  const py = Math.round(y);
+  // -1 at the catch (blades forward), +1 at the finish (blades aft).
+  const sw = Math.sin(phase);
+  ctx.fillStyle = PAL.woodLight;
+  for (const side of [-1, 1]) {
+    const a = at(-0.06, side * 0.2);
+    const b = at(-0.06 - sw * 0.42, side * 0.62);
+    const dx = b[0] - a[0];
+    const dy = b[1] - a[1];
+    const n = Math.max(2, Math.ceil(Math.hypot(dx, dy)));
+    for (let i = 0; i <= n; i++) {
+      ctx.fillRect(px + Math.round(a[0] + (dx * i) / n), py + Math.round(a[1] + (dy * i) / n) - 4, 1, 1);
+    }
+  }
+  // The body, leaning into the stroke. Small: a rower is bent over, and a full
+  // 14px villager standing in a 10px boat is a giant.
+  const seat = at(-0.06, 0);
+  const bx = px + Math.round(seat[0]);
+  const by = py + Math.round(seat[1]) - 5;
+  const lean = sw > 0.3 ? 1 : sw < -0.3 ? -1 : 0;
+  ctx.fillStyle = color;
+  ctx.fillRect(bx - 2, by - 4 + lean, 4, 5);
+  ctx.fillStyle = shade(color, -0.3);
+  ctx.fillRect(bx - 2, by - 4 + lean, 1, 5);
+  ctx.fillStyle = shade(color, 0.26);
+  ctx.fillRect(bx - 1, by - 5 + lean, 2, 1);
+}
+
+/**
+ * The ferryman: standing at the stern, working a pole. `phase` is the push,
+ * 0..2pi; the pole goes down into the water ahead and is walked back.
+ */
+export function drawPunter(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  dir: number,
+  phase: number,
+  color: string
+): void {
+  const at = bearing(dir);
+  const push = Math.sin(phase);
+  const stern = at(-0.5, 0);
+  const px = Math.round(x + stern[0]);
+  const py = Math.round(y + stern[1]) - 4;
+  // The pole: from the hands, down and forward into the water alongside.
+  const hand = at(-0.42, 0.12);
+  const foot = at(-0.42 + push * 0.6 + 0.35, 0.34);
+  ctx.fillStyle = PAL.woodLight;
+  {
+    const ax = Math.round(x + hand[0]);
+    const ay = Math.round(y + hand[1]) - 11;
+    const bx2 = Math.round(x + foot[0]);
+    const by2 = Math.round(y + foot[1]) + 1;
+    const dx = bx2 - ax;
+    const dy = by2 - ay;
+    const n = Math.max(2, Math.ceil(Math.hypot(dx, dy)));
+    for (let i = 0; i <= n; i++) {
+      ctx.fillRect(ax + Math.round((dx * i) / n), ay + Math.round((dy * i) / n), 1, 1);
+    }
+  }
+  const bend = push > 0.4 ? 1 : 0;
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px - 2, py - 3, 2, 3);
+  ctx.fillRect(px + 1, py - 3, 2, 3);
+  ctx.fillStyle = color;
+  ctx.fillRect(px - 2, py - 9 + bend, 5, 6);
+  ctx.fillStyle = shade(color, -0.28);
+  ctx.fillRect(px - 2, py - 9 + bend, 1, 6);
+  ctx.fillStyle = shade(color, 0.26);
+  ctx.fillRect(px - 1, py - 9 + bend, 1, 3);
+}
+
+/* -------------------------- end boats underway ---------------------------- */
 
 /**
  * The ring a jump leaves behind: a dozen pixels on an isometric ellipse, so it

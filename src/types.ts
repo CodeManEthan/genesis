@@ -281,6 +281,66 @@ export interface FordSpec {
   span: number;
 }
 
+/* ============================= the ferry ================================= */
+
+/**
+ * A ferry crossing: two small landing stages facing each other across the
+ * river, and a punt that shuttles between them all day.
+ *
+ * WHY IT IS NOT A BridgeSpec OR A FordSpec. Those two are the crossing pass:
+ * every road x river intersection carries exactly one of them, and which one is
+ * a pure function of `RoadSpec.kind` (see FordSpec). That rule is what makes
+ * the crossing pass cost no randomness, and it is what the harness's check (c)
+ * enforces — `crossings === bridges + fords`, nothing left over.
+ *
+ * A ferry carries no road. It is a crossing for PEOPLE, put in exactly where
+ * the road network declined to go: a reach of river a long way from the nearest
+ * bridge or ford, with a town near enough one bank to bother running it. So it
+ * sits beside the crossing pass rather than inside it, and check (c) is
+ * untouched — there is no road here for a ferry to fail to carry.
+ *
+ * A FERRY IS TERRAIN, on the same terms as chests, ruins, lakes and stones:
+ * every field is a pure function of the seed, drawn from a dedicated substream
+ * (`mulberry32(seed ^ salt)`) that never touches gen.ts's main sequence, and
+ * measured against the FULL town roster and the FULL crossing roster. It is
+ * byte-identical at 0.25x and at 4x. A day neither builds it nor takes it away.
+ *
+ * At most one to a valley. The punt, the ferryman and whoever is riding are
+ * ambient theatre and carry no consequences — the only thing the timeline has
+ * to say about a ferry is one line in the ledger, on the same clock as the town
+ * that runs it.
+ */
+export interface FerrySpec {
+  id: string; // "fy0"
+  seed: number;
+  /** Midpoint of the crossing, out on the river's centreline. Tile space. */
+  gx: number;
+  gy: number;
+  /** Landward root of the near-bank landing stage. Tile space, as a jetty's. */
+  ax: number;
+  ay: number;
+  /** …and of the one on the far bank. */
+  bx: number;
+  by: number;
+  /**
+   * Bearing from the A root toward the B root, in SCREEN-ALIGNED u/v radians —
+   * the river's own normal at the crossing. The A stage decks out along it, the
+   * B stage along `dir + PI`, and the punt runs the line between the two.
+   */
+  dir: number;
+  /** Root-to-root distance in u/v units. */
+  span: number;
+  /** Deck length of each landing stage, u/v — root to head, as PropSpec.len. */
+  len: number;
+  /** Roster index of the town that runs it, over the FULL roster. */
+  siteIndex: number;
+  /** `s${siteIndex}`. That town may not be founded at a small pace scale, in
+   * which case the crossing is simply there and nobody writes about it. */
+  siteId: string;
+}
+
+/* =========================== end the ferry =============================== */
+
 /* --------------------------- buried treasure ----------------------------- */
 
 /**
@@ -493,6 +553,13 @@ export interface GenesisMap {
    * scale. Optional so hand-written fixtures predating fords still typecheck;
    * absent means the same as empty. */
   fords?: FordSpec[];
+  /* ---- the ferry (additive) --------------------------------------------- */
+  /** The valley's one ferry crossing, or null where the geography never asked
+   * for one. Terrain: identical at every pace scale, and deliberately NOT part
+   * of the bridge/ford crossing pass — see FerrySpec. Optional so hand-written
+   * fixtures predating the feature still typecheck; absent means none. */
+  ferry?: FerrySpec | null;
+  /* ---- end the ferry (additive) ----------------------------------------- */
   /** The wild forest at t=0. Timeline events fell some of these. */
   trees: TreeSpec[];
   /** Wild non-tree scenery, present from t=0. */

@@ -83,6 +83,11 @@ import {
   buildLumber,
   buildMarketStall,
   buildNameBoard,
+  /* ---- boats underway + the ferry (additive) ---- */
+  buildPunt,
+  drawPunter,
+  drawRower,
+  /* ---- end boats underway + the ferry (additive) ---- */
   buildQuarryBlocks,
   buildReeds,
   buildRock,
@@ -162,6 +167,9 @@ import {
   type BuildingSpec,
   type ChestSpec,
   type ChestState,
+  /* ---- the ferry (additive) ---- */
+  type FerrySpec,
+  /* ---- end the ferry (additive) ---- */
   type GenesisMap,
   type LakeSpec,
   type PropSpec,
@@ -800,6 +808,16 @@ export interface GenesisScene {
   boats: Boat[];
   /** Every pier, with the point on its deck the crowd can stand on. */
   jetties: JettySpot[];
+  /* ---- boats underway + the ferry (additive) ---------------------------- */
+  /**
+   * The valley's ferry crossing, rigged for the renderer, or null. A pure
+   * function of the map, decided once at bake time on exactly the same terms
+   * as `stalls`, `market` and `fire` below — the existing precedent for "a
+   * presentation fact the day cannot change". Where the boats GO is not here:
+   * that is the ambient layer, and it hangs off its own WeakMap.
+   */
+  ferry: FerryRig | null;
+  /* ---- end boats underway + the ferry (additive) ------------------------ */
   /* ---- ruins (additive) ------------------------------------------------- */
   /**
    * Yesterday's ghost, or null. Not part of the map — see ghost.ts — so it is
@@ -897,6 +915,41 @@ export interface JettySpot {
    */
   depth: number;
 }
+
+/* ---- boats underway + the ferry (additive) ------------------------------- */
+
+/**
+ * The ferry crossing as the renderer wants it: two landing stages and the two
+ * plank heads the punt lies alongside.
+ *
+ * The map gives roots and a bearing; everything here is derived once, at bake
+ * time, on exactly the same terms as `jetties` above — and for the same reason.
+ * A landing is a baked sprite anchored at its LANDWARD root while its deck runs
+ * out over the water, so anything standing at the head has to borrow the deck's
+ * sort depth or the occlusion repair will paint the planks back over it.
+ */
+export interface FerryRig {
+  /** Landward roots, tile space, as PropSpec anchors. */
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+  /** Deck heads, tile space — where the punt comes alongside. */
+  hax: number;
+  hay: number;
+  hbx: number;
+  hby: number;
+  /** Bearing from the A root toward the B root, u/v radians. */
+  dir: number;
+  /** Deck length of each stage, u/v. */
+  len: number;
+  seed: number;
+  /** Sort depth for anything standing on each deck. See JettySpot. */
+  adepth: number;
+  bdepth: number;
+}
+
+/* ---- end boats underway + the ferry (additive) --------------------------- */
 
 export interface GView {
   /** World pixel at the top-left of the viewport. */
@@ -1538,6 +1591,42 @@ export function* buildGenesisSceneSteps(
   boats.sort((a, b) => (a.id ?? '').localeCompare(b.id ?? '') || a.seed - b.seed);
   jetties.sort((a, b) => a.id.localeCompare(b.id));
 
+  /* ---- the ferry (additive) --------------------------------------------- */
+  // The map states two roots and a bearing; the two deck heads and the two sort
+  // depths follow from them, and neither can change during a day.
+  const ferry = ((): FerryRig | null => {
+    const fy: FerrySpec | null | undefined = map.ferry;
+    if (!fy) return null;
+    const ca = Math.cos(fy.dir);
+    const sa = Math.sin(fy.dir);
+    // Three quarters of the way out along each deck: on the planks, not off the
+    // end — the same rule the jetty spots above use.
+    const head = (gx: number, gy: number, sgn: number): Vec2 => {
+      const k = fy.len * 0.78 * sgn;
+      const u = gx - gy + ca * k;
+      const v = gx + gy + sa * k;
+      return [(v + u) / 2, (v - u) / 2];
+    };
+    const [hax, hay] = head(fy.ax, fy.ay, 1);
+    const [hbx, hby] = head(fy.bx, fy.by, -1);
+    return {
+      ax: fy.ax,
+      ay: fy.ay,
+      bx: fy.bx,
+      by: fy.by,
+      hax,
+      hay,
+      hbx,
+      hby,
+      dir: fy.dir,
+      len: fy.len,
+      seed: fy.seed,
+      adepth: isoY(fy.ax, fy.ay) + 2,
+      bdepth: isoY(fy.bx, fy.by) + 2,
+    };
+  })();
+  /* ---- end the ferry (additive) ------------------------------------------ */
+
   // The endless woodland beyond the map is mostly conifer, so it only half
   // turns — but it has to turn, or the map sits in a summer frame all winter.
   const surround = buildForestPattern();
@@ -1573,6 +1662,9 @@ export function* buildGenesisSceneSteps(
     beyond: seasonGround('#3f7f66', day.season),
     boats,
     jetties,
+    /* ---- the ferry (additive) ---- */
+    ferry,
+    /* ---- end the ferry (additive) ---- */
     /* ---- ruins (additive) ---- */
     ghost,
     /* ---- end ruins (additive) ---- */
@@ -3203,6 +3295,7 @@ export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnaps
   amb.rng = mulberry32(4242);
   syncAmbient(scene, amb, snap);
   resetWildlife(scene, amb, snap); // WILDLIFE — same call site, same reproducibility
+  resetBoats(scene, snap); // BOATS UNDERWAY — likewise
 }
 
 /** Settle the crowd so a paused or reduced-motion visitor gets a lived-in world. */
@@ -3928,6 +4021,7 @@ export function renderGenesis(
   syncVeg(scene, snap);
   if (P) lap('veg');
   const wild = tickWildlife(scene, amb, snap, sky, clock); // WILDLIFE
+  const afloat = tickBoats(scene, snap, clock); // BOATS UNDERWAY
   if (P) lap('wild');
 
   // Whole world pixels, always: the buffer is drawn at 1 unit = 1 art pixel, so
@@ -4238,30 +4332,17 @@ export function renderGenesis(
    * an option in a world blitted at integer magnification, so the bob is a
    * rounded offset and the boat simply sits a pixel lower on half its cycle.
    *
+   * BOATS UNDERWAY took over this pass: some of these hulls are now somewhere
+   * other than where gen moored them, and two of them are a ferry. The rule
+   * has not changed — a moored boat is drawn exactly where and how it always
+   * was — only the source of the position. See the module at the foot of this
+   * file.
+   *
    * They go in ahead of `moversFrom` deliberately: they float on open water,
    * where there is nothing to occlude them, so they are the first thing the
    * repair pass should give up on.
    * ------------------------------------------------------------------------ */
-  for (const boat of scene.boats) {
-    if (boat.id !== null && !snap.props.has(boat.id)) continue;
-    const x = isoX(boat.gx, boat.gy);
-    const y = isoY(boat.gx, boat.gy);
-    if (!inView(x, y)) continue;
-    const sp = cached(scene, `bt:${Math.round((boat.dir * 180) / Math.PI)}:${boat.seed}`, () =>
-      buildRowboat(boat.dir, boat.seed)
-    );
-    const bob = Math.round(Math.sin(clock * 1.15 + boat.seed * 0.37) * 0.9);
-    const bx = Math.round(x - sp.ox);
-    const by = Math.round(y - sp.oy) + bob;
-    items.push({
-      depth: Math.max(y, boat.deck),
-      bx,
-      by,
-      bw: sp.c.width,
-      bh: sp.c.height,
-      draw: (c) => c.drawImage(sp.c, bx, by),
-    });
-  }
+  pushBoats(scene, afloat, snap, clock, items, wx0, wy0, wx1, wy1);
 
   // Everything from here on moves every frame. The occlusion repair below runs
   // over these first, so that if it ever hits its budget it is the scenery that
@@ -4409,6 +4490,9 @@ export function renderGenesis(
 
   // WILDLIFE — ground-dwellers, inside the repair pass with the rest of the crowd.
   pushWildlife(scene, wild, items, wx0, wy0, wx1, wy1);
+  // BOATS UNDERWAY — the ferry's passengers, on the same terms as the wildlife
+  // above: on the ground, after the crowd, inside the occlusion repair.
+  pushFerryFolk(scene, afloat, items, wx0, wy0, wx1, wy1);
   /* ---- the prospector (additive) ---- */
   // One more ground-dweller, on the same terms: inside the repair pass, so the
   // willow on the bank in front of him is painted back over his hat.
@@ -7088,3 +7172,826 @@ function pushProspector(
 }
 
 /* ---- end the prospector -------------------------------------------------- */
+
+/* ========================================================================== *
+ *                              BOATS UNDERWAY                                *
+ * -------------------------------------------------------------------------- *
+ * The boats stop being furniture.
+ *
+ * Two things happen on the water. A moored rowboat takes a trip now and then —
+ * a loop out from its pier and back on the river, or a slow drift across a lake
+ * — and, in the valleys that have one, the ferry punt shuttles between its two
+ * landings all day with whoever turned up to cross.
+ *
+ * This is the WILDLIFE pattern, deliberately and to the letter:
+ *
+ *  - State hangs off its own WeakMap keyed by the scene, so nothing in
+ *    `GenesisScene`, `Ambient` or the snapshot signature has to know it is
+ *    here. A new world means a new scene means new boats.
+ *  - All randomness comes off one dedicated mulberry32 stream seeded 4242, and
+ *    `resetBoats` re-seeds it from the same call site `resetAmbient` uses, so a
+ *    scrub backwards is as reproducible here as it is there. Like the rest of
+ *    the ambient layer this is performance only: nothing a boat does has a
+ *    consequence, so nothing here has to agree with the timeline.
+ *  - `dt` is the renderer's own clock, which stops dead when the world is
+ *    paused or the visitor asked for less motion — so a reduced-motion arrival
+ *    gets a frozen tableau for free: a punt halfway over with two people
+ *    standing on it, oars caught mid-stroke.
+ *
+ * WHERE A BOAT MAY GO is the whole difficulty, and it is answered once, off the
+ * map, in `UCache`:
+ *
+ *  - A lake boat drifts inside the lake's own analytic ellipse at a margin, the
+ *    way the ducks do — never against the resolved outline, which wobbles.
+ *  - A river boat rows along the river's CENTRELINE, which is by construction
+ *    the middle of the water, with at most a third of a tile of lateral offset
+ *    against a half-width of `riverWidth`. It cannot reach a bank.
+ *  - And it rows only inside an OPEN REACH: the stretches of river arclength
+ *    left over once every bridge, every ford, every pier, the ferry crossing
+ *    and any lake the river runs through have been cut out of it with a guard
+ *    either side. That is what keeps a boat from sliding under a bridge deck at
+ *    the wrong depth — there is no depth answer that reads right for a
+ *    ten-pixel boat against a three-stage bridge, so the boat never goes there.
+ *
+ * Depth follows the existing conventions exactly. A moving boat sorts on its
+ * own `isoY`; a boat lying at a pier or a landing borrows the deck's depth, as
+ * `JettySpot` and the fisherman already do, because the deck is a baked sprite
+ * anchored at its landward root and the occlusion repair is rect-and-depth.
+ * ========================================================================== */
+
+/** The boats' stream. Seeded once here and nowhere else — and deliberately not
+ * 4242 (the crowd) or 7777 (the wildlife): three independent streams, three
+ * distinct constants, so nobody can accidentally couple two of them. */
+const AFLOAT_SEED = 8121;
+
+/** How many boats may be away from their moorings at once. A valley has at
+ * most a handful of boats in it, and two moving at once is a working river;
+ * four is a regatta, and four times the per-frame cost. */
+const AFLOAT_MAX = 2;
+
+/** The hours a boat is out at all. Nobody rows in the dark. */
+const AFLOAT_FROM = 7.0;
+const AFLOAT_TO = 19.4;
+
+/** …and the ferry's, which is a job rather than an afternoon. */
+const FERRY_FROM = 6.2;
+const FERRY_TO = 21.0;
+
+/** Tiles either side of a bridge, a ford, a pier or the ferry that a rowing
+ * trip may not enter. Generous: the guard is measured along the centreline and
+ * a bridge deck is a good deal wider than its station. */
+const AFLOAT_GUARD = 3.2;
+
+/** A reach shorter than this is not worth rowing into. Tiles. */
+const AFLOAT_REACH_MIN = 5;
+
+/** Tiles per second. A boat is the slowest thing in the valley on purpose. */
+const ROW_SPEED = 0.3;
+const DRIFT_SPEED = 0.2;
+const PUNT_SPEED = 0.34;
+
+/** Radians per second the heading is allowed to swing. A boat that snaps round
+ * to face a new waypoint reads as a compass needle. */
+const TURN_RATE = 1.1;
+
+/** How many bearings a moving hull is baked at. A heading that varied freely
+ * would mint a sprite per degree per boat; sixteen is smooth enough at this
+ * size and bounds the cache at sixteen small canvases per hull. */
+const BOAT_BEARINGS = 16;
+
+/** Riders per ferry crossing, and how long the punt waits at a landing. */
+const RIDER_MAX = 2;
+const FERRY_WAIT = 11;
+/** Tiles inland of a landing that somebody appears from and walks away to. */
+const RIDER_WALK = 2.6;
+const RIDER_SPEED = 0.62;
+
+/* --------------------------------- state ---------------------------------- */
+
+/** One rowboat that sometimes goes somewhere. */
+interface UTrip {
+  /** Index into `scene.boats` — the boat this is the motion of. */
+  i: number;
+  /** 0 moored, 1 underway. */
+  st: 0 | 1;
+  gx: number;
+  gy: number;
+  /** Heading in u/v radians, as PropSpec.dir. */
+  dir: number;
+  /** Where gen moored it, and how it lies when it is home. A trip always ends
+   * exactly here, so a moored boat is pixel-identical to the one this feature
+   * found. */
+  hx: number;
+  hy: number;
+  hdir: number;
+  /** Waypoints still to visit, tile space. The last is always home. */
+  way: Vec2[];
+  /** Oar stroke, radians. */
+  stroke: number;
+  /** Seconds before another trip is even considered. */
+  wait: number;
+  /** The rower's coat. */
+  color: string;
+  /** Is this one on a lake? Lakes drift, rivers row. */
+  lake: boolean;
+}
+
+/** Somebody crossing on the ferry. */
+interface URider {
+  /** 0 walking down to the stage, 1 aboard, 2 walking away up the far bank. */
+  st: 0 | 1 | 2;
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  /** Where they stand on the punt, along and across it in u/v units. */
+  oa: number;
+  ob: number;
+  color: string;
+  phase: number;
+  face: boolean;
+}
+
+interface UFerry {
+  /** 0 loading at A, 1 crossing to B, 2 loading at B, 3 crossing back. */
+  st: 0 | 1 | 2 | 3;
+  /** 0 at the A head, 1 at the B head. */
+  k: number;
+  timer: number;
+  riders: URider[];
+  /** The punter's pole, radians. */
+  stroke: number;
+  color: string;
+}
+
+/** Everything derived from the MAP, which a scrub cannot change. Built once
+ * per scene and kept across every reset — the same contract as `WCache`. */
+interface UCache {
+  geo: RoadGeo | null;
+  /** Open reaches of river arclength, tiles, ascending. */
+  reaches: [number, number][];
+  /** Per boat, in `scene.boats` order: the lake it floats on, or null. */
+  lake: (LakeSpec | null)[];
+  /** Per boat: where it lies along the river in arclength, or -1 on a lake. */
+  at: number[];
+  /** Inland targets for the ferry's two banks, tile space. */
+  inA: Vec2 | null;
+  inB: Vec2 | null;
+}
+
+interface Underway {
+  ready: boolean;
+  rng: () => number;
+  clock: number;
+  cache: UCache;
+  trips: UTrip[];
+  ferry: UFerry | null;
+}
+
+const AFLOAT = new WeakMap<GenesisScene, Underway>();
+
+/* -------------------------------- geometry -------------------------------- */
+
+/** Is `p` inside the closed polygon `ring`? Tile space, ray casting. */
+function inPoly(p: Vec2, ring: Vec2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i];
+    const b = ring[j];
+    if (a[1] > p[1] !== b[1] > p[1]) {
+      const x = ((b[0] - a[0]) * (p[1] - a[1])) / (b[1] - a[1] || 1e-9) + a[0];
+      if (p[0] < x) inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Arclength of the point on `pts` nearest `p`. */
+function arcAt(pts: Vec2[], geo: RoadGeo, p: Vec2): number {
+  let best = Infinity;
+  let at = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const vx = b[0] - a[0];
+    const vy = b[1] - a[1];
+    const l2 = vx * vx + vy * vy || 1;
+    let t = ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / l2;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const dx = p[0] - (a[0] + vx * t);
+    const dy = p[1] - (a[1] + vy * t);
+    const d = dx * dx + dy * dy;
+    if (d < best) {
+      best = d;
+      at = geo.cum[i - 1] + Math.sqrt(l2) * t;
+    }
+  }
+  return at;
+}
+
+/** Heading in u/v radians from one tile-space point to another. */
+const uvDir = (from: Vec2, to: Vec2): number =>
+  Math.atan2(to[0] + to[1] - (from[0] + from[1]), to[0] - to[1] - (from[0] - from[1]));
+
+/** Quantised heading, so a turning hull cannot mint a sprite per degree. */
+const bearingKey = (dir: number): number => {
+  const step = (Math.PI * 2) / BOAT_BEARINGS;
+  return Math.round(dir / step) * step;
+};
+
+/* ------------------------------- the cache -------------------------------- */
+
+function waterCache(scene: GenesisScene): UCache {
+  const map = scene.map;
+  const river = map.river;
+  const geo = river.length >= 2 ? cumulative(river) : null;
+
+  /* Which water each boat is on. A lake is tested against its own resolved
+   * outline, which is the shape the renderer actually filled. */
+  const lake: (LakeSpec | null)[] = [];
+  const at: number[] = [];
+  for (const b of scene.boats) {
+    let on: LakeSpec | null = null;
+    for (const lk of map.lakes ?? []) {
+      if (lk.pts.length >= 3 && inPoly([b.gx, b.gy], lk.pts)) {
+        on = lk;
+        break;
+      }
+    }
+    lake.push(on);
+    at.push(on || !geo ? -1 : arcAt(river, geo, [b.gx, b.gy]));
+  }
+
+  /* The open reaches: the river minus everything standing in it. */
+  const reaches: [number, number][] = [];
+  if (geo) {
+    const cut: number[] = [];
+    for (const br of map.bridges) cut.push(arcAt(river, geo, [br.gx, br.gy]));
+    for (const fd of map.fords ?? []) cut.push(arcAt(river, geo, [fd.gx, fd.gy]));
+    for (const j of scene.jetties) cut.push(arcAt(river, geo, [j.gx, j.gy]));
+    if (scene.ferry) {
+      cut.push(
+        arcAt(river, geo, [
+          (scene.ferry.ax + scene.ferry.bx) / 2,
+          (scene.ferry.ay + scene.ferry.by) / 2,
+        ])
+      );
+    }
+    // A lake the river runs through is not river either.
+    for (const lk of map.lakes ?? []) {
+      if (!lk.fed || lk.pts.length < 3) continue;
+      for (let s = 0; s <= geo.len; s += 0.8) {
+        if (inPoly(alongPolyline(river, geo, s), lk.pts)) cut.push(s);
+      }
+    }
+    cut.sort((a, b) => a - b);
+    // Keep the map's own framing: a boat rowing off the edge of the picture is
+    // a boat nobody sees come back.
+    const EDGE = 3;
+    let lo = EDGE;
+    for (const c of cut) {
+      const hi = c - AFLOAT_GUARD;
+      if (hi - lo >= AFLOAT_REACH_MIN) reaches.push([lo, hi]);
+      lo = Math.max(lo, c + AFLOAT_GUARD);
+    }
+    const hi = geo.len - EDGE;
+    if (hi - lo >= AFLOAT_REACH_MIN) reaches.push([lo, hi]);
+  }
+
+  /* The two points somebody walks in from and away to at the ferry. */
+  let inA: Vec2 | null = null;
+  let inB: Vec2 | null = null;
+  if (scene.ferry) {
+    const f = scene.ferry;
+    const off = (gx: number, gy: number, sgn: number): Vec2 => {
+      const u = gx - gy + Math.cos(f.dir) * RIDER_WALK * Math.SQRT2 * sgn;
+      const v = gx + gy + Math.sin(f.dir) * RIDER_WALK * Math.SQRT2 * sgn;
+      return [(v + u) / 2, (v - u) / 2];
+    };
+    // A decks out along `dir` toward B, so its dry side is the other way.
+    inA = off(f.ax, f.ay, -1);
+    inB = off(f.bx, f.by, 1);
+  }
+
+  return { geo, reaches, lake, at, inA, inB };
+}
+
+/* -------------------------------- the reset ------------------------------- */
+
+function ensureAfloat(scene: GenesisScene): Underway {
+  let u = AFLOAT.get(scene);
+  if (u) return u;
+  u = {
+    ready: false,
+    rng: mulberry32(AFLOAT_SEED),
+    clock: -1,
+    cache: waterCache(scene),
+    trips: [],
+    ferry: null,
+  };
+  AFLOAT.set(scene, u);
+  return u;
+}
+
+/** The coats an oarsman or a passenger turns up in. Off the boats' own stream,
+ * so nothing here disturbs the crowd's colours. */
+const AFLOAT_COATS = ['#c46a6a', '#6a8fc4', '#7ab07a', '#c49a5a', '#9a7ac4', '#5aa8a8'];
+
+/**
+ * Throw the boats away and re-seed them, exactly as `resetWildlife` does for
+ * the wildlife — and from the same call site, so a scrub backwards puts the
+ * same punt in the same place every time.
+ */
+export function resetBoats(scene: GenesisScene, snap: WorldSnapshot): void {
+  const u = ensureAfloat(scene);
+  u.rng = mulberry32(AFLOAT_SEED);
+  u.clock = -1;
+  const rng = u.rng;
+
+  u.trips = scene.boats.map((b, i) => ({
+    i,
+    st: 0 as const,
+    gx: b.gx,
+    gy: b.gy,
+    dir: b.dir,
+    hx: b.gx,
+    hy: b.gy,
+    hdir: b.dir,
+    way: [] as Vec2[],
+    stroke: rng() * 6.283,
+    // Staggered, so a valley with three boats does not send them all out in
+    // the same second.
+    wait: 4 + rng() * 70 + i * 18,
+    color: AFLOAT_COATS[Math.floor(rng() * AFLOAT_COATS.length)],
+    lake: u.cache.lake[i] !== null,
+  }));
+
+  u.ferry = scene.ferry
+    ? {
+        st: 0,
+        k: 0,
+        timer: FERRY_WAIT,
+        riders: [],
+        stroke: rng() * 6.283,
+        color: AFLOAT_COATS[Math.floor(rng() * AFLOAT_COATS.length)],
+      }
+    : null;
+  u.ready = true;
+
+  // Settle, so a paused arrival or a deep link into an hour never opens on a
+  // punt sitting dead against the near landing with nobody on it.
+  const n = 20 + Math.floor(rng() * 90);
+  for (let k = 0; k < n; k++) stepBoats(scene, u, snap, 0.4);
+}
+
+/* --------------------------------- the tick ------------------------------- */
+
+/**
+ * Advance the boats. `dt` comes from the renderer's clock, which is the same
+ * clock the crowd and the wildlife run on and which stops when the world does.
+ */
+function tickBoats(scene: GenesisScene, snap: WorldSnapshot, clock: number): Underway {
+  const u = ensureAfloat(scene);
+  if (!u.ready) resetBoats(scene, snap);
+  let dt = u.clock < 0 ? 0 : clock - u.clock;
+  u.clock = clock;
+  if (!(dt > 0) || dt > 0.5) dt = 0;
+  if (dt > 0) stepBoats(scene, u, snap, dt);
+  return u;
+}
+
+function stepBoats(scene: GenesisScene, u: Underway, snap: WorldSnapshot, dt: number): void {
+  stepTrips(scene, u, snap, dt);
+  stepFerry(scene, u, snap, dt);
+}
+
+/* ------------------------------ rowing loops ------------------------------ */
+
+/** Plan a trip out and back. Returns the waypoints, or null for "stay in". */
+function planTrip(scene: GenesisScene, u: Underway, t: UTrip): Vec2[] | null {
+  const rng = u.rng;
+  const lk = u.cache.lake[t.i];
+
+  if (lk) {
+    /* A drift across the lake: two or three points well inside the analytic
+     * ellipse, then home. The ellipse rather than the outline, exactly as the
+     * ducks are seeded, because the outline wobbles and the margin must not. */
+    const ru = Math.max(0.8, lk.rx * 0.62);
+    const rv = Math.max(0.8, lk.ry * 0.62);
+    const lu = lk.gx - lk.gy;
+    const lv = lk.gx + lk.gy;
+    const n = 2 + Math.floor(rng() * 2);
+    const way: Vec2[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = rng() * Math.PI * 2;
+      const r = Math.sqrt(rng());
+      const uu =
+        lu + Math.cos(lk.rot) * Math.cos(a) * ru * r - Math.sin(lk.rot) * Math.sin(a) * rv * r;
+      const vv =
+        lv + Math.sin(lk.rot) * Math.cos(a) * ru * r + Math.cos(lk.rot) * Math.sin(a) * rv * r;
+      way.push([(uu + vv) / 2, (vv - uu) / 2]);
+    }
+    way.push([t.hx, t.hy]);
+    return way;
+  }
+
+  /* A rowing loop up or down the river, inside one open reach and never out
+   * of it. If the boat is not in a reach at all — moored beside a bridge, say
+   * — it stays where it is, which is the correct answer. */
+  const { geo, reaches } = u.cache;
+  const river = scene.map.river;
+  if (!geo || !reaches.length) return null;
+  const at = u.cache.at[t.i];
+  if (at < 0) return null;
+  const reach = reaches.find(([lo, hi]) => at >= lo - AFLOAT_GUARD && at <= hi + AFLOAT_GUARD);
+  if (!reach) return null;
+  const [lo, hi] = reach;
+  const from = Math.max(lo, Math.min(hi, at));
+
+  let sgn = rng() < 0.5 ? 1 : -1;
+  let len = 3 + rng() * 5;
+  if (from + sgn * len < lo || from + sgn * len > hi) sgn = -sgn;
+  if (from + sgn * len < lo) len = from - lo;
+  if (from + sgn * len > hi) len = hi - from;
+  if (len < 2) return null;
+
+  // Off the centreline by a third of a tile at most, against a half-width of
+  // `riverWidth` — the boat cannot reach a bank whatever the river does.
+  const off = (rng() - 0.5) * 0.6;
+  const steps = Math.max(2, Math.round(len / 1.4));
+  const out: Vec2[] = [];
+  for (let i = 1; i <= steps; i++) {
+    const s = from + (sgn * (len * i)) / steps;
+    const p = alongPolyline(river, geo, s);
+    const q = alongPolyline(river, geo, s + sgn * 0.4);
+    // The river's normal here, in tile space.
+    const dx = q[0] - p[0];
+    const dy = q[1] - p[1];
+    const l = Math.hypot(dx, dy) || 1;
+    out.push([p[0] - (dy / l) * off, p[1] + (dx / l) * off]);
+  }
+  // …and back the way it came, finishing exactly where gen moored it.
+  for (let i = out.length - 2; i >= 0; i--) out.push(out[i]);
+  out.push([t.hx, t.hy]);
+  return out;
+}
+
+function stepTrips(scene: GenesisScene, u: Underway, snap: WorldSnapshot, dt: number): void {
+  const rng = u.rng;
+  const open = snap.t >= AFLOAT_FROM && snap.t <= AFLOAT_TO;
+  let away = 0;
+  for (const t of u.trips) if (t.st === 1) away++;
+
+  for (const t of u.trips) {
+    const boat = scene.boats[t.i];
+    // A boat whose pier has not been built yet is not in the water at all.
+    const there = boat.id === null || snap.props.has(boat.id);
+
+    if (t.st === 0) {
+      t.wait -= dt;
+      if (!there || !open || away >= AFLOAT_MAX || t.wait > 0) continue;
+      const way = planTrip(scene, u, t);
+      // Even a refusal costs a wait, or a boat with nowhere to go re-plans
+      // every single frame for the rest of the day.
+      t.wait = 50 + rng() * 130;
+      if (!way || !way.length) continue;
+      t.way = way;
+      t.st = 1;
+      away++;
+      continue;
+    }
+
+    // Underway. Turn toward the next waypoint, then move along the heading.
+    const target = t.way[0];
+    if (!target) {
+      t.st = 0;
+      t.gx = t.hx;
+      t.gy = t.hy;
+      t.dir = t.hdir;
+      t.wait = 60 + rng() * 150;
+      continue;
+    }
+    const want = uvDir([t.gx, t.gy], target);
+    let d = want - t.dir;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    const turn = TURN_RATE * dt;
+    t.dir += Math.abs(d) < turn ? d : Math.sign(d) * turn;
+
+    const sp = (t.lake ? DRIFT_SPEED : ROW_SPEED) * dt;
+    const dx = target[0] - t.gx;
+    const dy = target[1] - t.gy;
+    const dl = Math.hypot(dx, dy);
+    if (dl <= sp || dl < 1e-4) {
+      t.gx = target[0];
+      t.gy = target[1];
+      t.way.shift();
+      if (!t.way.length) {
+        t.st = 0;
+        t.gx = t.hx;
+        t.gy = t.hy;
+        t.dir = t.hdir;
+        t.wait = 60 + rng() * 150;
+      }
+    } else {
+      t.gx += (dx / dl) * sp;
+      t.gy += (dy / dl) * sp;
+    }
+    // Oars keep time with the ground the boat is covering, so a drifting lake
+    // boat sculls slowly and a rowing one pulls.
+    t.stroke += dt * (t.lake ? 1.5 : 3.4);
+  }
+}
+
+/* ------------------------------- the ferry -------------------------------- */
+
+/** Where the punt is now, tile space, and which way it is pointing. */
+function puntAt(rig: FerryRig, f: UFerry): { gx: number; gy: number; dir: number } {
+  const gx = rig.hax + (rig.hbx - rig.hax) * f.k;
+  const gy = rig.hay + (rig.hby - rig.hay) * f.k;
+  // Facing the way it is going, and facing back the way it came while it waits
+  // on the far side.
+  const back = f.st === 2 || f.st === 3;
+  return { gx, gy, dir: back ? rig.dir + Math.PI : rig.dir };
+}
+
+function stepFerry(scene: GenesisScene, u: Underway, snap: WorldSnapshot, dt: number): void {
+  const rig = scene.ferry;
+  const f = u.ferry;
+  if (!rig || !f) return;
+  const rng = u.rng;
+  const running = snap.t >= FERRY_FROM && snap.t <= FERRY_TO;
+
+  f.stroke += dt * (f.st === 1 || f.st === 3 ? 2.1 : 0.5);
+
+  if (f.st === 0 || f.st === 2) {
+    const atA = f.st === 0;
+    const root: Vec2 = atA ? [rig.ax, rig.ay] : [rig.bx, rig.by];
+    const inland = (atA ? u.cache.inA : u.cache.inB) ?? root;
+    // Somebody turns up for the crossing while it waits.
+    if (f.timer === FERRY_WAIT && running) {
+      const n = Math.floor(rng() * (RIDER_MAX + 1));
+      for (let i = 0; i < n; i++) {
+        f.riders.push({
+          st: 0,
+          gx: inland[0] + (rng() - 0.5) * 0.8,
+          gy: inland[1] + (rng() - 0.5) * 0.8,
+          tx: root[0],
+          ty: root[1],
+          oa: -0.1 + i * 0.34,
+          ob: (rng() - 0.5) * 0.3,
+          color: AFLOAT_COATS[Math.floor(rng() * AFLOAT_COATS.length)],
+          phase: rng() * 6.283,
+          face: true,
+        });
+      }
+    }
+    f.timer -= dt;
+    if (f.timer <= 0 && running) {
+      // Anyone who made it down to the stage is aboard; the punt shoves off.
+      for (const r of f.riders) if (r.st === 0) r.st = 1;
+      f.st = atA ? 1 : 3;
+    } else if (f.timer <= -FERRY_WAIT * 4) {
+      // Out of hours: hold at the landing, and let the wait come round again
+      // when the valley wakes up.
+      f.timer = FERRY_WAIT;
+    }
+  } else {
+    const to = f.st === 1 ? 1 : 0;
+    const step =
+      (PUNT_SPEED * dt) / Math.max(0.4, Math.hypot(rig.hbx - rig.hax, rig.hby - rig.hay));
+    f.k += f.k < to ? Math.min(step, to - f.k) : -Math.min(step, f.k - to);
+    if (Math.abs(f.k - to) < 1e-6) {
+      f.k = to;
+      const arriveA = f.st === 3;
+      const root: Vec2 = arriveA ? [rig.ax, rig.ay] : [rig.bx, rig.by];
+      const inland = (arriveA ? u.cache.inA : u.cache.inB) ?? root;
+      for (const r of f.riders) {
+        if (r.st !== 1) continue;
+        r.st = 2;
+        r.gx = root[0];
+        r.gy = root[1];
+        r.tx = inland[0] + (rng() - 0.5) * 0.8;
+        r.ty = inland[1] + (rng() - 0.5) * 0.8;
+      }
+      f.st = arriveA ? 0 : 2;
+      f.timer = FERRY_WAIT;
+    }
+  }
+
+  // The walkers. Aboard, they ride the punt and have nothing else to do.
+  const punt = puntAt(rig, f);
+  for (let i = f.riders.length - 1; i >= 0; i--) {
+    const r = f.riders[i];
+    if (r.st === 1) {
+      const c = Math.cos(punt.dir);
+      const s = Math.sin(punt.dir);
+      const uu = punt.gx - punt.gy + r.oa * c - r.ob * s;
+      const vv = punt.gx + punt.gy + r.oa * s + r.ob * c;
+      r.gx = (uu + vv) / 2;
+      r.gy = (vv - uu) / 2;
+      continue;
+    }
+    const dx = r.tx - r.gx;
+    const dy = r.ty - r.gy;
+    const dl = Math.hypot(dx, dy);
+    const sp = RIDER_SPEED * dt;
+    r.phase += dt;
+    if (dl > 1e-4) r.face = dx - dy > 0;
+    if (dl <= sp) {
+      r.gx = r.tx;
+      r.gy = r.ty;
+      // Down at the stage: wait to be taken aboard. Up the far bank: gone.
+      if (r.st === 2) f.riders.splice(i, 1);
+    } else {
+      r.gx += (dx / dl) * sp;
+      r.gy += (dy / dl) * sp;
+    }
+  }
+  // Somebody nobody ever collected — the punt went out of hours while they
+  // were still walking down — is not left standing on the bank all night.
+  if (!running) {
+    for (let i = f.riders.length - 1; i >= 0; i--) if (f.riders[i].st === 0) f.riders.splice(i, 1);
+  }
+}
+
+/* -------------------------------- drawing --------------------------------- */
+
+/**
+ * Every boat, the two landing stages and the ferry, as depth-sorted items.
+ *
+ * Called where the old static boat pass was — ahead of `moversFrom`, so the
+ * hulls are the first thing the occlusion repair gives up on. They float on
+ * open water; there is nothing there to occlude them.
+ */
+function pushBoats(
+  scene: GenesisScene,
+  u: Underway,
+  snap: WorldSnapshot,
+  clock: number,
+  items: Item[],
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number
+): void {
+  const seen = (x: number, y: number) => x > wx0 && x < wx1 && y > wy0 && y < wy1;
+
+  for (const t of u.trips) {
+    const boat = scene.boats[t.i];
+    if (boat.id !== null && !snap.props.has(boat.id)) continue;
+    const moored = t.st === 0;
+    const gx = moored ? boat.gx : t.gx;
+    const gy = moored ? boat.gy : t.gy;
+    const x = isoX(gx, gy);
+    const y = isoY(gx, gy);
+    if (!seen(x, y)) continue;
+    // A moored boat keeps the bearing gen gave it, to the bit — this feature
+    // must not so much as rotate a hull it did not move. Only a boat actually
+    // going somewhere is quantised on to the bearing ladder.
+    const dir = moored ? boat.dir : bearingKey(t.dir);
+    const sp = cached(scene, `bt:${Math.round((dir * 180) / Math.PI)}:${boat.seed}`, () =>
+      buildRowboat(dir, boat.seed)
+    );
+    const bob = Math.round(Math.sin(clock * 1.15 + boat.seed * 0.37) * 0.9);
+    const bx = Math.round(x - sp.ox);
+    const by = Math.round(y - sp.oy) + bob;
+    // Moored, a boat borrows its pier's deck depth (see JettySpot); underway,
+    // it is out on open water and sorts on its own ground like anything else.
+    const depth = moored ? Math.max(y, boat.deck) : y;
+    const rowing = !moored;
+    const color = t.color;
+    const stroke = t.stroke;
+    items.push({
+      depth,
+      bx: rowing ? bx - 8 : bx,
+      by: rowing ? by - 8 : by,
+      bw: sp.c.width + (rowing ? 16 : 0),
+      bh: sp.c.height + (rowing ? 10 : 0),
+      draw: (c) => {
+        c.drawImage(sp.c, bx, by);
+        if (rowing) drawRower(c, x, y + bob, dir, stroke, color);
+      },
+    });
+  }
+
+  /* ---- the ferry ------------------------------------------------------- */
+  const rig = scene.ferry;
+  const f = u.ferry;
+  if (!rig) return;
+
+  // The two landing stages. Static, and drawn here rather than baked because
+  // there are exactly two of them and the veg bake has nowhere to put a thing
+  // that is not a prop, a tree or a building.
+  const stage = (gx: number, gy: number, dir: number, salt: number) => {
+    const x = isoX(gx, gy);
+    const y = isoY(gx, gy);
+    if (!seen(x, y)) return;
+    const sp = cached(
+      scene,
+      `fyj:${Math.round((dir * 180) / Math.PI)}:${salt}`,
+      () => buildJetty(dir, rig.len, rig.seed + salt)
+    );
+    const bx = Math.round(x - sp.ox);
+    const by = Math.round(y - sp.oy);
+    items.push({
+      depth: y,
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => c.drawImage(sp.c, bx, by),
+    });
+  };
+  stage(rig.ax, rig.ay, rig.dir, 0);
+  stage(rig.bx, rig.by, rig.dir + Math.PI, 7);
+
+  if (!f) return;
+  const punt = puntAt(rig, f);
+  const px = isoX(punt.gx, punt.gy);
+  const py = isoY(punt.gx, punt.gy);
+  if (seen(px, py)) {
+    const dir = bearingKey(punt.dir);
+    const sp = cached(scene, `pnt:${Math.round((dir * 180) / Math.PI)}:${rig.seed}`, () =>
+      buildPunt(dir, rig.seed)
+    );
+    const bob = Math.round(Math.sin(clock * 1.05 + rig.seed * 0.11) * 0.9);
+    const bx = Math.round(px - sp.ox);
+    const by = Math.round(py - sp.oy) + bob;
+    // Alongside a landing it borrows that deck's depth, as a moored boat does;
+    // out in the stream it sorts on its own ground.
+    const deck = puntDepth(rig, f, py);
+    const stroke = f.stroke;
+    const color = f.color;
+    items.push({
+      depth: deck,
+      bx: bx - 10,
+      by: by - 16,
+      bw: sp.c.width + 20,
+      bh: sp.c.height + 18,
+      draw: (c) => {
+        c.drawImage(sp.c, bx, by);
+        drawPunter(c, px, py + bob, dir, stroke, color);
+      },
+    });
+  }
+}
+
+/** Sort depth of the punt: alongside a landing it borrows that deck's depth,
+ * as a moored boat does; out in the stream it sorts on its own ground. */
+function puntDepth(rig: FerryRig, f: UFerry, py: number): number {
+  return f.k <= 0.02 ? Math.max(py, rig.adepth) : f.k >= 0.98 ? Math.max(py, rig.bdepth) : py;
+}
+
+/**
+ * The people using the crossing, as depth-sorted items.
+ *
+ * Split out of `pushBoats` and pushed AFTER the crowd on purpose. The hulls go
+ * in ahead of `moversFrom` because they float on open water where there is
+ * nothing to occlude them and they are the right thing for the repair pass to
+ * abandon first — but somebody walking down a bank is an actor on the ground,
+ * with willows and reeds between them and the camera, and that is exactly the
+ * case the repair budget is reserved for. Same rule the wildlife's
+ * ground-dwellers are pushed under.
+ */
+function pushFerryFolk(
+  scene: GenesisScene,
+  u: Underway,
+  items: Item[],
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number
+): void {
+  const rig = scene.ferry;
+  const f = u.ferry;
+  if (!rig || !f || !f.riders.length) return;
+  const punt = puntAt(rig, f);
+  const deck = puntDepth(rig, f, isoY(punt.gx, punt.gy));
+
+  for (const r of f.riders) {
+    const x = isoX(r.gx, r.gy);
+    const y = isoY(r.gx, r.gy);
+    if (x <= wx0 || x >= wx1 || y <= wy0 || y >= wy1) continue;
+    const rx = Math.round(x);
+    // Aboard, somebody stands ON the deck: half a pixel in front of the punt so
+    // the hull never paints over its own passengers, and lifted the height of
+    // the freeboard so they are not standing in the water.
+    const aboard = r.st === 1;
+    const ry = Math.round(y) - (aboard ? 3 : 0);
+    const col = r.color;
+    const ph = r.phase;
+    const face = r.face;
+    const act: BotAction = aboard ? 'idle' : 'walk';
+    items.push({
+      depth: aboard ? deck + 0.5 : y + 1,
+      bx: rx - 7,
+      by: ry - 20,
+      bw: 15,
+      bh: 22,
+      draw: (c) => drawBot(c, rx, ry, col, face, act, ph),
+    });
+  }
+}
+
+/* ---- end boats underway -------------------------------------------------- */

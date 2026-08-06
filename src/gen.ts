@@ -42,6 +42,9 @@ import {
   type ChestReward,
   type ChestSpec,
   type Chunk,
+  /* ---- the ferry (additive) ---- */
+  type FerrySpec,
+  /* ---- end the ferry (additive) ---- */
   type FordSpec,
   type GenesisMap,
   type LakeSpec,
@@ -850,6 +853,65 @@ export const JETTY_LEN = 2.2;
 
 /** How far up the bank the landward end of the deck sits, u/v. */
 const JETTY_ROOT = 0.62;
+
+/* ------------------------------- the ferry ------------------------------- *
+ * ADDITIVE BLOCK. Earned by geography like a jetty, and by the ABSENCE of
+ * geography as well: a ferry only exists where the road network declined to
+ * cross. See FerrySpec in types.ts for why it is not part of the bridge/ford
+ * crossing pass.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * How far the crossing must be from the nearest bridge OR ford, u/v. This is
+ * the whole feature: a ferry a short walk from a bridge is a ferry nobody would
+ * ever pay for. Measured against the FULL crossing roster, so a small pace
+ * scale — which may not have laid the road that bridge hangs on — still keeps
+ * the ferry where the busy day would have put it.
+ */
+export const FERRY_CLEAR = 13;
+
+/** How far the nearer landing may be from the rim of the town that runs it,
+ * u/v. Rim-to-root, the same convention as JETTY_REACH and QUARRY_REACH — but
+ * generous, because a ferry serves a district rather than a front garden. */
+export const FERRY_REACH = 3.5;
+
+/**
+ * …and how far the FAR landing may be from the nearest town's rim. This is the
+ * test that makes a ferry mean something: a crossing wants somebody on both
+ * banks, or it is a plank stage facing an empty field. Far more generous than
+ * FERRY_REACH — the far side is a district, not a doorstep — but finite, and it
+ * is what keeps ferries down to the valleys whose river genuinely divides
+ * somewhere people are.
+ */
+export const FERRY_FAR = 9;
+
+/** Deck length of a landing stage, u/v. Half a jetty: it is a step down to the
+ * punt, not a pier. */
+export const FERRY_LEN = 0.95;
+
+/** How far up the bank the landward end of a stage sits, u/v. */
+const FERRY_ROOT = 0.5;
+
+/** Root to root. Below the first the two stages would be touching; above the
+ * second the punt is crossing something that is no longer a river. */
+export const FERRY_SPAN_MIN = 2.2;
+export const FERRY_SPAN_MAX = 7.5;
+
+/**
+ * How many u/v of extra distance a town one place further down the roster is
+ * "worth" when the pass is choosing between two workable crossings. Roster
+ * order is a property of the FULL roster and so is scale-free; biasing toward
+ * the head of it is what keeps a ferry beside a town the baseline pace founds
+ * instead of out at a hamlet only a 4x day ever reaches.
+ */
+const FERRY_ROSTER_BIAS = 3.2;
+
+/** Not every reach of empty river gets one. Rolled once, off the ferry's own
+ * substream, BEFORE any geometry is looked at — so the draw does not depend on
+ * whether the valley turns out to have anywhere to put it. */
+const FERRY_CHANCE = 0.62;
+
+/* ---------------------------- end the ferry ------------------------------ */
 
 /** Base woodland mix per biome, before the day's forest character is applied. */
 const BASE_TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
@@ -3897,6 +3959,251 @@ function buildMap(seed: number, scale: number): GenesisMap {
   }
   /* ---- end standing stones (additive) ------------------------------------ */
 
+  /* ---- the ferry (additive) ---------------------------------------------- *
+   * Where the road network declined to cross, somebody still has to.
+   *
+   * The pass walks the river's own centreline looking for a reach that is a
+   * long way from every bridge and every ford, with a town near enough one bank
+   * to be worth the trouble, and solves a landing stage on each side of it the
+   * way `jettyFor` solves one: march out along the bank normal until the signed
+   * distance to open water changes sign, bisect for the crossing, root the
+   * stage a little way up the dry side. Both stages face each other, so the
+   * punt's course is the river's normal and is over live water the whole way.
+   *
+   * TERRAIN. Every input here is scale-free — the FULL crossing roster, the
+   * FULL town roster, the FULL dressing roster — and every draw comes off a
+   * dedicated substream, so `ferry` is byte-identical at 0.25x and at 4x and
+   * gen's main sequence never sees it. See FerrySpec in types.ts.
+   * ------------------------------------------------------------------------ */
+  let ferry: FerrySpec | null = null;
+  {
+    const frng = mulberry32((seed ^ 0x0fe27a13) >>> 0);
+    // Both draws happen whatever the geography says, so the stream does not
+    // depend on luck — the same rule the lake boats above are placed under.
+    const roll = frng();
+    const boatSeed = (Math.floor(frng() * 0xffffff) ^ 0x71c4) >>> 0;
+
+    if (roll < FERRY_CHANCE && river.length >= 2) {
+      /** Every place the roads already cross the water, over the FULL roster. */
+      const carried: Pt[] = [];
+      for (const b of bridges) carried.push([b.gx - b.gy, b.gx + b.gy]);
+      for (const f of fords) carried.push([f.gx - f.gy, f.gx + f.gy]);
+      /** …and every pier, which the punt must not run its course through. */
+      const piers: Pt[] = [];
+      for (const list of siteProps) {
+        for (const p of list) {
+          if (p.kind === 'jetty') piers.push([p.gx - p.gy, p.gx + p.gy]);
+        }
+      }
+
+      const riverHalfF = riverWidth * Math.SQRT2;
+      /** Signed distance to open water, u/v: negative in it, positive on land.
+       * The lakes are in here because a ferry must be on the RIVER — a stage
+       * rooted on a lake shore is a jetty, and there is already one of those. */
+      const sdF = (p: Pt, segs: Pt[][], near: typeof lakes): number => {
+        let best = Infinity;
+        for (const s of segs) {
+          const d = segDist(p, s[0], s[1]) - riverHalfF;
+          if (d < best) best = d;
+        }
+        for (const l of near) {
+          const d = lakeDist(p, l);
+          if (d < best) best = d;
+        }
+        return best;
+      };
+
+      // Keep the crossing inside the framed rect: a ferry running off the edge
+      // of the picture is a ferry nobody ever sees leave.
+      const IN = 3.5;
+      const u0 = content.u0 + IN;
+      const v0 = content.v0 + IN;
+      const u1 = content.u1 - IN;
+      const v1 = content.v1 - IN;
+
+      type Cand = {
+        mid: Pt;
+        A: Pt;
+        B: Pt;
+        dir: number;
+        span: number;
+        si: number;
+        cost: number;
+      };
+      let best: Cand | null = null;
+
+      // Walk the centreline by arclength, keeping clear of both ends.
+      let acc = 0;
+      const STEP = 0.55;
+      for (let i = 0; i + 1 < river.length; i++) {
+        const a = river[i];
+        const b = river[i + 1];
+        const segLen = dist(a, b);
+        if (segLen < 1e-6) continue;
+        const tu = (b[0] - a[0]) / segLen;
+        const tv = (b[1] - a[1]) / segLen;
+        let s = acc;
+        for (; s < segLen; s += STEP) {
+          const mid: Pt = [a[0] + tu * s, a[1] + tv * s];
+          if (mid[0] < u0 || mid[0] > u1 || mid[1] < v0 || mid[1] > v1) continue;
+
+          // Far from every crossing the roads already make.
+          let clear = Infinity;
+          for (const c of carried) clear = Math.min(clear, dist(mid, c));
+          if (clear < FERRY_CLEAR) continue;
+          for (const q of piers) if (dist(mid, q) < 3.5) { clear = -1; break; }
+          if (clear < 0) continue;
+
+          // River, not lake: a reach the water widens into is somebody else's.
+          const spanBox = FERRY_SPAN_MAX + 3;
+          const near = lakes.filter((l) => dist(mid, [l.u, l.v]) < spanBox + l.maxR);
+          let inLake = false;
+          for (const l of near) if (lakeDist(mid, l) < 2.5) { inLake = true; break; }
+          if (inLake) continue;
+          const segs = segsNearBox(
+            river,
+            mid[0] - spanBox,
+            mid[1] - spanBox,
+            mid[0] + spanBox,
+            mid[1] + spanBox,
+            0.5
+          );
+          if (!segs.length) continue;
+          if (sdF(mid, segs, near) > -0.2) continue; // the middle must be wet
+
+          // The river's own normal here, and a stage on each bank of it.
+          const nu = -tv;
+          const nv = tu;
+          const roots: (Pt | null)[] = [null, null];
+          for (let k = 0; k < 2; k++) {
+            const sg = k === 0 ? 1 : -1;
+            let lo = 0;
+            let hi = -1;
+            for (let d = 0.15; d <= 4.2; d += 0.12) {
+              if (sdF([mid[0] + nu * sg * d, mid[1] + nv * sg * d], segs, near) > 0) {
+                hi = d;
+                break;
+              }
+              lo = d;
+            }
+            if (hi < 0) continue;
+            for (let it = 0; it < 18; it++) {
+              const m = (lo + hi) / 2;
+              if (sdF([mid[0] + nu * sg * m, mid[1] + nv * sg * m], segs, near) < 0) lo = m;
+              else hi = m;
+            }
+            const at = (lo + hi) / 2 + FERRY_ROOT;
+            const R: Pt = [mid[0] + nu * sg * at, mid[1] + nv * sg * at];
+            if (sdF(R, segs, near) < 0.12) continue; // the root must be dry
+            // …and the head of the stage genuinely wet, or it is a plank on a
+            // beach. FERRY_LEN back down the same normal.
+            const H: Pt = [R[0] - nu * sg * FERRY_LEN, R[1] - nv * sg * FERRY_LEN];
+            if (sdF(H, segs, near) > -0.05) continue;
+            if (offRock(R, PROP_ROCK_CLEAR)) continue;
+            let clash = false;
+            for (const list of siteBuildings) {
+              for (const bl of list) {
+                if (dist(R, [bl.gx - bl.gy, bl.gx + bl.gy]) < fpR(bl.w) + 1.0) {
+                  clash = true;
+                  break;
+                }
+              }
+              if (clash) break;
+            }
+            if (clash) continue;
+            roots[k] = R;
+          }
+          const A = roots[0];
+          const B = roots[1];
+          if (!A || !B) continue;
+          const span = dist(A, B);
+          if (span < FERRY_SPAN_MIN || span > FERRY_SPAN_MAX) continue;
+
+          // How far the nearest town of ANY roster position is from each bank:
+          // the far-side test, which is about whether the crossing goes
+          // anywhere, not about who keeps the punt.
+          let rimA = Infinity;
+          let rimB = Infinity;
+          for (const st of sites) {
+            const dA = dist(A, [st.u, st.v]) - st.r;
+            const dB = dist(B, [st.u, st.v]) - st.r;
+            if (dA < rimA) rimA = dA;
+            if (dB < rimB) rimB = dB;
+          }
+          const farRim = Math.max(rimA, rimB);
+          if (farRim > FERRY_FAR) continue;
+
+          // Who runs it, and this is a HARD gate rather than a preference: only
+          // a town the BASELINE day founds may keep a ferry. `nBase` is drawn
+          // from the seed before the pace control is ever consulted — the same
+          // scale-free quantity the chest finder is drawn from — so this is not
+          // the scale leaking into terrain. It is what stops a ferry being
+          // parked beside the thirteenth hamlet that only a 4x day reaches,
+          // where nobody at the default pace would ever see it.
+          const nBaseline = Math.min(nBase, sites.length);
+          let nearRim = Infinity;
+          let si = -1;
+          for (let k = 0; k < nBaseline; k++) {
+            const st = sites[k];
+            const d = Math.min(dist(A, [st.u, st.v]), dist(B, [st.u, st.v])) - st.r;
+            if (d < nearRim) {
+              nearRim = d;
+              si = k;
+            }
+          }
+          if (si < 0 || nearRim > FERRY_REACH) continue;
+
+          // Prefer a crossing that has somebody on BOTH banks — that is a
+          // ferry with a reason — then one far from any bridge, then the near
+          // one. Ties break on the first station found, which is a pure
+          // function of the polyline, so no randomness decides the place.
+          // Prefer a crossing with somebody on BOTH banks, a long way from any
+          // bridge, and — the term that decides whether anybody ever sees it —
+          // run by a town EARLY in the roster. Roster order is scale-free, so
+          // using it here costs nothing, and it is what keeps the ferry beside
+          // a town the baseline pace actually founds rather than out at the
+          // thirteenth hamlet of a 4x day.
+          const cost =
+            nearRim + farRim * 0.5 - Math.min(clear, 30) * 0.2 + si * FERRY_ROSTER_BIAS;
+          if (!best || cost < best.cost - 1e-9) {
+            best = {
+              mid,
+              A,
+              B,
+              dir: Math.atan2(B[1] - A[1], B[0] - A[0]),
+              span,
+              si,
+              cost,
+            };
+          }
+        }
+        acc = s - segLen;
+      }
+
+      if (best) {
+        const [mgx, mgy] = uv(best.mid[0], best.mid[1]);
+        const [agx, agy] = uv(best.A[0], best.A[1]);
+        const [bgx, bgy] = uv(best.B[0], best.B[1]);
+        ferry = {
+          id: 'fy0',
+          seed: boatSeed,
+          gx: mgx,
+          gy: mgy,
+          ax: agx,
+          ay: agy,
+          bx: bgx,
+          by: bgy,
+          dir: best.dir,
+          span: best.span,
+          len: FERRY_LEN,
+          siteIndex: best.si,
+          siteId: sites[best.si].id,
+        };
+      }
+    }
+  }
+  /* ---- end the ferry (additive) ------------------------------------------ */
+
   const liveTrees = trees.filter((t) => !dead.has(t.id));
 
   /* ---- assemble --------------------------------------------------------- */
@@ -3956,6 +4263,11 @@ function buildMap(seed: number, scale: number): GenesisMap {
     roads: activeRoads,
     bridges: activeBridges,
     fords: activeFords,
+    /* ---- the ferry (additive) ---- */
+    // Not filtered by `activeRoadIds`: a ferry hangs off no road, and it is
+    // terrain besides — the same crossing at every pace. See FerrySpec.
+    ferry,
+    /* ---- end the ferry (additive) ---- */
     trees: liveTrees,
     scatter,
     chests,

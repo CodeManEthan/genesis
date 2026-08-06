@@ -640,6 +640,20 @@ const FORD_LOG = [
   'A ford, then. The track goes through, and whoever wants dry feet can go the long way round.',
 ];
 
+/* ---- the ferry (additive) ------------------------------------------------ *
+ * The one line a ferry costs the day. Nobody builds it and nobody finishes it;
+ * the stages were there before the first stake went in, and the punt goes back
+ * and forth whether anyone is watching or not.
+ * -------------------------------------------------------------------------- */
+const FERRY_LOG = [
+  'The nearest bridge is an hour the wrong way, so {town} keeps a punt and a pole instead.',
+  'Two plank stages and a flat-bottomed punt: the crossing at {town} costs a halfpenny and a wait.',
+  'The ferry runs all day at {town}. Four across, or three and a handcart.',
+  'Nobody built the crossing below {town}. Somebody just keeps rowing it.',
+  'The punt goes over and comes back, over and comes back. It is the oldest job in {valley}.',
+];
+/* ---- end the ferry (additive) -------------------------------------------- */
+
 const BRIDGE_LOG = [
   'The crossing is decked and railed. Carts go over dry.',
   'Bridge finished. Somebody jumps on it, twice, to be sure.',
@@ -1900,6 +1914,27 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   // Folded into `key` on exactly the same terms as the two passes above.
   for (const l of stonePass(map, pl)) key.push(l);
   /* --- end standing stones (additive) ------------------------------------- */
+
+  /* --- the ferry (additive): the crossing nobody had to build -------------- */
+  // A ferry is TERRAIN — the landings are map data and the punt is ambient
+  // theatre — so the day has exactly one thing to say about it, and only in
+  // the valleys that have one. No new event type, no new Plan field and
+  // nothing for scalePlan to scale: the clock is read off the town that runs
+  // it, which the pace has already scaled. The draw depends on the MAP alone
+  // (is there a ferry, and was its town founded today), never on the tempo
+  // `p` that plan() bisects, so the ledger reads the same at every tempo.
+  {
+    const fy = map.ferry;
+    const frun = fy ? pl.runs.get(fy.siteId) : undefined;
+    if (fy && frun) {
+      key.push({
+        t: clamp(frun.foundT + (frun.doneT - frun.foundT) * 0.22, frun.foundT + 0.1, 23.2),
+        siteId: fy.siteId,
+        text: fill(draw(FERRY_LOG), { town: frun.site.name, valley }),
+      });
+    }
+  }
+  /* --- end the ferry (additive) -------------------------------------------- */
 
   for (const sid of pl.order) {
     const run = pl.runs.get(sid)!;
