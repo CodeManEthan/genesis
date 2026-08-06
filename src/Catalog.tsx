@@ -48,6 +48,7 @@ import type { Biome, RoofStyle, StructureRole, TreeKind, Vec2 } from './types';
 const ROLES: StructureRole[] = [
   'cottage', 'house', 'hall', 'barn', 'workshop', 'store', 'chapel', 'tower',
   'mill', 'granary', 'smithy', 'shed', 'bakery', 'brewhouse', 'homestead',
+  'gildhall',
 ];
 
 /**
@@ -78,6 +79,9 @@ const PROP_POOLS = [
   'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
   'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
   'sheep', 'campfire',
+  // Buried treasure. Never a PropSpec — chests are their own list on the map —
+  // but pooled all the same, so they belong on this shelf.
+  'chest-buried', 'chest-closed', 'chest-open',
 ];
 
 /** Kinds not in the pools — built on demand by `propSprite()` in scene.ts. */
@@ -97,6 +101,9 @@ const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane'];
 const GENERATED = new Set<string>([
   'bush', 'rock', 'stump', 'flowers', 'sheep', 'reeds', 'fenceL', 'fenceR',
   'well', 'nameboard', 'lamp', 'signpost', 'campfire', 'lumber',
+  // The three states of a buried chest. gen.ts emits 0..2 ChestSpecs a day and
+  // the timeline moves them between these sprites.
+  'chest-buried', 'chest-closed', 'chest-open',
   ...FLAVOUR_PROPS,
 ]);
 const SCENE_ONLY = new Set<string>(['crane']);
@@ -274,6 +281,7 @@ const SPECIMEN: Record<StructureRole, RoleSpec> = {
   bakery: { w: 40, floors: 1, roof: 'gable', chimney: true },
   brewhouse: { w: 44, floors: 2, roof: 'hip', chimney: true },
   homestead: { w: 44, floors: 2, roof: 'gable', chimney: true, banner: true },
+  gildhall: { w: 52, floors: 3, roof: 'gable', banner: true },
 };
 
 function structure(

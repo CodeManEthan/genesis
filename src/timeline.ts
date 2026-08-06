@@ -93,7 +93,8 @@ function isLandmark(b: BuildingSpec): boolean {
     b.role === 'hall' ||
     b.role === 'chapel' ||
     b.role === 'tower' ||
-    b.role === 'mill'
+    b.role === 'mill' ||
+    b.role === 'gildhall'
   );
 }
 
@@ -701,7 +702,9 @@ function makeDrawer(rng: () => number) {
   };
 }
 
-/** ties at the same `t` resolve so a log always follows the thing it reports */
+/** ties at the same `t` resolve so a log always follows the thing it reports.
+ * New types are APPENDED — renumbering would silently re-order the ties in
+ * every timeline that already exists. */
 const TYPE_RANK: Record<GenesisEvent['type'], number> = {
   found: 0,
   arrive: 1,
@@ -713,7 +716,136 @@ const TYPE_RANK: Record<GenesisEvent['type'], number> = {
   bridge: 7,
   prop: 8,
   log: 9,
+  dig: 10,
+  discover: 11,
 };
+
+/* -------------------------------------------------------------------------- */
+/* buried treasure — the day's one piece of luck                              */
+/* -------------------------------------------------------------------------- */
+
+const CHEST_DIG_LOG = [
+  'A spade goes into something that is not a root, out in {where}.',
+  'Work stops in {where}. Somebody has hit a corner of something with an edge on it.',
+  'Two of them are digging in {where} and have stopped talking about it.',
+  'Iron under the moss in {where}. They send back for a bar.',
+];
+
+const CHEST_COIN_LOG = [
+  'A chest under the roots by {town}. Coin, mostly, and green with it. {town} decides it can afford another roof.',
+  'The lid comes off in {where}: coin, a bushel of it, nobody’s. {town} spends an hour arguing about what to build and then builds it.',
+  '{town} carries a strongbox in from {where}. It is heavy in the way that settles an argument about the year’s plans.',
+  'Coin out of {where}. Old coin, wrong kings, still coin. The masons at {town} are put on notice.',
+];
+
+const CHEST_CHARTER_LOG = [
+  'A sealed tube under a cairn in {where}. Inside it: a charter, older than {valley}. {town} intends to make use of it.',
+  'The chest in {where} holds one document and a great deal of mould. {town} reads the document twice and sends for a mason.',
+  '{town} turns up a charter in {where}. Nobody can read the seal. Everybody agrees it is impressive.',
+  'A grant of liberties, signed by somebody dead, dug out of {where}. {town} takes it entirely seriously.',
+];
+
+const CHEST_TRINKET_LOG = [
+  'A chest in {where}, and inside it a tin whistle, a comb and one button. Somebody hid this on purpose.',
+  'Opened at last, the chest in {where}: rainwater, and a spoon.',
+  '{town} brings a chest in from {where}. It holds a fish hook and forty years of damp.',
+  'The find in {where} turns out to be a brooch, a bad coin and a lock of somebody’s hair. It is kept anyway.',
+];
+
+const CHEST_TEASE_LOG = [
+  'Something glints in {where} when the light is right. Nobody walks over to look.',
+  'The dog will not leave one particular patch of {where} alone. The dog is ignored.',
+  'A story goes round about {where} and a strongbox. It goes round every year.',
+  'Two of them spend an hour digging in {where} on a rumour and find a root.',
+  'There is a low place in {where} where the ground rings hollow. It keeps that to itself another day.',
+];
+
+/**
+ * Scheduled serendipity, at last.
+ *
+ * The map buried the chests, decided what is in them and rolled the day's luck
+ * (it had to — a coin hoard pays for BUILDINGS, and buildings are map data).
+ * What is left for the ledger is the hour and the words:
+ *
+ *  - a found chest gets a `dig` and a `discover`, laid down so the discovery
+ *    lands *before* the town starts spending — the ledger reads cause, effect.
+ *  - a chest whose reward the pace control trimmed out of the day (the finding
+ *    town never founded, or its extra plots outside the day's slice) is
+ *    narrated at trinket tier. The find is real; the windfall never arrives.
+ *  - an unfound chest gets one tease line and stays in the ground.
+ *
+ * Runs on its own substream, so adding it left every existing ledger line in
+ * every existing valley exactly where it was.
+ */
+function chestPass(
+  map: GenesisMap,
+  pl: Plan,
+  surveyT: Map<string, number>
+): { t: number; text: string; siteId?: string }[] {
+  const chests = map.chests ?? [];
+  if (!chests.length) return [];
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x043e5735) >>> 0);
+  const range = (a: number, b: number) => a + rng() * (b - a);
+  const draw = makeDrawer(rng);
+  const valley = map.valleyName;
+  const lines: { t: number; text: string; siteId?: string }[] = [];
+  const siteById = new Map(map.sites.map((s) => [s.id, s]));
+
+  for (const chest of chests) {
+    const site = siteById.get(chest.siteId);
+    const run = site ? pl.runs.get(chest.siteId) : undefined;
+    const town = site ? site.name : valley;
+    const v = { town, valley, where: chest.where };
+
+    if (!chest.found) {
+      lines.push({ t: clamp(range(6.5, 20.5), 0.4, 23.4), text: fill(draw(CHEST_TEASE_LOG), v) });
+      continue;
+    }
+
+    // Did the reward survive the day's pace trim?
+    const grants = chest.grantIds.filter((id) => surveyT.has(id));
+    const paid = !!run && chest.grantIds.length > 0 && grants.length === chest.grantIds.length;
+
+    let discoverT: number;
+    if (paid) {
+      // The first thing the chest paid for must not be staked out before the
+      // chest was opened, or the ledger reads back to front.
+      const spend = Math.min(...grants.map((id) => surveyT.get(id)!));
+      const floor = Math.min(run!.foundT + 0.25, spend - 0.12);
+      discoverT = clamp(spend - range(0.35, 1.1), Math.max(0.05, floor), spend - 0.06);
+    } else if (run) {
+      discoverT = clamp(run.foundT + range(0.6, 3.2), 0.4, 22.4);
+    } else {
+      discoverT = clamp(range(8, 20), 0.4, 22.4);
+    }
+    const digT = Math.max(0.05, discoverT - range(0.12, 0.4));
+
+    pl.events.push({ t: digT, type: 'dig', chestId: chest.id });
+    pl.events.push({ t: discoverT, type: 'discover', chestId: chest.id });
+
+    // One beat of suspense, then the payoff — but only when there is room for
+    // both, so a two-chest day does not take over the whole ledger.
+    if (chests.length === 1) {
+      lines.push({ t: digT, text: fill(draw(CHEST_DIG_LOG), v) });
+    }
+    const pool = !paid
+      ? CHEST_TRINKET_LOG
+      : chest.reward === 'coin'
+        ? CHEST_COIN_LOG
+        : chest.reward === 'charter'
+          ? CHEST_CHARTER_LOG
+          : CHEST_TRINKET_LOG;
+    const line: { t: number; text: string; siteId?: string } = {
+      t: discoverT,
+      text: fill(draw(pool), v),
+    };
+    if (site) line.siteId = site.id;
+    lines.push(line);
+  }
+
+  return lines;
+}
 
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
@@ -776,6 +908,15 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
     };
     if (c.siteId) line.siteId = c.siteId;
     key.push(line);
+  }
+
+  /* --- buried treasure: the day's one piece of luck ---------------------- */
+  // Folded into `key` rather than appended afterwards, so the flavour filler
+  // below shortens itself by however many lines the chests just cost.
+  {
+    const surveyT = new Map<string, number>();
+    for (const e of out) if (e.type === 'survey') surveyT.set(e.buildingId, e.t);
+    for (const l of chestPass(map, pl, surveyT)) key.push(l);
   }
 
   for (const sid of pl.order) {
@@ -1051,6 +1192,7 @@ export function emptySnapshot(map: GenesisMap): WorldSnapshot {
     roads,
     bridges,
     props: new Set(),
+    chests: new Map(),
     founded,
     population,
     log,
@@ -1091,6 +1233,12 @@ function applyEvent(s: Snap, e: GenesisEvent): void {
       break;
     case 'prop':
       s.props.add(e.propId);
+      break;
+    case 'dig':
+      s.chests.set(e.chestId, 'digging');
+      break;
+    case 'discover':
+      s.chests.set(e.chestId, 'open');
       break;
     case 'log':
       s.log.push({ t: e.t, text: e.text });
