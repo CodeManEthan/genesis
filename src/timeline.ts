@@ -1531,6 +1531,9 @@ export function emptySnapshot(map: GenesisMap): WorldSnapshot {
   const snap: Snap = {
     t: 0,
     trees: new Map(),
+    /* ---- living details (additive) ---- */
+    felled: new Map(),
+    /* ---- end living details (additive) ---- */
     buildings,
     roads,
     bridges,
@@ -1559,6 +1562,11 @@ function applyEvent(s: Snap, e: GenesisEvent): void {
       break;
     case 'chop-done':
       s.trees.set(e.treeId, 'stump');
+      /* ---- living details (additive) ---- */
+      // The moment the tree went over, kept so the renderer can lay a log
+      // beside the stump for a while and take it away again.
+      s.felled.set(e.treeId, e.t);
+      /* ---- end living details (additive) ---- */
       break;
     case 'survey':
       s.buildings.set(e.buildingId, { status: 'surveyed', progress: 0.05 });
