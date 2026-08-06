@@ -202,7 +202,11 @@ async function runOne(browser, run) {
   });
 
   const url = urlFor(run);
+  // Headed, the tab has to be the front one or the compositor never asks it for
+  // a frame and `requestAnimationFrame` simply never fires.
+  await page.bringToFront().catch(() => {});
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.bringToFront().catch(() => {});
   const timeout = new Promise((r) => setTimeout(() => r('timeout'), 90000));
   const why = await Promise.race([done, timeout]);
   const metrics = await page.metrics().catch(() => ({}));
@@ -294,6 +298,8 @@ async function probeBuild(browser, cases) {
         layerH: scene.layer.height,
         vegW: scene.veg.c.width,
         vegH: scene.veg.c.height,
+        roadW: scene.roads.c.width,
+        roadH: scene.roads.c.height,
         trees: map.trees.length,
         sites: map.sites.length,
         buildings: map.sites.reduce((a, s) => a + s.buildings.length, 0),
@@ -322,7 +328,7 @@ function layerDims(map) {
   ];
 }
 
-function sceneBytes(W, H, viewport) {
+function sceneBytes(W, H, viewport, rw = 0, rh = 0) {
   const px = (w, h) => w * h * 4;
   // The frame buffer is the visible world rect: viewport device px / scale,
   // and at the fitted overview the scale is ~1 device px per world px.
@@ -336,9 +342,12 @@ function sceneBytes(W, H, viewport) {
     layerPx: `${W}x${H}`,
     terrain: px(W, H),
     veg: px(W, H),
+    // Finished roads get their own layer, sized to the network rather than to
+    // the padded map — see buildRoadLayer().
+    roads: px(rw, rh),
     frame: px(fw, fh),
     sprites: small,
-    total: px(W, H) * 2 + px(fw, fh) + small,
+    total: px(W, H) * 2 + px(rw, rh) + px(fw, fh) + small,
   };
 }
 
@@ -396,15 +405,30 @@ for (const pace of [1, 4]) {
   }
 }
 
-const browser = await puppeteer.launch({
-  executablePath: '/usr/bin/google-chrome',
-  headless: HEADED ? false : 'new',
-  args: [
-    ...(HEADED ? [] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']),
-    '--no-first-run',
-    '--hide-scrollbars',
-  ],
-});
+const launch = () =>
+  puppeteer.launch({
+    executablePath: '/usr/bin/google-chrome',
+    headless: HEADED ? false : 'new',
+    args: [
+      ...(HEADED ? [] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']),
+      '--no-first-run',
+      '--hide-scrollbars',
+    ],
+  });
+
+/**
+ * A headed run puts its page in a real window, and a real window only gets
+ * `requestAnimationFrame` while the compositor thinks it is on screen. Reusing
+ * one browser across the matrix means every tab after the first is at the mercy
+ * of whatever the desktop did in the meantime — on this machine that is a run
+ * that reports two scenarios and then times out on the rest, forever. So a
+ * headed run gets a fresh browser per scenario, which costs about a second each
+ * and makes the matrix reproducible. Headless has no window and no such
+ * problem, so it keeps the single browser.
+ */
+const PER_RUN = HEADED && !has('shared-browser');
+
+let browser = await launch();
 const chrome = await browser.version();
 const build = await probeBuild(browser, [
   { seed: plain, pace: 0.5 },
@@ -419,6 +443,10 @@ const build = await probeBuild(browser, [
 const results = [];
 for (const run of RUNS) {
   process.stdout.write(`  running ${run.sc.id} ${run.vp.id}${run.zoom ? ` zoom${run.zoom}` : ''} … `);
+  if (PER_RUN) {
+    await browser.close();
+    browser = await launch();
+  }
   const r = await runOne(browser, run);
   results.push(r);
   console.log(r.error ? `FAILED (${r.error})` : `avg ${r.avg}ms max ${r.max}ms`);
@@ -462,8 +490,8 @@ console.log(
 
 if (build.length) {
   for (const b of build) {
-    b.bytes = sceneBytes(b.layerW, b.layerH, VIEWPORTS[0]);
-    b.bytesPhone = sceneBytes(b.layerW, b.layerH, VIEWPORTS[1]);
+    b.bytes = sceneBytes(b.layerW, b.layerH, VIEWPORTS[0], b.roadW, b.roadH);
+    b.bytesPhone = sceneBytes(b.layerW, b.layerH, VIEWPORTS[1], b.roadW, b.roadH);
   }
   console.log('\n=== one-off world construction, in Chrome (cold, JIT-warmed) ===\n');
   console.log(
@@ -487,8 +515,10 @@ if (build.length) {
       { head: 'pace', right: true, get: (r) => r.pace },
       { head: 'terrain layer', get: (r) => `${r.layerW}x${r.layerH}` },
       { head: 'veg layer', get: (r) => `${r.vegW}x${r.vegH}` },
+      { head: 'roads layer', get: (r) => `${r.roadW}x${r.roadH}` },
       { head: 'terrain', right: true, get: (r) => MB(r.bytes.terrain) },
       { head: 'veg', right: true, get: (r) => MB(r.bytes.veg) },
+      { head: 'roads', right: true, get: (r) => MB(r.bytes.roads) },
       { head: 'frame(desktop)', right: true, get: (r) => MB(r.bytes.frame) },
       { head: 'frame(phone)', right: true, get: (r) => MB(r.bytesPhone.frame) },
       { head: 'sprites', right: true, get: (r) => MB(r.bytes.sprites) },

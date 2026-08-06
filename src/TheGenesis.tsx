@@ -24,6 +24,7 @@ import { TH, TW, hashSeed, type GenesisMap, type Timeline, type WorldSnapshot } 
 import { dayInfo } from './daytype.ts';
 import {
   buildGenesisScene,
+  buildGenesisSceneSteps,
   emptyPhases,
   makeAmbient,
   renderGenesis,
@@ -77,28 +78,29 @@ const USE_GENERATED = true;
  * generates more of the valley. The timeline then paces whatever it is handed
  * across the same 24 hours, which is why nothing here passes it along.
  */
-function loadWorld(seed: number, pace = 1): World {
-  if (USE_GENERATED) {
-    const map = generateMap(seed, pace);
-    return {
-      map,
-      timeline: buildTimeline(map),
-      emptySnapshot,
-      snapshotAt,
-      advance,
-    };
-  }
+function loadMap(seed: number, pace = 1): GenesisMap {
+  if (USE_GENERATED) return generateMap(seed, pace);
   // The fixture is one hand-written valley; there is no more of it to build.
   const map = fixtureMap();
   map.seed = seed;
-  return {
-    map,
-    timeline: fixtureTimeline(map),
-    emptySnapshot: fixtureEmptySnapshot,
-    snapshotAt: fixtureSnapshotAt,
-    advance: fixtureAdvance,
-  };
+  return map;
 }
+
+/** The other half of `loadWorld`, split out so the pre-generator that runs
+ * before midnight can pay for the map and the timeline on separate frames. */
+function worldFor(map: GenesisMap): World {
+  return USE_GENERATED
+    ? { map, timeline: buildTimeline(map), emptySnapshot, snapshotAt, advance }
+    : {
+        map,
+        timeline: fixtureTimeline(map),
+        emptySnapshot: fixtureEmptySnapshot,
+        snapshotAt: fixtureSnapshotAt,
+        advance: fixtureAdvance,
+      };
+}
+
+const loadWorld = (seed: number, pace = 1): World => worldFor(loadMap(seed, pace));
 
 /* --------------------------------- helpers ------------------------------- */
 
@@ -545,25 +547,48 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pushLog();
     };
 
-    /* ---- the world waiting on the other side of midnight ---------------- */
-    /** Pre-built while the valley is already dark, so the swap costs nothing. */
-    let pending: {
+    /* ---- the world waiting on the other side of midnight ----------------
+     * Tomorrow costs about 180ms to build: a map, a timeline and a bake. Doing
+     * that in one tick is a third of a second of frozen valley, and the valley
+     * is at its most watchable right then — the lamps are the only thing left
+     * on screen. So the build is broken into steps and one step is taken per
+     * frame from 23:24, which is a couple of hundred frames before it is
+     * needed even at the slowest playback that can reach midnight. */
+    interface Pending {
       seed: number;
       pace: number;
-      world: World;
-      scene: GenesisScene;
-    } | null = null;
+      map: GenesisMap | null;
+      world: World | null;
+      steps: Generator<void, GenesisScene, void> | null;
+      scene: GenesisScene | null;
+    }
+    let pending: Pending | null = null;
 
+    /** One step of the pre-build; never more than a few milliseconds. */
+    const stepPending = (s: number) => {
+      if (pending && (pending.seed !== s || pending.pace !== paceRef.current)) pending = null;
+      if (!pending) {
+        pending = { seed: s, pace: paceRef.current, map: null, world: null, steps: null, scene: null };
+        return;
+      }
+      if (pending.scene) return;
+      if (!pending.map) pending.map = loadMap(s, pending.pace);
+      else if (!pending.world) pending.world = worldFor(pending.map);
+      else if (!pending.steps) pending.steps = buildGenesisSceneSteps(pending.map, dayFor(s));
+      else {
+        const r = pending.steps.next();
+        if (r.done) pending.scene = r.value;
+      }
+    };
+
+    /** The finished article, whatever the clock did. If midnight arrives before
+     * the stepped build does — a scrub straight onto 23:59, or 3600× — the rest
+     * of it is simply paid for here, which is what used to happen every time. */
     const ensurePending = (s: number) => {
-      if (pending && pending.seed === s && pending.pace === paceRef.current) return pending;
-      const w = loadWorld(s, paceRef.current);
-      pending = {
-        seed: s,
-        pace: paceRef.current,
-        world: w,
-        scene: buildGenesisScene(w.map, dayFor(s)),
-      };
-      return pending;
+      while (!pending || pending.seed !== s || pending.pace !== paceRef.current || !pending.scene) {
+        stepPending(s);
+      }
+      return pending as Pending & { world: World; scene: GenesisScene };
     };
 
     /** A new seed or a new pace both mean a new map, and a new map is a whole
@@ -757,9 +782,10 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     }
 
     /* ---- the tick ------------------------------------------------------- */
-    // Generation is ~25ms; doing it here, deep in the dark, keeps the boundary
-    // itself free of any hitch at any playback speed.
-    const PREGEN_AT = 23.5;
+    // Tomorrow is built a step per frame from here on, deep in the dark, so the
+    // boundary itself is free of any hitch at any playback speed — and so is
+    // every frame leading up to it.
+    const PREGEN_AT = 23.4;
     let uiAccum = 0;
     const tick = (dt: number) => {
       const running = modeRef.current === 'live' || playingRef.current;
@@ -776,12 +802,12 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         if (raw >= 24) roll(stepSeed(seedRef.current, 1), raw - 24, false);
         else applyT(raw);
       }
-      // A pre-built world is only worth its ~35MB of baked canvases while
+      // A pre-built world is only worth its ~30MB of baked canvases while
       // midnight is actually coming. Scrub or pause back into the day and it is
-      // dropped again; the next approach to 23:30 rebuilds it.
+      // dropped again; the next approach to 23:24 rebuilds it.
       if (perf2) pSnapMs += performance.now() - tSnap0;
       if (tRef.current < PREGEN_AT) pending = null;
-      else if (running) ensurePending(comingSeed());
+      else if (running) stepPending(comingSeed());
       const tAmb0 = perf2 ? performance.now() : 0;
       syncAmbient(scene, amb, snapRef.current!);
       if (running && !reducedRef.current) {

@@ -371,7 +371,18 @@ interface RoadGeo {
   len: number;
 }
 
-/** One sprite that lives on the standing-wood layer. */
+/**
+ * Paint order at exactly equal depth, which is the order the per-frame pass
+ * used to draw these things in: the whole standing wood goes down first, then
+ * stumps, then site dressing. Only ever consulted when two sprites share a
+ * depth to the last bit; it exists so that baking cannot silently reorder a
+ * pair the old pass had an opinion about.
+ */
+const R_WOOD = 0;
+const R_STUMP = 1;
+const R_PROP = 2;
+
+/** One sprite that lives on the scenery layer. */
 interface VegItem {
   sprite: Sprite;
   depth: number;
@@ -379,7 +390,11 @@ interface VegItem {
   by: number;
   bw: number;
   bh: number;
-  /** Set for trees; undefined for wild scatter, which never changes state. */
+  /** `R_WOOD` | `R_STUMP` | `R_PROP` — the tie-break above. */
+  rank: number;
+  /** Tie-break inside a rank: the order the old per-frame pass pushed them. */
+  ord: number;
+  /** Set for standing trees; undefined for everything else. */
   treeId?: string;
 }
 
@@ -393,6 +408,55 @@ export interface VegLayer {
   on: boolean[];
   /** `snap.trees.size` the layer was last reconciled against; -1 = never. */
   size: number;
+  /**
+   * Two item slots per map tree — the tree standing, and the stump it leaves —
+   * of which at most one is ever painted. `2*k` and `2*k+1`.
+   */
+  slots: Int32Array;
+  /**
+   * Trees currently mid-chop, as indexes into `map.trees`. A tree only ever
+   * goes standing -> felling -> stump, and the first of those two steps grows
+   * `snap.trees`; so when the entry count has not moved, the only states that
+   * *can* have changed are these, and reconciling costs a handful of lookups
+   * instead of two thousand. This is also exactly the list the per-frame pass
+   * has to draw, because a tree under the axe is the one that shivers.
+   */
+  felling: number[];
+  /** Item slot per site prop, in site/prop order; -1 if the kind has no art. */
+  props: Int32Array;
+  /** `snap.props.size` at the last reconcile; -1 = never. */
+  propSize: number;
+}
+
+/**
+ * The finished road network, painted once.
+ *
+ * Every road is a five-strip stroke plus a scatter of loose stones, and at
+ * pace 4 a valley has seventeen of them — which is two and a half milliseconds
+ * a frame to redraw something that has not changed since lunchtime. So a road
+ * that has reached the end of its arclength is painted into this layer, once,
+ * and drops out of the per-frame list.
+ *
+ * ORDER. Roads overlap where they meet, so *which* road is on top at a junction
+ * is decided by paint order, and the per-frame pass paints them in map order.
+ * The layer is blitted before the remaining per-frame roads, so a road may only
+ * join the bake once every earlier road it overlaps has joined it too — which
+ * is the whole of `deps`. In practice roads are also *finished* in map order,
+ * so nothing is ever held back; the rule is there so that nothing can be.
+ */
+interface RoadLayer {
+  c: HTMLCanvasElement;
+  ctx: Ctx;
+  /** Where the layer's top-left sits in world pixels — its own, tighter than
+   * the terrain bake's, because a road network never reaches the padding. */
+  x: number;
+  y: number;
+  /** Parallel to `map.roads`: painted into `c`? */
+  baked: boolean[];
+  /** Earlier road indexes whose painted band touches this one's. */
+  deps: number[][];
+  /** How many are baked — a nonzero count is the only reason to blit. */
+  n: number;
 }
 
 /** The cell size of the vegetation index, in world pixels. */
@@ -413,6 +477,8 @@ export interface GenesisScene {
   ly: number;
   /** Standing trees + wild scatter, same size and origin as `layer`. */
   veg: VegLayer;
+  /** Finished roads, same size and origin as `layer`, blitted between them. */
+  roads: RoadLayer;
   surround: HTMLCanvasElement;
   frame: HTMLCanvasElement;
   pools: Record<string, Sprite[]>;
@@ -646,15 +712,173 @@ export function paintRoad(
   }
 }
 
+/* ------------------------------ finished roads ---------------------------- */
+
+/** Closest approach of two segments, 0 if they cross. Tile units. */
+function segSegDist(a1: Vec2, a2: Vec2, b1: Vec2, b2: Vec2): number {
+  const d1x = a2[0] - a1[0];
+  const d1y = a2[1] - a1[1];
+  const d2x = b2[0] - b1[0];
+  const d2y = b2[1] - b1[1];
+  const den = d1x * d2y - d1y * d2x;
+  if (Math.abs(den) > 1e-9) {
+    const ex = b1[0] - a1[0];
+    const ey = b1[1] - a1[1];
+    const s = (ex * d2y - ey * d2x) / den;
+    const u = (ex * d1y - ey * d1x) / den;
+    if (s >= 0 && s <= 1 && u >= 0 && u <= 1) return 0;
+  }
+  return Math.min(
+    segDist(a1[0], a1[1], b1, b2),
+    segDist(a2[0], a2[1], b1, b2),
+    segDist(b1[0], b1[1], a1, a2),
+    segDist(b2[0], b2[1], a1, a2)
+  );
+}
+
+/**
+ * How far off its centreline a road can put ink, in tile units: the widest
+ * strip is `width + 0.55`, and the loose stones are thrown a further
+ * `width * 0.8` sideways and are a few screen pixels long. Deliberately
+ * generous — an overestimate only costs a road its place in the bake for as
+ * long as an earlier neighbour is unfinished, and they finish in order anyway.
+ */
+const roadReach = (r: RoadSpec) => r.width * 1.8 + 1.5;
+
+/**
+ * The widest a road's ink can stray from a control point, in world pixels.
+ * `strip` offsets by `halfW` tile units perpendicular and projects, which is
+ * 16 px of x and 8 px of y per tile unit; the stones add another `width * 0.8`
+ * sideways and a few pixels of their own length. Rounded well up.
+ */
+const ROAD_MARGIN = 64;
+
+function buildRoadLayer(scene: GenesisScene): RoadLayer {
+  const roads = scene.map.roads;
+  // A road network reaches from town to town and never into the padding the
+  // terrain bake carries, so the layer only has to be as big as the network.
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const r of roads) {
+    for (const [gx, gy] of r.pts) {
+      const x = isoX(gx, gy);
+      const y = isoY(gx, gy);
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+  }
+  const empty = !roads.length;
+  const rx = empty ? 0 : Math.floor(x0) - ROAD_MARGIN;
+  const ry = empty ? 0 : Math.floor(y0) - ROAD_MARGIN;
+  const c = document.createElement('canvas');
+  c.width = empty ? 1 : Math.ceil(x1) + ROAD_MARGIN - rx;
+  c.height = empty ? 1 : Math.ceil(y1) + ROAD_MARGIN - ry;
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+  ctx.translate(-rx, -ry);
+
+  const deps: number[][] = roads.map(() => []);
+  for (let i = 0; i < roads.length; i++) {
+    const ri = roads[i];
+    for (let j = 0; j < i; j++) {
+      const rj = roads[j];
+      const reach = roadReach(ri) + roadReach(rj);
+      let hit = false;
+      for (let a = 0; a + 1 < ri.pts.length && !hit; a++) {
+        for (let b = 0; b + 1 < rj.pts.length; b++) {
+          if (segSegDist(ri.pts[a], ri.pts[a + 1], rj.pts[b], rj.pts[b + 1]) < reach) {
+            hit = true;
+            break;
+          }
+        }
+      }
+      if (hit) deps[i].push(j);
+    }
+  }
+  return { c, ctx, x: rx, y: ry, baked: roads.map(() => false), deps, n: 0 };
+}
+
+/** The stone seed a road is stroked with — same expression in both passes. */
+const roadStoneSeed = (road: RoadSpec) => 2024 + road.id.length * 31;
+
+/**
+ * Move every newly finished road onto the layer, and throw the layer away if a
+ * scrub has un-built one. Ascending order, so a road whose dependencies clear
+ * in this very pass still joins in this very pass.
+ */
+function syncRoads(scene: GenesisScene, snap: WorldSnapshot): void {
+  const R = scene.roads;
+  const roads = scene.map.roads;
+  if (R.n) {
+    for (let i = 0; i < roads.length; i++) {
+      if (R.baked[i] && (snap.roads.get(roads[i].id) ?? 0) < 1) {
+        R.ctx.save();
+        R.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        R.ctx.clearRect(0, 0, R.c.width, R.c.height);
+        R.ctx.restore();
+        R.baked.fill(false);
+        R.n = 0;
+        break;
+      }
+    }
+  }
+  if (R.n === roads.length) return;
+  for (let i = 0; i < roads.length; i++) {
+    if (R.baked[i]) continue;
+    if ((snap.roads.get(roads[i].id) ?? 0) < 1) continue;
+    let ready = true;
+    for (const j of R.deps[i]) if (!R.baked[j]) ready = false;
+    if (!ready) continue;
+    const road = roads[i];
+    paintRoad(R.ctx, road.pts, road.kind, road.width, roadStoneSeed(road));
+    R.baked[i] = true;
+    R.n++;
+  }
+}
+
 /* ---------------------------------- bake --------------------------------- */
 
 /**
+ * Build the whole scene in one go. Every caller that can afford ~150ms — the
+ * first load, a new seed, a new pace — uses this.
+ *
  * @param day What kind of day, and what time of year. The season reaches the
  *   ground tint and the leaf pools from here and nowhere else; the day type is
  *   kept on the scene for the overlays and the sky. Defaults to an ordinary
  *   summer day, which is the world exactly as it was before rare days existed.
  */
 export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): GenesisScene {
+  const steps = buildGenesisSceneSteps(map, day);
+  for (;;) {
+    const r = steps.next();
+    if (r.done) return r.value;
+  }
+}
+
+/**
+ * The same build, as a generator that pauses at safe points.
+ *
+ * The one caller that cannot afford 150ms in a single tick is the pre-generator
+ * that runs while the visitor is watching the valley go dark before midnight:
+ * a hitch there is a hitch in the one moment the day is supposed to hand over
+ * invisibly. So it drives this a step at a time, one step per frame, and the
+ * whole build is spread over a couple of seconds of a world that has nothing
+ * left to do.
+ *
+ * It is a generator and not a hand-rolled state machine on purpose: there is
+ * exactly one copy of the build, so the stepped path cannot drift from the
+ * synchronous one. The `yield`s are placed where no local is half-written and
+ * — crucially — where no seeded rng stream is mid-sequence, which a generator
+ * preserves for free.
+ */
+export function* buildGenesisSceneSteps(
+  map: GenesisMap,
+  day: DayInfo = PLAIN_DAY
+): Generator<void, GenesisScene, void> {
   const B = map.bounds;
   const x0 = B.u0 * (TW / 2);
   const x1 = B.u1 * (TW / 2);
@@ -733,7 +957,16 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
   const grng = mulberry32(1337);
   const grassEdge = seasonGround(PAL.grassEdge, day.season);
   const tuft = seasonGround(PAL.leafDark, day.season);
-  for (let v = Math.floor(B.v0) - OVER_V; v <= Math.ceil(B.v1) + OVER_V; v++) {
+  yield;
+  // The tile loop is by far the longest stretch of the build, so it breathes
+  // every few rows. `grng` is a live sequence across the whole loop and the
+  // generator keeps it exactly where it was — which is the reason a step is a
+  // `yield` and not a re-entrant function.
+  const V0 = Math.floor(B.v0) - OVER_V;
+  const V1 = Math.ceil(B.v1) + OVER_V;
+  const ROWS = 24;
+  for (let v = V0; v <= V1; v++) {
+    if (v > V0 && (v - V0) % ROWS === 0) yield;
     for (let u = Math.floor(B.u0) - OVER_U; u <= Math.ceil(B.u1) + OVER_U; u++) {
       if ((u + v) & 1) continue;
       const gx = (u + v) / 2;
@@ -772,10 +1005,12 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
     }
   }
 
+  yield;
   /* ---- the lakes ------------------------------------------------------- */
   // Drawn BEFORE the river, so a river-fed lake reads as the water widening
   // out rather than as a pond laid on top of a channel that vanishes into it.
   for (const lk of map.lakes ?? []) bakeLake(ctx, lk);
+  yield;
 
   /* ---- the river ------------------------------------------------------- */
   // Run both ends on past the map edge so the water leaves the frame instead of
@@ -798,6 +1033,7 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
     }
   }
 
+  yield;
   /* ---- indexes --------------------------------------------------------- */
   const roadGeo = new Map<string, RoadGeo>();
   const roadById = new Map<string, RoadSpec>();
@@ -814,6 +1050,9 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
   // turns — but it has to turn, or the map sits in a summer frame all winter.
   const surround = buildForestPattern();
   seasonCanvas(surround, day.season, 0.6);
+  yield;
+  const pools = makePools(day.season);
+  yield;
 
   const scene: GenesisScene = {
     map,
@@ -821,9 +1060,10 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
     lx,
     ly,
     veg: null as unknown as VegLayer,
+    roads: null as unknown as RoadLayer,
     surround,
     frame: document.createElement('canvas'),
-    pools: makePools(day.season),
+    pools,
     extra: new Map(),
     structs: new Map(),
     roadGeo,
@@ -840,19 +1080,45 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
     day,
     beyond: seasonGround('#3f7f66', day.season),
   };
-  scene.veg = buildVeg(scene, W, H);
+  scene.veg = yield* buildVeg(scene, W, H);
+  yield;
+  scene.roads = buildRoadLayer(scene);
   return scene;
 }
 
-/* --------------------------- the standing wood --------------------------- */
+/* ------------------------------- the scenery ----------------------------- */
 
 /**
- * Every tree (drawn as if standing) and every wild prop, sorted into one
- * depth-ordered list, indexed by cell, and painted onto a transparent layer that
- * sits exactly on top of the terrain bake. Whether an entry is actually painted
- * is tracked in `on`, so a chopped tree can be lifted off with a small patch.
+ * Every sprite that stands still.
+ *
+ * Originally this was the standing wood alone; everything else went through a
+ * depth-sorted pass rebuilt from scratch every frame. But by evening at pace 4
+ * that pass is fourteen hundred `drawImage` calls, and eleven hundred of them
+ * are stumps, well-heads and haystacks that have not moved since the hour they
+ * appeared. So the layer now carries all of them:
+ *
+ *   every tree, drawn standing         on while it stands
+ *   the stump it leaves                on once the axe is done
+ *   every wild scatter prop            always on
+ *   every piece of site dressing       on once the timeline raises it
+ *
+ * All four go into ONE depth-sorted list on ONE canvas, because depth order
+ * between them matters — a well in front of a fir has to be in front of it —
+ * and a single sorted array is the only cheap way to say that. Slots for
+ * things that do not exist yet are allocated and indexed at build time and
+ * simply left unpainted, which is what keeps item index synonymous with depth
+ * order for the whole life of the layer: the occlusion repair's early break and
+ * `patchVeg`'s paint order both depend on that and on nothing else.
+ *
+ * What is left in the per-frame pass is what actually changes per frame: the
+ * crowd, the wildlife, a tree mid-fall, a chest being dug, a building still
+ * going up and its crane.
  */
-function buildVeg(scene: GenesisScene, W: number, H: number): VegLayer {
+function* buildVeg(
+  scene: GenesisScene,
+  W: number,
+  H: number
+): Generator<void, VegLayer, void> {
   const c = document.createElement('canvas');
   c.width = W;
   c.height = H;
@@ -861,7 +1127,15 @@ function buildVeg(scene: GenesisScene, W: number, H: number): VegLayer {
   ctx.translate(-scene.lx, -scene.ly);
 
   const items: VegItem[] = [];
-  const add = (sprite: Sprite, gx: number, gy: number, treeId?: string) => {
+  /** Build order, which the sort keeps as the tie-break inside a rank. */
+  const add = (
+    sprite: Sprite,
+    gx: number,
+    gy: number,
+    rank: number,
+    ord: number,
+    treeId?: string
+  ): number => {
     const x = isoX(gx, gy);
     const y = isoY(gx, gy);
     items.push({
@@ -871,23 +1145,73 @@ function buildVeg(scene: GenesisScene, W: number, H: number): VegLayer {
       by: y - sprite.oy,
       bw: sprite.c.width,
       bh: sprite.c.height,
+      rank,
+      ord,
       treeId,
     });
+    return items.length - 1;
   };
 
-  for (const tr of scene.map.trees) {
+  const trees = scene.map.trees;
+  const slots = new Int32Array(trees.length * 2);
+  const on: boolean[] = [];
+  for (let k = 0; k < trees.length; k++) {
+    const tr = trees[k];
     const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
-    add(p[Math.abs(tr.seed) % p.length], tr.gx, tr.gy, tr.id);
+    slots[k * 2] = add(p[Math.abs(tr.seed) % p.length], tr.gx, tr.gy, R_WOOD, k, tr.id);
+    on.push(true);
+    const st = scene.pools.stump;
+    slots[k * 2 + 1] = add(st[Math.abs(tr.seed) % st.length], tr.gx, tr.gy, R_STUMP, k);
+    on.push(false);
   }
   for (const p of scene.map.scatter) {
     const sp = propSprite(scene, p.kind, p.seed, '#63c9a8');
-    if (sp) add(sp, p.gx, p.gy);
+    if (sp) {
+      add(sp, p.gx, p.gy, R_WOOD, trees.length + on.length);
+      on.push(true);
+    }
+  }
+  // Site dressing, in the order the per-frame pass used to push it: site by
+  // site, prop by prop. `-1` is a kind with no art, which that pass skipped too.
+  let np = 0;
+  for (const s of scene.map.sites) np += s.props.length;
+  const props = new Int32Array(np).fill(-1);
+  let pi = 0;
+  for (const site of scene.map.sites) {
+    for (const p of site.props) {
+      const sp = propSprite(scene, p.kind, p.seed, site.accent);
+      if (sp) {
+        props[pi] = add(sp, p.gx, p.gy, R_PROP, pi);
+        on.push(false);
+      }
+      pi++;
+    }
   }
 
-  items.sort((a, b) => a.depth - b.depth || a.bx - b.bx);
+  yield;
+  // Sorted by depth, then by the rank the old per-frame pass implied, then by
+  // build order — for the wood, whose ordering predates all this, by `bx`.
+  const order = items.map((_, i) => i);
+  order.sort((a, b) => {
+    const A = items[a];
+    const B = items[b];
+    return (
+      A.depth - B.depth ||
+      A.rank - B.rank ||
+      (A.rank === R_WOOD ? A.bx - B.bx : A.ord - B.ord) ||
+      a - b
+    );
+  });
+  const pos = new Int32Array(items.length);
+  for (let i = 0; i < order.length; i++) pos[order[i]] = i;
+  const sorted = order.map((i) => items[i]);
+  const sortedOn = order.map((i) => on[i]);
+  for (let i = 0; i < slots.length; i++) slots[i] = pos[slots[i]];
+  for (let i = 0; i < props.length; i++) if (props[i] >= 0) props[i] = pos[props[i]];
 
+  yield;
   const grid = new Map<number, number[]>();
-  items.forEach((it, i) => {
+  sorted.forEach((it, i) => {
     const cx0 = Math.floor(it.bx / VCELL);
     const cx1 = Math.floor((it.bx + it.bw) / VCELL);
     const cy0 = Math.floor(it.by / VCELL);
@@ -905,11 +1229,16 @@ function buildVeg(scene: GenesisScene, W: number, H: number): VegLayer {
   const veg: VegLayer = {
     c,
     ctx,
-    items,
+    items: sorted,
     grid,
-    on: items.map(() => true),
+    on: sortedOn,
     size: -1,
+    slots,
+    felling: [],
+    props,
+    propSize: -1,
   };
+  yield;
   bakeVeg(scene, veg);
   return veg;
 }
@@ -960,27 +1289,71 @@ function patchVeg(veg: VegLayer, r: VegItem): void {
 }
 
 /**
- * Reconcile the standing-wood layer with the snapshot. A tree only leaves the
- * layer when the timeline puts it under the axe, so the entry count of
- * `snap.trees` is a complete fingerprint: the felled set is always a prefix of
- * the chop-start events, forwards or backwards.
+ * Force the next `syncVeg` to reconcile from scratch. The forward paths below
+ * lean on the snapshot only ever growing; a scrub backwards breaks that, so the
+ * one call site that knows a scrub has happened says so.
+ */
+export function invalidateVeg(scene: GenesisScene): void {
+  scene.veg.size = -1;
+  scene.veg.propSize = -1;
+}
+
+/**
+ * Reconcile the scenery layer with the snapshot.
+ *
+ * Two fingerprints keep this off the critical path. A tree only ever enters
+ * `snap.trees` when the axe starts, so while the entry count is unchanged the
+ * only trees that can have moved on are the ones already mid-chop — a list the
+ * renderer wants anyway. Site dressing only ever appears, so `snap.props.size`
+ * is a complete fingerprint of the whole set. Both are exact forwards; a
+ * backwards scrub comes through `invalidateVeg` above and rescans everything.
  */
 export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
   const veg = scene.veg;
-  if (veg.size === snap.trees.size) return;
-  veg.size = snap.trees.size;
-
   const changed: number[] = [];
-  for (let i = 0; i < veg.items.length; i++) {
-    const id = veg.items[i].treeId;
-    if (id === undefined) continue;
-    const want = (snap.trees.get(id) ?? 'standing') === 'standing';
-    if (want !== veg.on[i]) changed.push(i);
-  }
-  if (!changed.length) return;
 
+  /** Flip one slot if the snapshot disagrees with the bake. */
+  const want = (slot: number, wanted: boolean) => {
+    if (slot >= 0 && veg.on[slot] !== wanted) changed.push(slot);
+  };
+
+  if (veg.size !== snap.trees.size) {
+    veg.size = snap.trees.size;
+    const trees = scene.map.trees;
+    const felling: number[] = [];
+    for (let k = 0; k < trees.length; k++) {
+      const st = snap.trees.get(trees[k].id);
+      if (st === 'felling') felling.push(k);
+      want(veg.slots[k * 2], st === undefined || st === 'standing');
+      want(veg.slots[k * 2 + 1], st === 'stump');
+    }
+    veg.felling = felling;
+  } else if (veg.felling.length) {
+    const trees = scene.map.trees;
+    const felling: number[] = [];
+    for (const k of veg.felling) {
+      const st = snap.trees.get(trees[k].id);
+      if (st === 'felling') {
+        felling.push(k);
+        continue;
+      }
+      want(veg.slots[k * 2], st === undefined || st === 'standing');
+      want(veg.slots[k * 2 + 1], st === 'stump');
+    }
+    veg.felling = felling;
+  }
+
+  if (veg.propSize !== snap.props.size) {
+    veg.propSize = snap.props.size;
+    let pi = 0;
+    for (const site of scene.map.sites) {
+      for (const p of site.props) want(veg.props[pi++], snap.props.has(p.id));
+    }
+  }
+
+  if (!changed.length) return;
   for (const i of changed) veg.on[i] = !veg.on[i];
-  // A scrub can move hundreds of trees at once; past a few dozen patches a
+  // A scrub can move hundreds of sprites at once; past a few dozen patches a
   // straight re-bake of the whole layer is the cheaper of the two.
   if (changed.length > 40) bakeVeg(scene, veg);
   else for (const i of changed) patchVeg(veg, veg.items[i]);
@@ -1702,6 +2075,10 @@ function stepSmoke(amb: Ambient, dt: number): void {
 
 /** Scrubbing backwards throws the whole ambient layer away and re-seeds it. */
 export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
+  // The baked scenery is derived from the snapshot too, and its cheap forward
+  // fingerprints assume the day only ever moves on. This is the one call site
+  // that knows it has not, so it is where the bake is told to start again.
+  invalidateVeg(scene);
   amb.bots = [];
   amb.crews.clear();
   amb.pop.clear();
@@ -2245,14 +2622,21 @@ export function renderGenesis(
   const wy1 = cy + bh + 64;
   const inView = (x: number, y: number) => x > wx0 && x < wx1 && y > wy0 && y < wy1;
 
-  /* ---- roads, clipped to what has actually been built ------------------ */
-  for (const road of scene.map.roads) {
+  /* ---- roads, clipped to what has actually been built ------------------
+   * The finished ones are already on their own layer, in map order and under
+   * everything the per-frame pass is about to lay over them; only the road
+   * still growing is stroked here. */
+  syncRoads(scene, snap);
+  if (scene.roads.n) g.drawImage(scene.roads.c, scene.roads.x, scene.roads.y);
+  for (let i = 0; i < scene.map.roads.length; i++) {
+    if (scene.roads.baked[i]) continue;
+    const road = scene.map.roads[i];
     const frac = snap.roads.get(road.id) ?? 0;
     if (frac <= 0.001) continue;
     const geo = scene.roadGeo.get(road.id)!;
     const pts = cutPolyline(road.pts, geo, frac);
     if (pts.length < 2) continue;
-    paintRoad(g, pts, road.kind, road.width, 2024 + road.id.length * 31);
+    paintRoad(g, pts, road.kind, road.width, roadStoneSeed(road));
     // A ribboned stake marks the head of an unfinished road.
     if (frac < 0.995) {
       const head = pts[pts.length - 1];
@@ -2279,7 +2663,7 @@ export function renderGenesis(
   }
   if (P) lap('roads');
 
-  /* ---- the standing wood, straight off its own layer -------------------- */
+  /* ---- the standing wood, the stumps and the dressing, off one layer ----- */
   g.drawImage(scene.veg.c, scene.lx, scene.ly);
   if (P) lap('veg');
 
@@ -2302,16 +2686,11 @@ export function renderGenesis(
     });
   };
 
-  // Only the trees the day is actually touching. Everything still standing is
-  // already on the layer that was blitted a moment ago.
-  for (const tr of scene.map.trees) {
-    const state = snap.trees.get(tr.id);
-    if (state === undefined || state === 'standing') continue;
-    if (state === 'stump') {
-      const sp = scene.pools.stump[Math.abs(tr.seed) % scene.pools.stump.length];
-      push(sp, tr.gx, tr.gy);
-      continue;
-    }
+  // Only the trees actually under the axe. Everything still standing, and every
+  // stump the day has already left, is on the layer blitted a moment ago —
+  // `syncVeg` keeps this list as a by-product of putting them there.
+  for (const k of scene.veg.felling) {
+    const tr = scene.map.trees[k];
     const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
     const sp = p[Math.abs(tr.seed) % p.length];
     // A tree under the axe leans and shivers a couple of pixels — enough to
@@ -2350,12 +2729,13 @@ export function renderGenesis(
     }
   }
 
+  // Site dressing itself is baked; what is left of it here is the light it
+  // throws, which is a screen-space pass and cannot be.
+  let pi = 0;
   for (const site of scene.map.sites) {
     for (const p of site.props) {
-      if (!snap.props.has(p.id)) continue;
-      const sp = propSprite(scene, p.kind, p.seed, site.accent);
-      if (!sp) continue;
-      push(sp, p.gx, p.gy);
+      const slot = scene.veg.props[pi++];
+      if (slot < 0 || !scene.veg.on[slot]) continue;
       if (sky.lamps > 0.02 && (p.kind === 'lamp' || p.kind === 'campfire')) {
         const x = isoX(p.gx, p.gy);
         const y = isoY(p.gx, p.gy);
