@@ -31,7 +31,7 @@ import {
   type Timeline,
   type WorldSnapshot,
 } from './types';
-import { dayInfo } from './daytype.ts';
+import { DAY_TYPES, dayInfo, dayOfType, type DayType } from './daytype.ts';
 import {
   buildGenesisScene,
   buildGenesisSceneSteps,
@@ -221,8 +221,35 @@ function monthOfSeed(seed: number): number | null {
   return null;
 }
 
+/**
+ * DEV ONLY — `?day=flood`, `?day=drought`, `?day=stars`…
+ *
+ * The lottery decides what kind of day a seed is and nothing here argues with
+ * it; this simply photographs a chosen kind of day on a chosen valley, which is
+ * the only way to put a flooded river and a dried-up one at the SAME bend of
+ * the same map. Read once, because the answer cannot change without a reload.
+ * An unrecognised value is ignored rather than treated as an ordinary day, so
+ * a typo shows you the real seed instead of quietly lying about it.
+ */
+let dayForced: DayType | null | undefined;
+function forcedDay(): DayType | null {
+  if (dayForced === undefined) {
+    const v =
+      typeof window === 'undefined'
+        ? null
+        : new URLSearchParams(window.location.search).get('day');
+    dayForced = v && (DAY_TYPES as string[]).includes(v) ? (v as DayType) : null;
+  }
+  return dayForced;
+}
+
 /** What kind of day this seed is, and what time of year. */
-const dayFor = (seed: number) => dayInfo(seed, monthOfSeed(seed));
+const dayFor = (seed: number) => {
+  const forced = forcedDay();
+  return forced
+    ? dayOfType(seed, forced, monthOfSeed(seed))
+    : dayInfo(seed, monthOfSeed(seed));
+};
 
 /* ---- ruins (additive) ----------------------------------------------------
  * Yesterday's seed, which is the whole of what the ghost needs.

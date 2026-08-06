@@ -1659,6 +1659,29 @@ const WEATHER_LOG: Partial<Record<DayType, string[]>> = {
     'The rain moves off. Wet timber, and an afternoon to make up before dark.',
   ],
   aurora: ['Green light standing over the north ridge. Nobody at {town} goes in.'],
+  /* ---- more day types (additive) --------------------------------------- *
+   * Three more days, on exactly the same terms as the four above: lines in the
+   * ledger and nothing else. None of them warps time — `stormWarp` is the only
+   * time warp there is and there will not be a second, because two warps on one
+   * day would compose into a shape the pacing solver never solved for.
+   *
+   * The stars get ONE line, on purpose. The ledger is a work record kept by
+   * people with a valley to build, and a man who writes two paragraphs about a
+   * meteor was not working. */
+  stars: ['A star falls over the long wood west of {town}. Two people see it, and neither was looking.'],
+  // FLOOD — the water is up all day; these are the two hours somebody writes it
+  // down. It grumbles about the crossing without the crossing having moved:
+  // the ford is exactly where it was this morning, under four feet of river.
+  flood: [
+    'The river is up over the low bank and running brown. Whatever the shallows were yesterday, they are not shallows today.',
+    'Still up at dusk, and still brown. {valley} is short one hurdle, one gate and most of somebody’s woodpile.',
+  ],
+  // DROUGHT — the opposite complaint, in the same voice.
+  drought: [
+    'The river is down to a thread between the stones. Everything with legs in {valley} is standing in what is left of it.',
+    'No rain again. The bed above {town} is dry enough to walk up, and two people have, for no reason either could give.',
+  ],
+  /* ---- end more day types (additive) ------------------------------------ */
 };
 
 /**
@@ -1693,10 +1716,16 @@ function weather(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
   // When each line lands: the mist once the light is up and it is a fact rather
   // than a forecast, the aurora once it is properly out, and the two-line
   // phenomena on their own edges.
+  // A falling star is written up the same way an aurora is: once, shortly after
+  // it is worth looking at. Flood and drought fall through to the two-line
+  // default, which is exactly right — their `from`/`to` are the hours the
+  // valley talks about the water rather than the hours the water is wrong (see
+  // daytype.ts), so "just after `from`" and "just after `to`" are the morning
+  // and the evening somebody walked down to look at it.
   const at =
     day.type === 'mist'
       ? [day.from + 1.6]
-      : day.type === 'aurora'
+      : day.type === 'aurora' || day.type === 'stars'
         ? [day.from + 0.5]
         : [day.from + 0.22, day.to + 0.18];
   const rng = mulberry32(((map.seed >>> 0) ^ 0x5c0d1e77) >>> 0);
