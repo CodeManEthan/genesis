@@ -32,6 +32,9 @@ import {
   type WorldSnapshot,
 } from './types';
 import { DAY_TYPES, dayInfo, dayOfType, type DayType } from './daytype.ts';
+/* ---- living details II (additive) ---- */
+import { chopDoneTimes } from './living.ts';
+/* ---- end living details II (additive) ---- */
 import {
   buildGenesisScene,
   buildGenesisSceneSteps,
@@ -116,15 +119,20 @@ function worldFor(map: GenesisMap): World {
 const loadWorld = (seed: number, pace = 1): World => worldFor(loadMap(seed, pace));
 
 /**
- * FESTIVAL — the one thing about the day the bake cannot work out for itself.
+ * The facts about the day that the bake cannot work out for itself.
  *
  * Whether the valley finished early enough to earn an evening is a fact about
  * the *timeline*, and `buildGenesisScene` has never seen one. So it is joined on
  * here, at the only three places that ever hold a matching scene and world:
  * first load, a rebuild, and the world waiting on the far side of midnight.
+ *
+ * LIVING DETAILS II joins the felling clock on at the same seam and for the
+ * same reason: which minute each tree hits the ground is the plan's business,
+ * not the map's, and a tree cannot be drawn going over without it.
  */
-function withFestival(sc: GenesisScene, w: World): GenesisScene {
+function withTimelineFacts(sc: GenesisScene, w: World): GenesisScene {
   sc.fest = festivalAt(w.map, w.timeline);
+  sc.chopDone = chopDoneTimes(w.timeline);
   return sc;
 }
 
@@ -494,7 +502,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       setTDisp(t0);
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
-      sceneRef.current = withFestival(
+      sceneRef.current = withTimelineFacts(
         buildGenesisScene(world.map, dayFor(seed0), ghostOf(world.map, seed0)),
         world
       );
@@ -681,7 +689,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         pending.steps = buildGenesisSceneSteps(pending.map, dayFor(s), pending.ghost);
       else {
         const r = pending.steps.next();
-        if (r.done) pending.scene = withFestival(r.value, pending.world!);
+        if (r.done) pending.scene = withTimelineFacts(r.value, pending.world!);
       }
     };
 
@@ -704,7 +712,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pending = null;
       world = loadWorld(s, p);
       worldRef.current = world;
-      scene = withFestival(
+      scene = withTimelineFacts(
         buildGenesisScene(world.map, dayFor(s), ghostOf(world.map, s)),
         world
       );

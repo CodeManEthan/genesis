@@ -4101,3 +4101,116 @@ export function buildSapling(seed: number): Sprite {
 }
 
 /* ===================== end living details (additive) ===================== */
+
+/* =================== living details II (additive block) ==================
+ * A half-fallen tree, hay that grows, and a timber yard that fills up. All
+ * three are drawn from art that already existed wherever art that already
+ * existed would do: the leaning tree is the standing tree under a transform,
+ * and the two new hay and two new lumber sprites are the middle-aged ones they
+ * already had, younger and older. Nothing here is a new KIND of thing — they
+ * are new AGES of things, which is why they share their siblings' seeds.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A tree on its hinge.
+ *
+ * A shear about the foot of the trunk, not a rotation. Every tree sprite in the
+ * valley carries its own ground shadow as a flat diamond at its base: a
+ * rotation swings that shadow up into the air with the crown, which reads as
+ * the whole tree levitating, whereas a shear leaves the base row exactly where
+ * it was and slides everything above it sideways in proportion to its height —
+ * which is what a tree bending over its own stump actually does. `squash` takes
+ * the height the fall trades for reach.
+ *
+ * `x`,`y` is the tree's anchor, i.e. the foot of the trunk, in the same world
+ * pixels `drawImage` would have taken. One transformed blit, no new canvas: the
+ * handful of trees mid-fall at any moment are the only per-frame tree draws in
+ * the valley, and this keeps them that way.
+ */
+export function drawLeaningTree(
+  ctx: Ctx,
+  sp: Sprite,
+  x: number,
+  y: number,
+  k: number,
+  squash: number
+): void {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.transform(1, 0, -k, squash, 0, 0);
+  ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+  ctx.restore();
+}
+
+/**
+ * Hay, stage 0 — the cut grass raked into a heap, an hour old.
+ *
+ * Same seed as `buildHaystack`, drawn in the same order, so a field's hay keeps
+ * its width and its colour as it grows: this is the same rick, younger.
+ */
+export function buildHayHeap(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const w = 20 + Math.floor(rng() * 6);
+  const ww = Math.round(w * 0.66);
+  return makeSprite(w + 8, 30, (w + 8) / 2, 25, (ctx) => {
+    poly(ctx, diamond(1, 1, ww + 4), PAL.shadow);
+    blob(ctx, 0, -7, [5, 10, 14, ww - 3, ww, ww, 4], '#e0b569');
+    blob(ctx, -2, -6, [3, 6, 6, 4], '#f0cd86');
+    for (let i = 0; i < 3; i++) rect(ctx, -ww / 2 + 3 + i * 4, -2 - (i % 2), 2, 1, '#c99b4e');
+    // Loose stalks still lying where the scythe left them.
+    rect(ctx, ww / 2 - 1, 0, 4, 1, '#d9b978');
+    rect(ctx, -ww / 2 - 3, -1, 3, 1, '#d9b978');
+  });
+}
+
+/** Hay, stage 1 — forked up into a cock, but not yet thatched or poled. */
+export function buildHayCock(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const w = 20 + Math.floor(rng() * 6);
+  const ww = Math.round(w * 0.86);
+  return makeSprite(w + 8, 30, (w + 8) / 2, 25, (ctx) => {
+    poly(ctx, diamond(1, 1, ww + 4), PAL.shadow);
+    blob(ctx, 0, -12, [4, 8, 12, 15, 17, ww - 2, ww, ww, ww - 2, 4], '#e6bd6e');
+    blob(ctx, -3, -11, [3, 6, 8, 7, 5], '#f2d08c');
+    for (let i = 0; i < 4; i++) rect(ctx, -ww / 2 + 3 + i * 4, -4 - (i % 2), 2, 1, '#c99b4e');
+  });
+}
+
+/** Timber, stage 0 — the first two boards off the saw. */
+export function buildLumberLow(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(28, 27, 14, 22, (ctx) => {
+    poly(ctx, diamond(1, 1, 22), PAL.shadow);
+    for (let i = 0; i < 2; i++) {
+      const y = -3 - i * 3;
+      const x = -9 + i * 1.5;
+      poly(ctx, [[x, y], [x + 17, y - 8], [x + 17, y - 5], [x, y + 3]], i % 2 ? PAL.woodLight : PAL.wood);
+      poly(ctx, [[x, y], [x, y + 3], [x + 2, y + 4], [x + 2, y + 1]], PAL.woodDark);
+    }
+    // The tools that put them there, since there is room at this height.
+    if (rng() < 0.5) rect(ctx, 9, -5, 1, 5, PAL.woodDark);
+  });
+}
+
+/** Timber, stage 2 — a yard that has had a good day. */
+export function buildLumberHigh(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(32, 42, 16, 34, (ctx) => {
+    poly(ctx, diamond(1, 1, 26), PAL.shadow);
+    for (let i = 0; i < 8; i++) {
+      const y = -3 - i * 3;
+      const x = -9 + i * 1.5;
+      poly(ctx, [[x, y], [x + 17, y - 8], [x + 17, y - 5], [x, y + 3]], i % 2 ? PAL.woodLight : PAL.wood);
+      poly(ctx, [[x, y], [x, y + 3], [x + 2, y + 4], [x + 2, y + 1]], PAL.woodDark);
+    }
+    // Two ends sticking out of the stack, and the off-cuts nobody has moved.
+    poly(ctx, [[2, -30], [12, -35], [12, -32], [2, -27]], shade(PAL.woodLight, 0.12));
+    rect(ctx, -11, -3, 4, 3, PAL.woodDark);
+    if (rng() < 0.5) {
+      rect(ctx, 8, -6, 5, 6, PAL.stoneDark);
+      rect(ctx, 8, -7, 5, 1, PAL.stone);
+    }
+  });
+}
+
+/* ================= end living details II (additive block) ================= */
