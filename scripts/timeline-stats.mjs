@@ -17,9 +17,36 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const gdir = join(root, 'src/components/designs/genesis');
 
 const { mulberry32, hashSeed } = await import(join(gdir, 'types.ts'));
-const { buildTimeline, emptySnapshot, snapshotAt, advance } = await import(
-  join(gdir, 'timeline.ts')
-);
+const { buildTimeline, emptySnapshot, snapshotAt, advance, RIVAL_POOLS, RIVAL_LINES_MAX } =
+  await import(join(gdir, 'timeline.ts'));
+/* ---- town rivalries (additive) ---- */
+const { rivalryOf } = await import(join(gdir, 'daytype.ts'));
+
+/**
+ * Every wager template, compiled to an exact regex ({var} -> .+?), so a
+ * finished ledger line can be traced back to the pool it came out of. This is
+ * how the harness tells a wager line from a flavour line — see the note on
+ * `RIVAL_POOLS` in timeline.ts for why it is done by text rather than by a
+ * field on the event.
+ */
+const RIVAL_RX = [];
+for (const [tag, pool] of Object.entries(RIVAL_POOLS)) {
+  for (const tpl of pool) {
+    const rx = tpl
+      .split(/\{\w+\}/)
+      .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('.+?');
+    RIVAL_RX.push([tag, new RegExp('^' + rx + '$')]);
+  }
+}
+const rivalTag = (text) => {
+  for (const [tag, rx] of RIVAL_RX) if (rx.test(text)) return tag;
+  return null;
+};
+/** Roles the loser's-alehouse line is allowed to name. Duplicated from
+ * timeline.ts on purpose: a test that imports the answer cannot fail. */
+const RIVAL_PUB_ROLES = new Set(['brewhouse', 'hall', 'gildhall']);
+/* ---- end town rivalries (additive) ---- */
 
 let generateMap = null;
 try {
@@ -307,7 +334,10 @@ const hhmm = (t) => {
   return `${String(m === 60 ? h + 1 : h).padStart(2, '0')}:${String(m === 60 ? 0 : m).padStart(2, '0')}`;
 };
 
-function serialize(snap) {
+/** @param withLog false serialises the BUILT WORLD only — everything the
+ * renderer draws, and nothing the ledger says. That is the form the town-
+ * rivalry check needs: narration may add lines, and may not move a nail. */
+function serialize(snap, withLog = true) {
   const m = (x) => [...x.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
   const s = (x) => [...x].sort();
   return JSON.stringify({
@@ -324,7 +354,7 @@ function serialize(snap) {
     chests: m(snap.chests),
     founded: s(snap.founded),
     population: m(snap.population),
-    log: snap.log,
+    log: withLog ? snap.log : null,
   });
 }
 
@@ -714,6 +744,72 @@ function run(label, map, pace = 1) {
   }
   if (emptySnapshot(map).chests.size) bad(`(n2) chests are already disturbed at t=0`);
 
+  /* (r) town rivalries: narration, and nothing but narration.
+   *
+   * Four things are checked, and the third is the one that matters:
+   *   - a day the seed did not call gets no wager lines at all;
+   *   - a day it did gets at most RIVAL_LINES_MAX of them, in the only order
+   *     a wager can happen in, and all of them about the two towns named;
+   *   - the BUILT WORLD is bit-for-bit the same with the wager lines deleted.
+   *     If a rivalry ever moves a nail, this is what catches it;
+   *   - and the alehouse the loser pays up in is a building that exists, in a
+   *     rival town, of a kind you could stand a round in. No invented pubs.
+   */
+  const riv = rivalryOf(map);
+  const rivLines = ev.filter((e) => e.type === 'log' && rivalTag(e.text));
+  const rivTags = rivLines.map((e) => rivalTag(e.text));
+  if (!riv) {
+    if (rivLines.length)
+      bad(`(r) ${rivLines.length} wager line(s) on a day the seed called no rivalry`);
+  } else {
+    const both = new Set([riv.a.id, riv.b.id]);
+    if (rivLines.length > RIVAL_LINES_MAX)
+      bad(`(r) ${rivLines.length} wager lines, cap is ${RIVAL_LINES_MAX}`);
+    for (const l of rivLines)
+      if (!both.has(l.siteId))
+        bad(`(r) wager line about ${l.siteId ?? 'nobody'}, rivals are ${[...both].join('/')}`);
+    if (rivTags.length && rivTags[0] !== 'challenge')
+      bad(`(r) the ledger opens the wager with a "${rivTags[0]}" line`);
+    if (rivTags.filter((t) => t === 'challenge').length > 1)
+      bad(`(r) the wager is laid more than once`);
+    const isResult = (t) => t === 'settle' || t === 'close';
+    const isPaid = (t) => t === 'pubNew' || t === 'pubStanding' || t === 'nopub';
+    const resultAt = rivTags.findIndex(isResult);
+    const paidAt = rivTags.findIndex(isPaid);
+    if (rivTags.filter(isResult).length > 1) bad(`(r) the race is settled twice`);
+    if (rivTags.filter(isPaid).length > 1) bad(`(r) the bet is paid twice`);
+    if ((resultAt < 0) !== (paidAt < 0))
+      bad(`(r) a result with no reckoning, or a reckoning with no result`);
+    if (resultAt >= 0 && paidAt < resultAt) bad(`(r) the bet is paid before it is lost`);
+    rivTags.forEach((t, i) => {
+      if ((t === 'score' || t === 'level') && resultAt >= 0 && i > resultAt)
+        bad(`(r) a running score after the race was already settled`);
+    });
+
+    // the wager, deleted: the world must not notice
+    if (rivLines.length) {
+      const without = { events: ev.filter((e) => !(e.type === 'log' && rivalTag(e.text))) };
+      for (const at of [8, 16, 24]) {
+        const a = serialize(snapshotAt(map, tl, at), false);
+        const b = serialize(snapshotAt(map, without, at), false);
+        if (a !== b) bad(`(r) deleting the wager lines changes the world at ${hhmm(at)}`);
+      }
+    }
+
+    // the alehouse is never invented
+    for (let i = 0; i < rivLines.length; i++) {
+      if (rivTags[i] !== 'pubNew' && rivTags[i] !== 'pubStanding') continue;
+      let found = null;
+      for (const s of map.sites) {
+        if (!both.has(s.id)) continue;
+        for (const b of s.buildings) if (rivLines[i].text.includes(b.label)) found = b;
+      }
+      if (!found) bad(`(r) the bet is settled in a building no rival town ever built`);
+      else if (!RIVAL_PUB_ROLES.has(found.role))
+        bad(`(r) the bet is settled in a ${found.role}, which is not somewhere to drink`);
+    }
+  }
+
   /* (k) day arc: first road mid-morning, ledger well spread, quiet close */
   const roadEvents = ev.filter((e) => e.type === 'road');
   const firstRoad = roadEvents.length ? roadEvents[0].t : null;
@@ -721,7 +817,11 @@ function run(label, map, pace = 1) {
     bad(`(k) first road at ${hhmm(firstRoad)} — too early for a mid-morning push`);
   const logs = ev.filter((e) => e.type === 'log');
   if (full) {
-    if (logs.length < 25 || logs.length > 45) bad(`(k) ${logs.length} log lines, want 25..45`);
+    // A wager day is allowed to run a few lines long — exactly as many as the
+    // rivalry pass is capped at, and not one more.
+    const room = 45 + (riv ? RIVAL_LINES_MAX : 0);
+    if (logs.length < 25 || logs.length > room)
+      bad(`(k) ${logs.length} log lines, want 25..${room}`);
     if (!logs.some((l) => l.t > 22)) bad(`(k) nothing in the ledger after 22:00`);
     // no six-hour dead patch in the ledger
     let prevLog = 0;
@@ -780,8 +880,14 @@ function run(label, map, pace = 1) {
           .join('  ')
     );
   }
+  if (riv) {
+    console.log(
+      `  rivalry: ${riv.a.name} (${riv.a.id}) v ${riv.b.name} (${riv.b.id})   ` +
+        `${rivLines.length} line${rivLines.length === 1 ? '' : 's'} [${rivTags.join(' ')}]`,
+    );
+  }
   for (const m of fails) console.log(`  ! ${m}`);
-  return { fails, ev, tl, map, lastBuild, pace };
+  return { fails, ev, tl, map, lastBuild, pace, riv, rivLines, rivTags };
 }
 
 function sampleLogs(ev, n = 8) {
@@ -882,6 +988,26 @@ cases.push([
     ],
   }),
 ]);
+/* ---- town rivalries (additive) ------------------------------------------ *
+ * Three shapes, chosen by rolling the rivalry substream by hand: a seed that
+ * calls a race between towns big enough to have one, the same shape on a seed
+ * that does not, and a pair too small to qualify (two roofs a town) so the
+ * ≥3-roof floor is exercised on a seed that WOULD otherwise have said yes.
+ * -------------------------------------------------------------------------- */
+cases.push([
+  'fixture: a rivalry — three towns, six roofs each',
+  makeFixture(26, { buildings: [7, 6, 6], trees: 90, roadClears: 6, loopRoad: true }),
+]);
+cases.push([
+  'fixture: the same shape on a seed with no rivalry in it',
+  makeFixture(3, { buildings: [7, 6, 6], trees: 90, roadClears: 6, loopRoad: true }),
+]);
+cases.push([
+  'fixture: a rivalry seed, but nobody is big enough to race',
+  makeFixture(43, { buildings: [3, 2], trees: 30 }),
+]);
+/* ---- end town rivalries (additive) -------------------------------------- */
+
 cases.push([
   // the pace control trimmed the reward out of the day: the find is real, the
   // windfall never arrives, and the ledger has to cope
@@ -1008,6 +1134,122 @@ if (showcase) {
       `stumps ${[...mid.trees.values()].filter((v) => v === 'stump').length}  ` +
       `props ${mid.props.size}  log ${mid.log.length}`,
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* town rivalries (additive) — the wager is the same wager every time         */
+/* -------------------------------------------------------------------------- */
+
+console.log(`\n${'='.repeat(72)}`);
+console.log('town rivalries');
+{
+  let rivFail = 0;
+  const rbad = (m) => (console.log(`  ! ${m}`), rivFail++);
+
+  /* (r1) the decision is a pure function of the map, and picks a real pair */
+  for (const [label, map] of cases) {
+    const one = rivalryOf(map);
+    const two = rivalryOf(map);
+    const key = (r) => (r ? `${r.a.id}/${r.b.id}/${r.mark}` : 'none');
+    if (key(one) !== key(two)) rbad(`(r1) rivalryOf is not a function for ${label}`);
+    if (!one) continue;
+    const ids = new Set(map.sites.map((s) => s.id));
+    if (!ids.has(one.a.id) || !ids.has(one.b.id) || one.a.id === one.b.id)
+      rbad(`(r1) ${label}: rivals ${one.a.id}/${one.b.id} are not two towns on this map`);
+    // both are big enough to have a race in them
+    for (const s of [one.a, one.b]) {
+      const roofs = s.buildings.length - (map.sites[0].id === s.id ? 1 : 0);
+      if (roofs < 3) rbad(`(r1) ${label}: ${s.id} races with only ${roofs} roofs`);
+    }
+    // and where the roads join any qualifying pair at all, the rivals are one
+    const joined = map.roads.some(
+      (r) =>
+        (r.from === one.a.id && r.to === one.b.id) || (r.from === one.b.id && r.to === one.a.id),
+    );
+    const anyJoined = map.roads.some((r) => {
+      const A = map.sites.find((s) => s.id === r.from);
+      const B = map.sites.find((s) => s.id === r.to);
+      if (!A || !B || A === B) return false;
+      const big = (s) => s.buildings.length - (map.sites[0].id === s.id ? 1 : 0) >= 3;
+      return big(A) && big(B);
+    });
+    if (anyJoined && !joined)
+      rbad(`(r1) ${label}: ${one.a.id}/${one.b.id} are strangers, and the roads offered neighbours`);
+  }
+
+  /* (r2) the same map, built twice, tells the same story word for word —
+   *      including two maps generated separately from one seed */
+  for (const [label, map] of cases) {
+    if (!rivalryOf(map)) continue;
+    const lines = (m) =>
+      JSON.stringify(
+        buildTimeline(m)
+          .events.filter((e) => e.type === 'log' && rivalTag(e.text))
+          .map((e) => [e.t, e.text, e.siteId]),
+      );
+    // two independent buildTimeline calls over the same map — not a tautology:
+    // the rivalry pass draws from an rng, and a leaked one would show up here
+    const first = lines(map);
+    const second = lines(map);
+    if (first !== second) rbad(`(r2) ${label}: wager lines are not deterministic`);
+  }
+  if (generateMap) {
+    for (const day of ['2027-01-01', '2026-08-03']) {
+      const a = generateMap(hashSeed(day));
+      const b = generateMap(hashSeed(day));
+      const lines = (m) =>
+        JSON.stringify(
+          buildTimeline(m)
+            .events.filter((e) => e.type === 'log' && rivalTag(e.text))
+            .map((e) => [e.t, e.text, e.siteId]),
+        );
+      if (lines(a) !== lines(b))
+        rbad(`(r2) ${day}: two maps from one seed disagree about the wager`);
+    }
+  }
+
+  /* (r3) a seed that says no says no at every pace, and says nothing */
+  const quiet = cases.find(([l]) => l.startsWith('fixture: the same shape on a seed with no'));
+  if (quiet) {
+    for (const pace of [0.5, 1, 2, 4]) {
+      const ev = buildTimeline(quiet[1], pace).events;
+      const n = ev.filter((e) => e.type === 'log' && rivalTag(e.text)).length;
+      if (n) rbad(`(r3) ${n} wager lines at pace ${pace} on a seed with no rivalry`);
+    }
+  }
+  const small = cases.find(([l]) => l.startsWith('fixture: a rivalry seed, but nobody'));
+  if (small && rivalryOf(small[1]))
+    rbad(`(r3) a two-roof hamlet was allowed into a race`);
+
+  /* (r4) how often, over a real sweep — a guard on RIVALRY_CHANCE itself */
+  if (generateMap) {
+    let multi = 0;
+    let riv = 0;
+    let lines = 0;
+    let capped = 0;
+    for (let s = 1; s <= 120; s++) {
+      const map = generateMap((s * 2654435761) >>> 0);
+      if (map.sites.length >= 2) multi++;
+      const r = rivalryOf(map);
+      if (!r) continue;
+      riv++;
+      const n = buildTimeline(map).events.filter((e) => e.type === 'log' && rivalTag(e.text)).length;
+      lines += n;
+      if (n > RIVAL_LINES_MAX) capped++;
+      if (!n) rbad(`(r4) seed ${(s * 2654435761) >>> 0}: a rivalry that never reached the ledger`);
+    }
+    const pct = (100 * riv) / Math.max(1, multi);
+    console.log(
+      `  ${riv}/${multi} multi-town seeds run a wager (${pct.toFixed(1)}%), ` +
+        `${(lines / Math.max(1, riv)).toFixed(2)} ledger lines each`,
+    );
+    if (pct < 18 || pct > 42) rbad(`(r4) ${pct.toFixed(1)}% of days are races — want roughly 1 in 4`);
+    if (capped) rbad(`(r4) ${capped} days ran past the ${RIVAL_LINES_MAX}-line cap`);
+  }
+
+  console.log(`  ${rivFail ? `${rivFail} RIVALRY CHECKS FAILED` : 'rivalry checks all pass'}`);
+  failed += rivFail;
+  total += 4;
 }
 
 /* -------------------------------------------------------------------------- */

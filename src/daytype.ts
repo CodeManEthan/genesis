@@ -833,3 +833,124 @@ export function goldStrike(map: GenesisMap): GoldStrike | null {
 }
 
 /* ---- end the prospector (additive) --------------------------------------- */
+
+/* ==================== town rivalries (additive) =========================== *
+ * Two towns decide, on their own and for no good reason, that today is a race.
+ *
+ * NOTHING IN THE WORLD CHANGES. No plot moves, no crew hurries, no event shifts
+ * by a minute; the two towns build exactly the day they were always going to
+ * build. The rivalry is a story the valley tells about a schedule it already
+ * had — a wager laid over work in progress, a running score, and somebody
+ * paying up at the end. That is the whole feature, and the reason it is safe.
+ *
+ * This half is the *decision*: is there a race today, and between whom. It
+ * lives here rather than in `timeline.ts` for the same reason `marketSite` and
+ * `goldStrike` do — it is a pure question about a map, answered off its own
+ * derived stream, so asking it cannot move anything that was already rolled.
+ * `timeline.ts` owns the other half: the hours, and the words.
+ * -------------------------------------------------------------------------- */
+
+const SALT_RIVAL = 0x72495641; // 'rIVA'
+
+/** How often two towns fall out over nothing. Rolled first, before the map is
+ * inspected at all, so this is a property of the SEED; the qualifying tests
+ * below then turn some of those days back into ordinary ones. */
+const RIVALRY_CHANCE = 0.28;
+
+/**
+ * A town has to have enough of a day ahead of it to lose a race in. Three roofs
+ * is the floor: it is the first score milestone, and a two-plot hamlet racing
+ * anybody reads as a joke rather than a rivalry.
+ */
+const RIVAL_MIN_ROOFS = 3;
+
+/**
+ * The day's grudge: who, and how many roofs the first score line waits for.
+ *
+ * `a` and `b` are in ROSTER order and nothing more. Which of them sets the mark
+ * and which one goes at it is a question about the finished schedule, not about
+ * the map, so `timeline.ts` works that out for itself from the first frame each
+ * one gets in the ground.
+ */
+export interface Rivalry {
+  /** the earlier in the roster, which is founding order */
+  a: SiteSpec;
+  /** the later */
+  b: SiteSpec;
+  /** roofs on the board before the ledger says the score out loud */
+  mark: number;
+}
+
+/** Roofs this town actually raises today. The founding homestead's first house
+ * is standing at midnight and is nobody's achievement. */
+function roofsPlanned(map: GenesisMap, s: SiteSpec): number {
+  const n = s.buildings.length;
+  return map.sites.length && map.sites[0].id === s.id ? n - 1 : n;
+}
+
+/**
+ * Is today a race, and between which two towns?
+ *
+ * Neighbours read better than strangers, so the candidates are the pairs the
+ * ROAD NETWORK already joined — two towns at opposite corners of the valley
+ * have no way of knowing what the other is up to, let alone of betting on it.
+ * Only if the roads join no qualifying pair at all does it fall back to the
+ * nearest two, which is the same relationship by a different route.
+ *
+ * Deterministic throughout: candidate pairs are built in a fixed order and
+ * sorted by roster index, so the choice never depends on iteration luck.
+ */
+export function rivalryOf(map: GenesisMap): Rivalry | null {
+  const sites = map.sites;
+  if (sites.length < 2) return null;
+
+  const rng = mulberry32(((map.seed >>> 0) ^ SALT_RIVAL) >>> 0);
+  if (rng() >= RIVALRY_CHANCE) return null;
+
+  const idx = new Map<string, number>();
+  sites.forEach((s, i) => idx.set(s.id, i));
+  const big = sites.map((s) => roofsPlanned(map, s) >= RIVAL_MIN_ROOFS);
+
+  /* --- pairs the roads already introduced -------------------------------- */
+  const pairs: [number, number][] = [];
+  const seen = new Set<string>();
+  for (const r of map.roads) {
+    const i = idx.get(r.from);
+    const j = idx.get(r.to);
+    if (i === undefined || j === undefined || i === j) continue;
+    const lo = Math.min(i, j);
+    const hi = Math.max(i, j);
+    if (!big[lo] || !big[hi]) continue;
+    const k = `${lo}:${hi}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    pairs.push([lo, hi]);
+  }
+
+  /* --- or, failing that, the two nearest towns that qualify --------------- */
+  // Strict `<`, walked in roster order, so a tie in distance goes to the pair
+  // that was founded earliest rather than to whichever the loop met first.
+  if (!pairs.length) {
+    let best = Infinity;
+    let pick: [number, number] | null = null;
+    for (let i = 0; i < sites.length; i++) {
+      if (!big[i]) continue;
+      for (let j = i + 1; j < sites.length; j++) {
+        if (!big[j]) continue;
+        const d = Math.hypot(sites[i].gx - sites[j].gx, sites[i].gy - sites[j].gy);
+        if (d < best) {
+          best = d;
+          pick = [i, j];
+        }
+      }
+    }
+    if (!pick) return null;
+    pairs.push(pick);
+  }
+
+  pairs.sort((p, q) => p[1] - q[1] || p[0] - q[0]);
+  const [lo, hi] = pairs[Math.floor(rng() * pairs.length)];
+  return { a: sites[lo], b: sites[hi], mark: RIVAL_MIN_ROOFS };
+}
+
+/* ================== end town rivalries (additive) ========================= */
