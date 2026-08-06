@@ -51,6 +51,8 @@ import {
   buildBush,
   buildCampfire,
   buildCart,
+  buildChest,
+  buildChestMound,
   buildCrane,
   buildCrates,
   buildCropRow,
@@ -73,6 +75,7 @@ import {
   buildWell,
   drawBot,
   drawCart,
+  drawChestGlint,
   drawCraneLoad,
   drawWheel,
   isoTile,
@@ -93,6 +96,8 @@ import {
   isoX,
   isoY,
   type BuildingSpec,
+  type ChestSpec,
+  type ChestState,
   type GenesisMap,
   type PropSpec,
   type RoadSpec,
@@ -137,7 +142,24 @@ export function makePools(): Record<string, Sprite[]> {
     lamp: pool(1, () => buildLamp()),
     sheep: pool(3, (i) => buildSheep(103 + i * 23)),
     campfire: pool(1, () => buildCampfire()),
+    // Buried treasure, in its three states. Never a PropSpec — chests are their
+    // own list on the map, so nothing resolves these by kind; they are pooled
+    // for the cache and so the catalog page can show them.
+    'chest-buried': pool(3, (i) => buildChestMound(211 + i * 13)),
+    'chest-closed': pool(2, (i) => buildChest(false, 223 + i * 17)),
+    'chest-open': pool(2, (i) => buildChest(true, 227 + i * 19)),
   };
+}
+
+/** Which of the three chest sprites the snapshot is asking for. */
+function chestSprite(scene: GenesisScene, chest: ChestSpec, state: ChestState | undefined): Sprite {
+  const p =
+    state === 'open'
+      ? scene.pools['chest-open']
+      : state === 'digging'
+        ? scene.pools['chest-closed']
+        : scene.pools['chest-buried'];
+  return p[Math.abs(chest.seed) % p.length];
 }
 
 const TREE_POOL: Record<string, string> = {
@@ -202,6 +224,39 @@ export interface Walker {
   cargo: string;
 }
 
+/**
+ * The one settler who walks out to a chest, turns the earth over it and gets
+ * the lid up. They are not part of any site's crew — the chest is usually a
+ * long way out in the wood — so they live in their own list and are staffed
+ * straight off the snapshot's chest state.
+ */
+export interface Digger {
+  chestId: string;
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  /** Where they walked out from, and where they trudge back to. */
+  hx: number;
+  hy: number;
+  phase: number;
+  color: string;
+  faceRight: boolean;
+  action: BotAction;
+  /** 0 = out at the chest, 1 = walking home with the news. */
+  leg: 0 | 1;
+}
+
+/** One pixel of the moment the lid comes up. */
+export interface Spark {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  age: number;
+  color: string;
+}
+
 export interface Ambient {
   bots: Bot[];
   /**
@@ -214,6 +269,12 @@ export interface Ambient {
   /** Settlers per site at the last sync, so an *increase* can be walked in. */
   pop: Map<string, number>;
   walkers: Walker[];
+  /** One per chest currently being dug out or just opened. */
+  diggers: Digger[];
+  /** The pixels thrown up at the moment a lid comes off. */
+  sparks: Spark[];
+  /** Chests we have already thrown sparks for, so the moment happens once. */
+  opened: Set<string>;
   smoke: Smoke[];
   smokeClock: { t: number };
   smokers: { x: number; y: number }[];
@@ -828,6 +889,9 @@ export function makeAmbient(pace = 1): Ambient {
     crews: new Map(),
     pop: new Map(),
     walkers: [],
+    diggers: [],
+    sparks: [],
+    opened: new Set(),
     smoke: [],
     smokeClock: { t: 0 },
     smokers: [],
@@ -873,7 +937,14 @@ function snapSig(snap: WorldSnapshot): string {
   snap.roads.forEach((v) => {
     rd += Math.round(v * 20);
   });
-  return `${snap.founded.size}|${pop}|${b}|${tr}.${snap.trees.size}|${rd}|${snap.props.size}`;
+  let ch = 0;
+  snap.chests.forEach((v, k) => {
+    ch += k.length + v.charCodeAt(0);
+  });
+  return (
+    `${snap.founded.size}|${pop}|${b}|${tr}.${snap.trees.size}|${rd}|${snap.props.size}` +
+    `|${ch}.${snap.chests.size}`
+  );
 }
 
 interface Task {
@@ -1109,6 +1180,8 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
     }
   }
 
+  syncDiggers(scene, amb, snap);
+
   /* ---- chimneys and wheels --------------------------------------------- */
   amb.smokers = [];
   amb.wheels = [];
@@ -1124,6 +1197,150 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
       }
       if (sp.wheel) amb.wheels.push({ x: bx + sp.wheel[0], y: by + sp.wheel[1] });
     }
+  }
+}
+
+/* --------------------------- discovery theatre --------------------------- */
+
+/** How far out the finder starts walking from, in tiles. */
+const DIG_APPROACH = 6.5;
+const DIG_SPEED = 1.15;
+
+/**
+ * Staff the chests. One digger appears as soon as the timeline says somebody is
+ * turning earth over a chest, walking in from whichever town is going to claim
+ * it; when the lid comes up they turn round and take the news home, and the
+ * moment itself throws a handful of pixels into the air.
+ *
+ * This is ambience, so it is allowed to be approximate: the walk is a straight
+ * line over whatever is in the way, and the arrival is timed by the length of
+ * the approach rather than by the clock.
+ */
+function syncDiggers(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
+  const chests = scene.map.chests ?? [];
+  const rng = amb.rng;
+  const live = new Map(amb.diggers.map((d) => [d.chestId, d]));
+
+  for (const chest of chests) {
+    const state = snap.chests.get(chest.id);
+    if (!state) continue;
+
+    /* ---- the moment ---------------------------------------------------- */
+    if (state === 'open' && !amb.opened.has(chest.id)) {
+      amb.opened.add(chest.id);
+      const x = isoX(chest.gx, chest.gy);
+      const y = isoY(chest.gx, chest.gy);
+      for (let i = 0; i < 24; i++) {
+        const a = -Math.PI / 2 + (rng() - 0.5) * 2.2;
+        // World pixels per second: slow enough that the burst still reads at a
+        // close zoom, where a fast pixel is off the screen before it is seen.
+        const sp = 9 + rng() * 20;
+        amb.sparks.push({
+          x: x + (rng() - 0.5) * 9,
+          y: y - 12,
+          vx: Math.cos(a) * sp,
+          vy: Math.sin(a) * sp,
+          age: 0,
+          color: rng() < 0.35 ? '#ffffff' : rng() < 0.6 ? '#ffeaa8' : '#f2cc63',
+        });
+      }
+    }
+
+    /* ---- the finder ----------------------------------------------------- */
+    let d = live.get(chest.id);
+    if (!d) {
+      // Walk in from the town that is going to claim it, or from the nearest
+      // town that exists yet — somebody has to have come from somewhere.
+      let home: SiteSpec | null = null;
+      let best = Infinity;
+      for (const s of scene.map.sites) {
+        if (!snap.founded.has(s.id)) continue;
+        if (s.id === chest.siteId) {
+          home = s;
+          break;
+        }
+        const dd = Math.hypot(s.gx - chest.gx, s.gy - chest.gy);
+        if (dd < best) {
+          best = dd;
+          home = s;
+        }
+      }
+      let ux = home ? home.gx - chest.gx : 1;
+      let uy = home ? home.gy - chest.gy : 1;
+      const l = Math.hypot(ux, uy) || 1;
+      ux /= l;
+      uy /= l;
+      d = {
+        chestId: chest.id,
+        gx: chest.gx + ux * DIG_APPROACH,
+        gy: chest.gy + uy * DIG_APPROACH,
+        // They walk in from their own town but always end up on the near side
+        // of the hole, and a little to the right of it, so the finder never
+        // stands between the camera and the lid however they came in.
+        tx: chest.gx + 1.4,
+        ty: chest.gy + 0.3,
+        hx: home ? home.gx : chest.gx + ux * 14,
+        hy: home ? home.gy : chest.gy + uy * 14,
+        phase: rng() * 10,
+        color: BOT_COLORS[Math.floor(rng() * BOT_COLORS.length)],
+        faceRight: ux - uy < 0,
+        action: 'walk',
+        leg: 0,
+      };
+      // A chest already open when the snapshot arrives (a scrub, or a deep
+      // link straight to the evening) has no walk left to perform.
+      if (state === 'open') {
+        d.leg = 1;
+        d.tx = d.hx;
+        d.ty = d.hy;
+      }
+      amb.diggers.push(d);
+      live.set(chest.id, d);
+    } else if (state === 'open' && d.leg === 0) {
+      d.leg = 1;
+      d.tx = d.hx;
+      d.ty = d.hy;
+      d.action = 'walk';
+    }
+  }
+
+  // A chest that went back to being buried (a scrub backwards) loses its finder.
+  amb.diggers = amb.diggers.filter((d) => snap.chests.has(d.chestId));
+  for (const chest of chests) if (!snap.chests.has(chest.id)) amb.opened.delete(chest.id);
+}
+
+function stepDiggers(amb: Ambient, dt: number, rate: number): void {
+  for (let i = amb.diggers.length - 1; i >= 0; i--) {
+    const d = amb.diggers[i];
+    d.phase += dt * rate;
+    const dx = d.tx - d.gx;
+    const dy = d.ty - d.gy;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 0.2) {
+      // Arrived: either at the chest, where there is digging to do, or home,
+      // where there is nothing left to draw.
+      if (d.leg === 1) amb.diggers.splice(i, 1);
+      else d.action = 'work';
+      continue;
+    }
+    const step = Math.min(dist, DIG_SPEED * rate * dt);
+    d.gx += (dx / dist) * step;
+    d.gy += (dy / dist) * step;
+    const sdx = dx - dy;
+    if (Math.abs(sdx) > 0.01) d.faceRight = sdx > 0;
+    d.action = 'walk';
+  }
+
+  for (let i = amb.sparks.length - 1; i >= 0; i--) {
+    const s = amb.sparks[i];
+    s.age += dt;
+    if (s.age > 1.5) {
+      amb.sparks.splice(i, 1);
+      continue;
+    }
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.vy += 40 * dt;
   }
 }
 
@@ -1212,6 +1429,7 @@ export function stepAmbient(
     w.gy = at[1];
   }
 
+  stepDiggers(amb, dt, rate);
   stepSmoke(amb, dt);
 }
 
@@ -1293,6 +1511,9 @@ export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnaps
   amb.crews.clear();
   amb.pop.clear();
   amb.walkers = [];
+  amb.diggers = [];
+  amb.sparks = [];
+  amb.opened.clear();
   amb.smoke = [];
   amb.smokeClock.t = 0;
   amb.sig = '';
@@ -1562,6 +1783,36 @@ export function renderGenesis(
     push(sp, tr.gx, tr.gy, 0, sway);
   }
 
+  /* ---- buried treasure -------------------------------------------------- */
+  // Mound, dug-out chest or open chest, straight off the snapshot. There are
+  // never more than two, so they go through the ordinary item pass and get the
+  // ordinary occlusion repair — an open chest half behind a fir is exactly
+  // right, because that is where it was buried.
+  for (const chest of scene.map.chests ?? []) {
+    const state = snap.chests.get(chest.id);
+    const sp = chestSprite(scene, chest, state);
+    const x = isoX(chest.gx, chest.gy);
+    const y = isoY(chest.gx, chest.gy);
+    if (!inView(x, y)) continue;
+    const bx = Math.round(x - sp.ox);
+    const by = Math.round(y - sp.oy);
+    const open = state === 'open';
+    items.push({
+      depth: y,
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => {
+        c.drawImage(sp.c, bx, by);
+        if (open) drawChestGlint(c, x, y, clock);
+      },
+    });
+    if (open && sky.lamps > 0.02) {
+      halos.push({ x, y: y - 10, r: 22, a: sky.lamps * 0.5 });
+    }
+  }
+
   for (const site of scene.map.sites) {
     for (const p of site.props) {
       if (!snap.props.has(p.id)) continue;
@@ -1696,6 +1947,32 @@ export function renderGenesis(
     });
   }
 
+  for (const d of amb.diggers) {
+    const x = isoX(d.gx, d.gy);
+    const y = isoY(d.gx, d.gy);
+    if (!inView(x, y)) continue;
+    const px = Math.round(x);
+    const py = Math.round(y);
+    const { color, faceRight, action, phase } = d;
+    items.push({
+      depth: y + 1,
+      bx: px - 7,
+      by: py - 20,
+      bw: 15,
+      bh: 22,
+      draw: (c) => {
+        drawBot(c, px, py, color, faceRight, action, phase);
+        // Earth coming off the spade, on the same beat as a hammer spark.
+        if (action === 'work' && Math.sin(phase * 8) > 0.8) {
+          c.fillStyle = '#b98b5f';
+          const s = faceRight ? 6 : -7;
+          c.fillRect(px + s, py - 9, 1, 1);
+          c.fillRect(px + s + 1, py - 11, 1, 1);
+        }
+      },
+    });
+  }
+
   for (const w of amb.walkers) {
     const x = isoX(w.gx, w.gy);
     const y = isoY(w.gx, w.gy);
@@ -1784,6 +2061,7 @@ export function renderGenesis(
   items.sort((a, b) => a.depth - b.depth);
   for (const it of items) it.draw(g);
 
+  drawSparks(g, amb.sparks, wx0, wy0, wx1, wy1);
   drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1, sky.night);
 
   /* ---- blit the world buffer to the viewport --------------------------- */
@@ -1928,6 +2206,19 @@ export function drawBridge(
         rect(ctx, p[0], p[1] - 5, 1, 5, PAL.woodDark);
       }
     }
+  }
+}
+
+/** The pixels thrown up when a lid comes off. Over everything, like the smoke. */
+function drawSparks(ctx: Ctx, sparks: Spark[], wx0: number, wy0: number, wx1: number, wy1: number): void {
+  for (const s of sparks) {
+    const px = Math.round(s.x);
+    const py = Math.round(s.y);
+    if (px < wx0 || px > wx1 || py < wy0 || py > wy1) continue;
+    ctx.globalAlpha = Math.max(0, 1 - s.age / 1.5);
+    ctx.fillStyle = s.color;
+    ctx.fillRect(px, py, 1, 1);
+    ctx.globalAlpha = 1;
   }
 }
 

@@ -469,6 +469,7 @@ export function fixtureEmptySnapshot(map: GenesisMap): WorldSnapshot {
     roads: new Map(),
     bridges: new Map(),
     props: new Set(),
+    chests: new Map(),
     founded,
     population,
     log,
@@ -528,6 +529,12 @@ function applyEvent(snap: WorldSnapshot, ev: GenesisEvent): void {
       break;
     case 'prop':
       snap.props.add(ev.propId);
+      break;
+    case 'dig':
+      snap.chests.set(ev.chestId, 'digging');
+      break;
+    case 'discover':
+      snap.chests.set(ev.chestId, 'open');
       break;
     case 'log':
       snap.log.push({ t: ev.t, text: ev.text });

@@ -37,6 +37,8 @@ import {
   type BridgeSpec,
   type BuildingSpec,
   type Biome,
+  type ChestReward,
+  type ChestSpec,
   type Chunk,
   type GenesisMap,
   type PropSpec,
@@ -346,6 +348,9 @@ const LABELS: Record<StructureRole, string[]> = {
   shed: ['The Woodshed', 'The Tool Shed', 'The Lean-To', 'The Cart Shed'],
   bakery: ['The Bakehouse', 'The Oven House', 'Loaf & Ladle', 'The Baker’s'],
   brewhouse: ['The Brewhouse', 'The Oast House', 'The Malting', 'Hop Yard'],
+  // Charter-only. There is never more than one in a valley, so the list is
+  // short and every entry has to be able to carry the whole building.
+  gildhall: ['The Gildhall', 'The Charter House', 'The Freemen’s Hall', 'The Warrant House'],
 };
 
 export const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', 'homestead']);
@@ -851,6 +856,196 @@ function extendIntoTown(line: Pt[], centre: Pt, stopR: number, atStart: boolean)
 }
 
 /* ========================================================================== */
+/*  buried treasure                                                           */
+/* ========================================================================== */
+
+/**
+ * Scheduled serendipity.
+ *
+ * A seed buries nought, one or two chests in the deep wood or out on the open
+ * moor, always well off the road network, and decides then and there what is in
+ * each one and which town's crews will turn it up. Whether the day's digging
+ * finds it at all is decided here too, and for a hard reason: the reward for a
+ * coin hoard is EXTRA BUILDINGS, and buildings are map data. A timeline cannot
+ * conjure a plot the map never surveyed. So the map owns the day's luck; the
+ * timeline owns the day's clock and all of its words.
+ *
+ * ── THE SCALE RULE ────────────────────────────────────────────────────────
+ * Chests are TERRAIN: every field of every ChestSpec is a pure function of the
+ * seed and is byte-identical at 0.25x and at 4x. Nothing below reads `scale`.
+ *
+ * The reward is NOT terrain — it is expressed entirely through the finding
+ * town's building roster and the existing `siteBuilt` prefix mechanism:
+ *
+ *   coin     `grant` ordinary plots are APPENDED to that town's full roster and
+ *            `siteBuilt` is raised by exactly `grant` at every scale. A prefix
+ *            of length countAt(S) + grant is still a prefix, and it is still
+ *            monotone in S, so subset stability is untouched. At a small scale
+ *            the extra plots are ordinary plots the town would not otherwise
+ *            have reached — which is precisely what a hoard buys.
+ *   charter  the gildhall is INSERTED at roster index countAt(SCALE_MIN) — just
+ *            past what the very quietest day would build — and `siteBuilt` is
+ *            raised by one. A prefix of length countAt(S) + 1 therefore reaches
+ *            it at every scale from 0.25x up.
+ *   trinket  nothing.
+ *
+ * A chest can still outrun the pace control: at 0.25x the finding town may not
+ * be founded at all, and a coin hoard's extra plots may fall outside the slice.
+ * `grantIds` names the buildings the chest paid for, so the timeline can see
+ * exactly which of them survived the trim and narrate at trinket tier when the
+ * reward did not make it into the day. Nothing in the map changes; only the
+ * story does.
+ */
+const CHEST_ROAD_CLEAR = 2.5;
+const CHEST_RIVER_CLEAR = 3;
+const CHEST_SITE_CLEAR = 3;
+const CHEST_APART = 12;
+/** Chance one buried chest is turned up today. See the harness readout. */
+const CHEST_FIND_P = 0.32;
+
+/** Ledger-ready name for the ground a chest is lying in. */
+function chestWhere(seed: number, biome: Biome): string {
+  if (biome === 'moor') return 'the high moor';
+  const ch = woodChar(seed);
+  if (ch.boost <= 0) return 'the deep wood';
+  const noun: Record<TreeKind, string> = {
+    oak: 'the oak wood',
+    birch: 'the birch wood',
+    fir: 'the fir wood',
+    pine: 'the pinewood',
+    blossom: 'the blossom wood',
+    hedgerow: 'the thickets',
+    willow: 'the willow carr',
+  };
+  return noun[ch.kind] ?? 'the deep wood';
+}
+
+interface ChestSite {
+  id: string;
+  u: number;
+  v: number;
+  r: number;
+}
+
+/** What one town owes a chest it is going to find. */
+interface ChestGrant {
+  reward: ChestReward;
+  /** Extra plots (coin) or 1 (charter). */
+  n: number;
+  chest: ChestSpec;
+}
+
+function buryChests(
+  seed: number,
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[],
+  chunks: Chunk[],
+  sites: ChestSite[],
+  nBase: number,
+  roadLines: Pt[][]
+): { chests: ChestSpec[]; grants: Map<number, ChestGrant> } {
+  const chests: ChestSpec[] = [];
+  const grants = new Map<number, ChestGrant>();
+  if (sites.length < 2) return { chests, grants };
+  // Finders come out of the day's BASELINE towns only. `nBase` is drawn from
+  // the seed alone, so this is still scale-free — but it means a normal day
+  // always reaches the town that gets the windfall, and only the quarter-pace
+  // day is ever left narrating a find nobody could act on.
+  const finders = clamp(Math.min(nBase, sites.length), 2, sites.length);
+
+  // A derived substream: never the main stream, never the scale.
+  const crng = mulberry32((seed ^ 0x63485354) >>> 0); // 'cHST'
+
+  const biomeAt = (p: Pt): Biome => {
+    for (const c of chunks) {
+      if (p[0] >= c.u0 && p[0] < c.u1 && p[1] >= c.v0 && p[1] < c.v1) return c.biome;
+    }
+    return 'meadow';
+  };
+
+  const roll = crng();
+  const n = roll < 0.2 ? 0 : roll < 0.68 ? 1 : 2;
+
+  const placedUV: Pt[] = [];
+  for (let k = 0; k < n; k++) {
+    /* ---- somewhere nobody has any reason to be --------------------------- */
+    let at: Pt | null = null;
+    for (let t = 0; t < 4000 && !at; t++) {
+      const p: Pt = [
+        lerp(content.u0 + 3, content.u1 - 3, crng()),
+        lerp(content.v0 + 3, content.v1 - 3, crng()),
+      ];
+      const biome = biomeAt(p);
+      if (biome !== 'forest' && biome !== 'moor') continue;
+      if (polyDist(p, river) < CHEST_RIVER_CLEAR) continue;
+      let clear = true;
+      for (const s of sites) {
+        if (dist(p, [s.u, s.v]) < s.r + CHEST_SITE_CLEAR) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      for (const line of roadLines) {
+        if (polyDist(p, line) < CHEST_ROAD_CLEAR) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      for (const q of placedUV) {
+        if (dist(p, q) < CHEST_APART) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      at = p;
+    }
+    if (!at) continue;
+    placedUV.push(at);
+
+    /* ---- what is in it, and who is going to find it ---------------------- */
+    // Four draws, always, whatever the answers turn out to be.
+    const tierRoll = crng();
+    const siteRoll = crng();
+    const coinRoll = crng();
+    const findRoll = crng();
+
+    let reward: ChestReward = tierRoll < 0.45 ? 'coin' : tierRoll < 0.65 ? 'charter' : 'trinket';
+    // Never sites[0]: the founding house has enough to be getting on with, and
+    // its plot count is load-bearing for the rest of the day's pacing.
+    const siteIndex = 1 + Math.min(finders - 2, Math.floor(siteRoll * (finders - 1)));
+    const found = findRoll < CHEST_FIND_P;
+    // One town, one windfall. A second chest aimed at the same place is still a
+    // chest — it just turns out to be full of somebody's old buttons.
+    if (grants.has(siteIndex)) reward = 'trinket';
+    const grantN = reward === 'coin' ? (coinRoll < 0.5 ? 1 : 2) : reward === 'charter' ? 1 : 0;
+
+    const biome = biomeAt(at);
+    const [gx, gy] = uv(at[0], at[1]);
+    const chest: ChestSpec = {
+      id: `ch${chests.length}`,
+      gx,
+      gy,
+      seed: (seed + chests.length * 7919 + 331) >>> 0,
+      biome,
+      where: chestWhere(seed, biome),
+      reward,
+      siteIndex,
+      siteId: `s${siteIndex}`,
+      found,
+      grantIds: [],
+    };
+    chests.push(chest);
+    // Only a chest somebody actually opens today pays for anything.
+    if (found && grantN > 0) grants.set(siteIndex, { reward, n: grantN, chest });
+  }
+
+  return { chests, grants };
+}
+
+/* ========================================================================== */
 /*  the generator                                                             */
 /* ========================================================================== */
 
@@ -1265,6 +1460,20 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
+  /* ---- buried treasure --------------------------------------------------- */
+  // Terrain, and drawn from its own substream — see buryChests above for the
+  // scale rule. It has to run here, after the chunks and the FULL road network
+  // and before the buildings, because a chest that gets found pays for plots.
+  const { chests, grants: chestGrants } = buryChests(
+    seed,
+    content,
+    river,
+    chunks,
+    sites,
+    nBase,
+    roadLines
+  );
+
   /* ---- buildings -------------------------------------------------------- */
   const GOLDEN = 2.399963;
   const siteBuildings: BuildingSpec[][] = [];
@@ -1288,9 +1497,22 @@ function buildMap(seed: number, scale: number): GenesisMap {
     const hi = si === 0 ? 14 : 11;
     const countAt = (x: number) => clamp(Math.round(count * buildFactor(x)), lo, hi);
     const maxCount = countAt(SCALE_MAX);
-    siteBuilt.push(Math.min(maxCount, countAt(S)));
-    siteBuiltBase.push(countAt(1));
-    siteBuiltMax.push(maxCount);
+
+    /* ---- what a chest bought this town, if anything -------------------- */
+    // The one sanctioned way the roster grows beyond the pace ladder. Both
+    // branches keep `siteBuilt` a monotone prefix length — see buryChests.
+    const grant = chestGrants.get(si);
+    const extra = grant ? grant.n : 0;
+    // Whatever a chest buys goes in just past the quietest day's roster, so it
+    // is inside the prefix at every scale from 0.25x up. A prefix of length
+    // countAt(S) + extra always reaches index countAt(SCALE_MIN) + extra - 1.
+    const grantAt = grant ? Math.min(countAt(SCALE_MIN), maxCount) : -1;
+    const gildAt = grant && grant.reward === 'charter' ? grantAt : -1;
+    const total = maxCount + extra;
+
+    siteBuilt.push(Math.min(total, countAt(S) + extra));
+    siteBuiltBase.push(countAt(1) + extra);
+    siteBuiltMax.push(total);
     const usedLabels = new Set<string>();
     // Scale the architecture to the town so a small holding does not try to
     // fit a 64px hall inside a 5-tile green.
@@ -1369,9 +1591,10 @@ function buildMap(seed: number, scale: number): GenesisMap {
       return fallback ?? [site.u, site.v];
     };
 
-    for (let i = 0; i < maxCount; i++) {
+    for (let i = 0; i < total; i++) {
       const founding = si === 0 && i === 0;
       const landmark = founding ? false : (si === 0 ? i === 1 : i === 0);
+      const gild = i === gildAt;
 
       let role: StructureRole;
       let w: number;
@@ -1380,6 +1603,12 @@ function buildMap(seed: number, scale: number): GenesisMap {
         role = 'homestead';
         w = 40 + Math.floor(brng() * 3) * 4; // 40 | 44 | 48
         floors = 2;
+      } else if (gild) {
+        // A charter buys one building nothing else in the valley can be: gold
+        // ridge trim, a banner, and a floor more than it strictly needs.
+        role = 'gildhall';
+        w = clamp(Math.round((baseW * 1.4) / 4) * 4, 44, 60);
+        floors = brng() < 0.6 ? 3 : 2;
       } else if (landmark) {
         role = LANDMARK_ROLES[(si + landmarkOffset) % LANDMARK_ROLES.length];
         w = clamp(Math.round((baseW * 1.5) / 4) * 4, 44, 64);
@@ -1418,13 +1647,21 @@ function buildMap(seed: number, scale: number): GenesisMap {
           role === 'house' ||
           brng() < 0.35,
         awning: role === 'store' || (role === 'workshop' && brng() < 0.5),
-        banner: founding || landmark,
+        banner: founding || landmark || gild,
         cupola: role === 'chapel' || (role === 'tower' && brng() < 0.6),
         accent: site.accent,
         seed: (seed + si * 7717 + i * 613) >>> 0,
         clears: [],
       });
     }
+    // Name the buildings this chest paid for, so the timeline can tell at a
+    // glance which of them survived the day's pace trim — and can put the
+    // discovery in the ledger before the town starts spending. Ids come off the
+    // FULL roster at a scale-free index, so the list is the same at every pace.
+    if (grant) {
+      grant.chest.grantIds = list.slice(grantAt, grantAt + extra).map((b) => b.id);
+    }
+
     siteBuildings.push(list);
   });
 
@@ -2000,6 +2237,20 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   });
 
+  // Whoever buried a chest cleared a yard of ground to do it, and the wood has
+  // not quite taken it back. Same rule as the dressing above: only unclaimed
+  // undergrowth gives way, so nobody's felling appointment is cancelled. Chest
+  // positions are scale-free, so this leaves the tree list scale-identical.
+  for (const chest of chests) {
+    const cu = chest.gx - chest.gy;
+    const cv = chest.gx + chest.gy;
+    for (const i of treesNear(cu, cv, 1.1)) {
+      const t = trees[i];
+      if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) continue;
+      if (dist(treeUV[i], [cu, cv]) < 1.1) dead.add(t.id);
+    }
+  }
+
   const liveTrees = trees.filter((t) => !dead.has(t.id));
 
   /* ---- assemble --------------------------------------------------------- */
@@ -2036,6 +2287,7 @@ function buildMap(seed: number, scale: number): GenesisMap {
     bridges: activeBridges,
     trees: liveTrees,
     scatter,
+    chests,
     valleyName: valley,
   };
 }

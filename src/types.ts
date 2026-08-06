@@ -117,7 +117,10 @@ export type StructureRole =
   | 'shed'
   | 'bakery'
   | 'brewhouse'
-  | 'homestead';
+  | 'homestead'
+  /** Never drawn from the common or landmark bags: a gildhall is only ever
+   * built with a charter dug out of a treasure chest. See ChestSpec. */
+  | 'gildhall';
 
 export type RoofStyle = 'hip' | 'gable' | 'flat' | 'thatch';
 
@@ -178,6 +181,52 @@ export interface BridgeSpec {
   span: number; // tiles, ~3.5..5
 }
 
+/* --------------------------- buried treasure ----------------------------- */
+
+/**
+ * What a chest is worth to whoever turns it up.
+ *
+ *   coin     — a hoard. The finding town raises `grant` EXTRA plots today that
+ *              it would otherwise never have got round to.
+ *   charter  — a document. The finding town raises one gildhall, a silhouette
+ *              no ordinary roster can produce.
+ *   trinket  — a comb, a bad coin, forty years of damp. No material reward at
+ *              all; the whole of it is a ledger line.
+ */
+export type ChestReward = 'coin' | 'charter' | 'trinket';
+
+/**
+ * A chest buried in the deep wood or out on the moor, well off any road.
+ *
+ * CHESTS ARE TERRAIN. Position, reward, finder and luck are a pure function of
+ * the seed and are byte-identical at every pace scale — see the SCALE RULE in
+ * gen.ts. What the pace scale *can* do is trim the finding town, or the plots
+ * the chest paid for, out of the day; when that happens the timeline narrates
+ * the find at trinket tier and nothing material changes hands.
+ */
+export interface ChestSpec {
+  id: string; // "ch0"
+  gx: number;
+  gy: number;
+  seed: number;
+  /** The ground it is buried in — only ever 'forest' or 'moor'. */
+  biome: Biome;
+  /** Ledger-ready name for the place: "the fir wood", "the high moor". */
+  where: string;
+  reward: ChestReward;
+  /** Roster index of the town that finds it. Never 0 — the founding house has
+   * enough to be getting on with. */
+  siteIndex: number;
+  /** `s${siteIndex}`. The town may not exist at a small pace scale. */
+  siteId: string;
+  /** Does the day's digging turn it up at all? False on a tease day. */
+  found: boolean;
+  /** Buildings this chest paid for, in the finding town's FULL roster. Empty
+   * for trinket tier and for every unfound chest. A smaller pace scale may
+   * trim some or all of them away. */
+  grantIds: string[];
+}
+
 export interface GenesisMap {
   version: 1;
   seed: number;
@@ -196,6 +245,9 @@ export interface GenesisMap {
   trees: TreeSpec[];
   /** Wild non-tree scenery, present from t=0. */
   scatter: PropSpec[];
+  /** 0..2 buried chests. Terrain: identical at every pace scale. Optional so
+   * hand-written fixtures predating the feature still typecheck. */
+  chests?: ChestSpec[];
   valleyName: string;
 }
 
@@ -213,7 +265,9 @@ export type GenesisEvent =
   | { t: number; type: 'road'; roadId: string; frac: number } // built up to frac of arclength, monotonic
   | { t: number; type: 'bridge'; bridgeId: string; stage: 0 | 1 | 2 | 3 } // 1 pilings, 2 deck, 3 rails/done
   | { t: number; type: 'prop'; propId: string; siteId: string } // dressing appears
-  | { t: number; type: 'log'; text: string; siteId?: string }; // ledger line (also emitted alongside milestones)
+  | { t: number; type: 'log'; text: string; siteId?: string } // ledger line (also emitted alongside milestones)
+  | { t: number; type: 'dig'; chestId: string } // somebody's spade hits the lid
+  | { t: number; type: 'discover'; chestId: string }; // the lid comes up
 
 export interface Timeline {
   events: GenesisEvent[];
@@ -223,6 +277,8 @@ export interface Timeline {
 
 export type TreeState = 'standing' | 'felling' | 'stump';
 export type BuildingStatus = 'unplanned' | 'surveyed' | 'building' | 'done';
+/** Missing from the map = still buried and undisturbed. */
+export type ChestState = 'digging' | 'open';
 
 export interface WorldSnapshot {
   t: number;
@@ -232,6 +288,8 @@ export interface WorldSnapshot {
   roads: Map<string, number>; // id -> built frac (missing = 0)
   bridges: Map<string, 0 | 1 | 2 | 3>;
   props: Set<string>; // site-dressing prop ids that exist
+  /** chest id -> state (missing = still buried) */
+  chests: Map<string, ChestState>;
   founded: Set<string>; // site ids
   population: Map<string, number>; // site id -> settlers
   log: { t: number; text: string }[]; // all log-worthy lines up to t

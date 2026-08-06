@@ -244,7 +244,11 @@ export type StructureRole =
   // routine below falls through to the plain-house path when it sees one.
   | 'bakery'
   | 'brewhouse'
-  | 'homestead';
+  | 'homestead'
+  // Only ever built on a charter dug out of a buried chest, so it is allowed a
+  // silhouette no ordinary plot can have: gilded ridge, gilded eaves, a lamp on
+  // the ridge end and a plaque by the door.
+  | 'gildhall';
 
 export interface StructureSpec {
   role: StructureRole;
@@ -454,7 +458,9 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
   const kilnH = role === 'brewhouse' ? 26 : 0;
 
   const padX = 12 + (sailR ? 12 : 0) + (role === 'bakery' ? 8 : 0);
-  const padTop = 34 + towerH + siloH + sailR + kilnH + (spec.cupola ? 22 : 0);
+  /** Ridge lamp and finial on a gildhall stand clear of the roof. */
+  const gildH = role === 'gildhall' ? 14 : 0;
+  const padTop = 34 + towerH + siloH + sailR + kilnH + gildH + (spec.cupola ? 22 : 0);
   const padBottom = 8;
   const spriteW = W + padX * 2;
   const spriteH = padTop + Math.round(W * 0.4) + wallH + H + padBottom + 20;
@@ -718,6 +724,44 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
       rect(ctx, W / 5, -8, 3, 8, PAL.woodLight);
       rect(ctx, W / 5, -6, 8, 1, PAL.stoneDark);
       rect(ctx, W / 5, -2, 8, 1, PAL.stoneDark);
+    }
+
+    if (role === 'gildhall' && p >= 0.62 && roof !== 'flat') {
+      // A charter building. Everything here is gilt: the eaves, the ridge, a
+      // lamp on the ridge end and a plaque by the door. Gold rather than the
+      // town's accent, because the point of the silhouette is that this one
+      // roof was paid for by something nobody in the valley worked for.
+      const GOLD = '#f2cc63';
+      const GOLD_D = '#c1912f';
+      const GOLD_L = '#ffeaa8';
+      const RW = W + 8;
+      const ry = -wallH;
+      const Ec: Pt = [RW / 2, ry];
+      const Sc: Pt = [0, ry + RW / 4];
+      const Wc: Pt = [-RW / 2, ry];
+      poly(ctx, [Wc, Sc, [Sc[0], Sc[1] + 2.2], [Wc[0], Wc[1] + 2.2]], GOLD);
+      poly(ctx, [Sc, Ec, [Ec[0], Ec[1] + 2.2], [Sc[0], Sc[1] + 2.2]], GOLD_D);
+
+      const hip = roof === 'hip';
+      const r1: Pt = hip ? [0, ry - roofH] : [-RW / 4, ry - RW / 8 - roofH];
+      const r2: Pt = hip ? [0, ry - roofH] : [RW / 4, ry + RW / 8 - roofH];
+      if (!hip) {
+        poly(ctx, [r1, r2, [r2[0], r2[1] + 2.2], [r1[0], r1[1] + 2.2]], GOLD_D);
+        poly(ctx, [r1, r2, [r2[0], r2[1] + 1], [r1[0], r1[1] + 1]], GOLD_L);
+      } else {
+        poly(ctx, [[r1[0] - 4, r1[1] + 2], [r1[0] + 4, r1[1] + 2], [r1[0], r1[1] - 1]], GOLD);
+      }
+      const fx = Math.round(r1[0]);
+      const fy = Math.round(r1[1]);
+      rect(ctx, fx - 1, fy - 8, 1, 8, GOLD_D);
+      rect(ctx, fx - 3, fy - 12, 5, 4, PAL.glassLit);
+      rect(ctx, fx - 4, fy - 13, 7, 1, GOLD);
+      rect(ctx, fx - 4, fy - 8, 7, 1, GOLD);
+
+      // charter plaque, screwed to the wall beside the door
+      const pw = 3.2 / W;
+      poly(ctx, qL(W, 0.5 + pw * 2, 0.5 + pw * 3.8, 6, 11.5), GOLD_D);
+      poly(ctx, qL(W, 0.5 + pw * 2.2, 0.5 + pw * 3.6, 6.8, 10.7), GOLD);
     }
 
     if (spec.cupola && p >= 0.62) {
@@ -1269,6 +1313,133 @@ export function drawCraneLoad(ctx: Ctx, x: number, y: number, t: number): void {
   ctx.fillRect(lx, ly + 4, 9, 2);
   ctx.fillStyle = PAL.woodDark;
   ctx.fillRect(lx, ly, 9, 1);
+}
+
+/* ---------------------------- buried treasure --------------------------- */
+/* Genesis only. Three states of one object: the mound nobody has noticed, the
+ * chest standing in its hole with the earth thrown back, and the same chest
+ * with the lid up. The anchor is the ground centre in all three, so the sprite
+ * can be swapped underneath a fixed tile position without anything shifting. */
+
+/** Point on the near-left / near-right face of a 18px chest body. */
+const chestL = (t: number, h: number): Pt => [-9 + 9 * t, 4.5 * t - h];
+const chestR = (t: number, h: number): Pt => [9 * t, 4.5 - 4.5 * t - h];
+
+/** Body, bands and lock — shared by the closed and open chests. */
+function chestBody(ctx: Ctx): void {
+  poly(ctx, [chestL(0, 8), chestL(1, 8), chestL(1, 0), chestL(0, 0)], PAL.wood);
+  poly(ctx, [chestR(0, 8), chestR(1, 8), chestR(1, 0), chestR(0, 0)], PAL.woodDark);
+  for (const t of [0.24, 0.76]) {
+    poly(ctx, [chestL(t - 0.07, 8), chestL(t + 0.07, 8), chestL(t + 0.07, 0), chestL(t - 0.07, 0)], PAL.stoneDark);
+    poly(ctx, [chestR(t - 0.07, 8), chestR(t + 0.07, 8), chestR(t + 0.07, 0), chestR(t - 0.07, 0)], shade(PAL.stoneDark, -0.16));
+  }
+  poly(ctx, [chestL(0, 5), chestL(1, 5), chestL(1, 3.6), chestL(0, 3.6)], PAL.woodLight);
+  poly(ctx, [chestR(0, 5), chestR(1, 5), chestR(1, 3.6), chestR(0, 3.6)], PAL.wood);
+}
+
+/**
+ * A chest still in the ground: a low hump of turned earth going green again,
+ * with one corner of a lid and one iron band showing. Meant to be *findable*
+ * from the road, not obvious — a visitor who spots one before the settlers do
+ * has earned it.
+ */
+export function buildChestMound(seed: number): Sprite {
+  const rng = mulberry32(seed);
+  return makeSprite(28, 22, 14, 16, (ctx) => {
+    poly(ctx, diamond(1, 1, 22), PAL.shadowSoft);
+    poly(ctx, diamond(0, 0, 21), shade(PAL.till, -0.14));
+    poly(ctx, diamond(0, -2, 15), shade(PAL.till, 0.02));
+    blob(ctx, -5, -6, [5, 8, 7, 4], PAL.moss);
+    blob(ctx, 5, -4, [4, 6, 5], shade(PAL.moss, -0.14));
+    poly(ctx, [[-6, -5], [1, -8.5], [6, -6], [-1, -2.5]], PAL.woodDark);
+    poly(ctx, [[-5, -5.6], [0, -8], [3, -6.6], [-2, -4.2]], PAL.wood);
+    rect(ctx, -1, -7, 3, 1, PAL.stoneDark);
+    if (rng() < 0.55) rect(ctx, 6, -2, 2, 1, PAL.stone);
+    if (rng() < 0.4) rect(ctx, -8, -1, 2, 1, PAL.stone);
+  });
+}
+
+/**
+ * The chest itself. `open` swings the lid up onto its hinges and fills the box
+ * with what the day was worth. Closed is the dug-out state the crew works on;
+ * open is what the valley gets to look at for the rest of the day.
+ */
+export function buildChest(open: boolean, seed: number): Sprite {
+  const rng = mulberry32(seed);
+  const H = open ? 40 : 28;
+  return makeSprite(30, H, 15, H - 8, (ctx) => {
+    poly(ctx, diamond(1, 1, 24), PAL.shadow);
+    poly(ctx, diamond(0, 0, 22), shade(PAL.till, -0.06));
+    poly(ctx, diamond(0, -1, 16), PAL.till);
+    chestBody(ctx);
+
+    if (!open) {
+      // A domed lid, stepped in two courses so it reads as a chest and not as a
+      // crate: full width to h10, inset to h12, then the boards on top.
+      poly(ctx, [chestL(0, 10), chestL(1, 10), chestL(1, 8), chestL(0, 8)], PAL.woodLight);
+      poly(ctx, [chestR(0, 10), chestR(1, 10), chestR(1, 8), chestR(0, 8)], PAL.wood);
+      poly(ctx, [chestL(0.1, 12), chestL(0.9, 12), chestL(0.9, 10), chestL(0.1, 10)], shade(PAL.woodLight, 0.1));
+      poly(ctx, [chestR(0.1, 12), chestR(0.9, 12), chestR(0.9, 10), chestR(0.1, 10)], PAL.woodLight);
+      poly(ctx, diamond(0, -12, 15), shade(PAL.woodLight, 0.2));
+      // one iron strap over the crown, and the lock plate on the front corner
+      poly(ctx, [[-3.6, -13.6], [3.6, -10.2], [3.6, -8.9], [-3.6, -12.3]], PAL.stoneDark);
+      poly(ctx, [chestL(0.44, 12), chestL(0.56, 12), chestL(0.56, 8), chestL(0.44, 8)], PAL.stoneDark);
+      poly(ctx, [chestR(0.44, 12), chestR(0.56, 12), chestR(0.56, 8), chestR(0.44, 8)], shade(PAL.stoneDark, -0.16));
+      rect(ctx, -2, -8, 4, 3, '#c1912f');
+      rect(ctx, -1, -7, 1, 1, PAL.ink);
+      return;
+    }
+
+    // The lid, standing on its hinges: we see the inside of it, banded like the
+    // outside because whoever made this expected it to be argued with.
+    const LH = 11;
+    const lidL = (t: number, up: number): Pt => [-9 + 9 * t, -8 - 4.5 * t - up];
+    const lidR = (t: number, up: number): Pt => [9 * t, -12.5 + 4.5 * t - up];
+    poly(ctx, [lidL(0, LH), lidL(1, LH), lidL(1, 0), lidL(0, 0)], PAL.wood);
+    poly(ctx, [lidR(0, LH), lidR(1, LH), lidR(1, 0), lidR(0, 0)], PAL.woodLight);
+    for (const t of [0.26, 0.74]) {
+      poly(ctx, [lidL(t - 0.07, LH), lidL(t + 0.07, LH), lidL(t + 0.07, 0), lidL(t - 0.07, 0)], shade(PAL.wood, -0.26));
+      poly(ctx, [lidR(t - 0.07, LH), lidR(t + 0.07, LH), lidR(t + 0.07, 0), lidR(t - 0.07, 0)], PAL.stoneDark);
+    }
+    poly(ctx, [lidL(0, LH), lidL(1, LH), lidL(1, LH - 1.4), lidL(0, LH - 1.4)], PAL.stoneDark);
+    poly(ctx, [lidR(0, LH), lidR(1, LH), lidR(1, LH - 1.4), lidR(0, LH - 1.4)], shade(PAL.stoneDark, 0.14));
+
+    // …and what is in it.
+    poly(ctx, diamond(0, -8, 18), '#4a3a2c');
+    blob(ctx, 0, -12, [7, 12, 14, 12, 8], '#c1912f');
+    blob(ctx, -1, -13, [6, 9, 9, 6], '#f2cc63');
+    blob(ctx, 2, -12, [4, 5, 4], '#ffeaa8');
+    rect(ctx, -4, -11, 1, 1, PAL.chalk);
+    rect(ctx, 3, -13, 1, 1, PAL.chalk);
+    if (rng() < 0.6) rect(ctx, -6, -9, 2, 1, '#ffeaa8');
+  });
+}
+
+/**
+ * The glint coming off an open chest: two or three pixels that wink on and off.
+ * Drawn per frame by the renderer at the chest's ground anchor, so it never
+ * gets baked into the sprite and never crawls.
+ */
+export function drawChestGlint(ctx: Ctx, x: number, y: number, t: number): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const spots: [number, number, number][] = [
+    [-3, -13, 0],
+    [4, -11, 2.1],
+    [0, -16, 4.3],
+  ];
+  for (const [dx, dy, ph] of spots) {
+    const k = Math.sin(t * 2.4 + ph);
+    if (k < 0.55) continue;
+    ctx.fillStyle = k > 0.9 ? '#ffffff' : '#ffeaa8';
+    ctx.fillRect(px + dx, py + dy, 1, 1);
+    if (k > 0.9) {
+      ctx.fillRect(px + dx - 1, py + dy, 1, 1);
+      ctx.fillRect(px + dx + 1, py + dy, 1, 1);
+      ctx.fillRect(px + dx, py + dy - 1, 1, 1);
+      ctx.fillRect(px + dx, py + dy + 1, 1, 1);
+    }
+  }
 }
 
 /* ------------------------------- dynamics ------------------------------- */

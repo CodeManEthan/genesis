@@ -187,6 +187,23 @@ function report(seed) {
       .map(([k, v]) => `${k} ${v}`)
       .join(', ');
   };
+  const chests = map.chests ?? [];
+  say(`\nCHESTS (${chests.length})`);
+  for (const c of chests) {
+    const p = uvOf(c);
+    let road = Infinity;
+    for (const r of map.roads) road = Math.min(road, polyDist(p, roadUV.get(r.id)));
+    const site = map.sites.find((s) => s.id === c.siteId);
+    const paid = site ? c.grantIds.filter((id) => site.buildings.some((b) => b.id === id)) : [];
+    say(
+      `  ${c.id} ${c.reward.padEnd(8)} u,v ${f1(p[0]).padStart(6)},${f1(p[1]).padStart(6)}  ` +
+        `${c.biome.padEnd(6)} ${('“' + c.where + '”').padEnd(18)} ` +
+        `road ${f1(road).padStart(5)}  river ${f1(polyDist(p, river)).padStart(5)}  ` +
+        `${c.found ? 'FOUND' : 'buried'} by ${c.siteId}${site ? '' : ' (trimmed)'}  ` +
+        `pays ${paid.length}/${c.grantIds.length}${c.grantIds.length ? ' [' + c.grantIds.join(' ') + ']' : ''}`
+    );
+  }
+
   say(`\nforest character: ${woodCharacter(seed)}`);
   say(`tree kinds: ${hist(map.trees, (t) => t.kind)}`);
   say(`scatter kinds: ${hist(map.scatter, (p) => p.kind)}`);
@@ -456,6 +473,78 @@ function checks(seed, map, scale = 1) {
     );
   }
 
+  /* (t) buried treasure: nought to two, in deep cover, well off every road,
+     and paying out only where the day's roster could carry the reward.
+     Chests are TERRAIN — the scale-identity half of that is in subsetChecks. */
+  {
+    const chests = map.chests ?? [];
+    const bad = [];
+    const ids = new Set();
+    let minRoad = Infinity;
+    let minRiver = Infinity;
+    let minSite = Infinity;
+    for (const c of chests) {
+      if (ids.has(c.id)) bad.push(`duplicate id ${c.id}`);
+      ids.add(c.id);
+      const p = uvOf(c);
+      const chunk = map.chunks.find(
+        (k) => p[0] >= k.u0 && p[0] < k.u1 && p[1] >= k.v0 && p[1] < k.v1
+      );
+      if (!chunk) bad.push(`${c.id} sits outside every chunk`);
+      else if (chunk.biome !== 'forest' && chunk.biome !== 'moor')
+        bad.push(`${c.id} buried in ${chunk.biome}`);
+      else if (chunk.biome !== c.biome) bad.push(`${c.id} says ${c.biome}, ground says ${chunk.biome}`);
+      if (!c.where) bad.push(`${c.id} has nowhere to be`);
+      for (const r of map.roads) minRoad = Math.min(minRoad, polyDist(p, roadUV.get(r.id)));
+      minRiver = Math.min(minRiver, polyDist(p, river));
+      for (const s of map.sites) minSite = Math.min(minSite, d2(p, uvOf(s)) - s.radius);
+      for (const o of chests) if (o !== c && d2(p, uvOf(o)) < 12 - 1e-9) bad.push(`${c.id} crowds ${o.id}`);
+
+      if (!(c.siteIndex >= 1)) bad.push(`${c.id} names s0 as its finder`);
+      if (c.siteId !== `s${c.siteIndex}`) bad.push(`${c.id} siteId/siteIndex disagree`);
+      if (!['coin', 'charter', 'trinket'].includes(c.reward)) bad.push(`${c.id} reward ${c.reward}`);
+      if (!c.found && c.grantIds.length) bad.push(`${c.id} was never found but pays out`);
+      if (c.reward === 'trinket' && c.grantIds.length) bad.push(`${c.id} is a trinket that pays out`);
+      if (c.reward === 'charter' && c.found && c.grantIds.length !== 1)
+        bad.push(`${c.id} charter grants ${c.grantIds.length}`);
+      for (const id of c.grantIds)
+        if (!id.startsWith(`${c.siteId}-`)) bad.push(`${c.id} grant ${id} is not ${c.siteId}'s`);
+
+      const site = map.sites.find((s) => s.id === c.siteId);
+      if (site && c.grantIds.length) {
+        const here = c.grantIds.filter((id) => site.buildings.some((b) => b.id === id));
+        // All of it, or (only where the pace control trimmed the town's roster
+        // back past the grant) none of it. Never half a windfall.
+        if (here.length && here.length !== c.grantIds.length)
+          bad.push(`${c.id} pays out ${here.length}/${c.grantIds.length} at ${scale}x`);
+        if (scale >= 1 && here.length !== c.grantIds.length)
+          bad.push(`${c.id} reward trimmed at ${scale}x — a normal day must always pay`);
+        if (c.reward === 'charter' && here.length && !site.buildings.some((b) => b.role === 'gildhall'))
+          bad.push(`${c.id} charter paid out with no gildhall in ${site.id}`);
+      }
+    }
+    // A gildhall exists for exactly one reason.
+    for (const s of map.sites)
+      for (const b of s.buildings)
+        if (
+          b.role === 'gildhall' &&
+          !chests.some((c) => c.found && c.reward === 'charter' && c.grantIds.includes(b.id))
+        )
+          bad.push(`${b.id} is a gildhall nobody found a charter for`);
+
+    check(
+      't  chests buried off the road',
+      chests.length <= 2 &&
+        bad.length === 0 &&
+        (!chests.length || (minRoad >= 2 && minRiver >= 3 && minSite >= 3)),
+      `${chests.length} chest(s)` +
+        (chests.length
+          ? `, nearest road ${f1(minRoad)}, river ${f1(minRiver)}, town rim ${f1(minSite)}`
+          : '') +
+        (bad.length ? ` — ${bad.join('; ')}` : '')
+    );
+  }
+
   /* (s) no two towns wear the same accent */
   {
     const acc = map.sites.map((s) => s.accent);
@@ -490,7 +579,11 @@ function subsetChecks(seed) {
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
   // Terrain is scale-invariant, full stop.
-  for (const field of ['river', 'riverWidth', 'chunks', 'trees', 'scatter', 'bounds', 'content', 'valleyName']) {
+  // `chests` is in here on purpose: a chest is terrain. Where it is, what is in
+  // it, who finds it and whether the day's digging turns it up at all are all a
+  // pure function of the seed. Only the REWARD is allowed to notice the pace,
+  // and it does that through the ordinary site/building prefix below.
+  for (const field of ['river', 'riverWidth', 'chunks', 'trees', 'scatter', 'chests', 'bounds', 'content', 'valleyName']) {
     const ok = maps.every((m) => same(m[field], maps[0][field]));
     check(`terrain: ${field} identical`, ok);
   }
@@ -576,6 +669,64 @@ function subsetChecks(seed) {
   return pass;
 }
 
+/* ------------------------------ chest rates ------------------------------ */
+
+/**
+ * How often a day buries treasure, and how often the day's digging turns any of
+ * it up. The number that matters is the last one: a discovery on roughly one in
+ * three to one in two of the days that have a chest to find. Rarer than that and
+ * nobody ever sees the feature; commoner and it stops being luck.
+ */
+function chestReport(n) {
+  let chestDays = 0;
+  let findDays = 0;
+  let total = 0;
+  let found = 0;
+  const nHist = {};
+  const tier = {};
+  const paid = {};
+  const where = {};
+  for (let s = 1; s <= n; s++) {
+    const map = generateMap(s);
+    const chests = map.chests ?? [];
+    nHist[chests.length] = (nHist[chests.length] ?? 0) + 1;
+    if (chests.length) chestDays++;
+    let f = 0;
+    for (const c of chests) {
+      total++;
+      tier[c.reward] = (tier[c.reward] ?? 0) + 1;
+      where[c.where] = (where[c.where] ?? 0) + 1;
+      if (!c.found) continue;
+      found++;
+      f++;
+      const site = map.sites.find((x) => x.id === c.siteId);
+      const key =
+        c.reward === 'trinket'
+          ? 'trinket (nothing owed)'
+          : site && c.grantIds.every((id) => site.buildings.some((b) => b.id === id))
+            ? `${c.reward} paid`
+            : `${c.reward} TRIMMED`;
+      paid[key] = (paid[key] ?? 0) + 1;
+    }
+    if (f) findDays++;
+  }
+  const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : '--');
+  const hist = (o) =>
+    Object.entries(o)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k} ${v}`)
+      .join(', ');
+  console.log(`\nBURIED TREASURE over ${n} seeds`);
+  console.log(`  chests per day: ${hist(nHist)}   (${chestDays} days with a chest, ${total} chests)`);
+  console.log(`  rewards buried: ${hist(tier)}`);
+  console.log(`  ground:         ${hist(where)}`);
+  console.log(`  found at 1x:    ${found}/${total} chests (${pct(found, total)}), ${hist(paid)}`);
+  console.log(
+    `  => a discovery on ${findDays}/${chestDays} chest-days (${pct(findDays, chestDays)}), ` +
+      `${pct(findDays, n)} of all days`
+  );
+}
+
 /* ---------------------------------- main --------------------------------- */
 
 const argv = process.argv.slice(2);
@@ -618,6 +769,7 @@ if (argv[0] === '--sweep') {
   }
   console.log(`sweep ${Math.min(n, 60)} seeds subset stability: ${subFails.length ? `FAIL ${subFails.join(',')}` : 'ALL PASS'}`);
   if (subFails.length) allPass = false;
+  chestReport(n);
 } else {
   const seeds = argv.length ? argv.map(Number) : [1, 42, 20260802];
   for (const s of seeds) {

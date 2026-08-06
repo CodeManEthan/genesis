@@ -191,6 +191,35 @@ function makeFixture(seed, opts) {
     });
   }
 
+  // Buried treasure. `opts.chests` is a list of {reward, site, found, grants}:
+  // the map's half of the feature, hand-authored so the timeline can be tested
+  // on shapes gen.ts will not always produce — a find with nothing owed, a
+  // reward the day's roster cannot carry, two chests in one valley.
+  const chests = [];
+  for (const [i, spec] of (opts.chests ?? []).entries()) {
+    const si = Math.min(spec.site ?? 1, nSites - 1);
+    const site = sites[si];
+    const n = spec.found && spec.reward !== 'trinket' ? (spec.grants ?? 1) : 0;
+    const grantIds = [];
+    for (let k = 0; k < n; k++) {
+      const b = site.buildings[site.buildings.length - 1 - k];
+      if (b) grantIds.unshift(b.id);
+    }
+    chests.push({
+      id: `ch${i}`,
+      gx: 74 + i * 9,
+      gy: 6 + i * 13,
+      seed: 4000 + i * 13,
+      biome: i % 2 ? 'moor' : 'forest',
+      where: i % 2 ? 'the high moor' : 'the fir wood',
+      reward: spec.reward,
+      siteIndex: si,
+      siteId: site.id,
+      found: !!spec.found,
+      grantIds: spec.orphanGrant ? [`${site.id}-b999`] : grantIds,
+    });
+  }
+
   return {
     version: 1,
     seed,
@@ -208,6 +237,7 @@ function makeFixture(seed, opts) {
     bridges,
     trees,
     scatter,
+    chests,
     valleyName: 'Ashmere Vale',
   };
 }
@@ -268,6 +298,7 @@ function serialize(snap) {
     roads: m(snap.roads),
     bridges: m(snap.bridges),
     props: s(snap.props),
+    chests: m(snap.chests),
     founded: s(snap.founded),
     population: m(snap.population),
     log: snap.log,
@@ -554,6 +585,49 @@ function run(label, map, pace = 1) {
   for (const [id, n] of startCount) if (n > 1) bad(`(m) tree ${id} felled ${n} times`);
   for (const [id, n] of doneCount) if (n > 1) bad(`(m) tree ${id} chop-done ${n} times`);
 
+  /* (n2) buried treasure: one dig and one lid per chest, only for the chests
+     the map actually buried and actually found, and always before the town
+     starts spending the proceeds */
+  const chests = map.chests ?? [];
+  const chestById = new Map(chests.map((c) => [c.id, c]));
+  const digT = new Map();
+  const discT = new Map();
+  for (const e of ev) {
+    if (e.type !== 'dig' && e.type !== 'discover') continue;
+    const into = e.type === 'dig' ? digT : discT;
+    if (!chestById.has(e.chestId)) bad(`(n2) unknown chestId ${e.chestId}`);
+    if (into.has(e.chestId)) bad(`(n2) ${e.chestId}: two ${e.type} events`);
+    else into.set(e.chestId, e.t);
+  }
+  for (const [id, t] of discT) {
+    const c = chestById.get(id);
+    if (!c) continue;
+    if (!c.found) bad(`(n2) ${id} was opened, but the map never found it`);
+    if (!digT.has(id)) bad(`(n2) ${id} was opened without anybody digging for it`);
+    else if (digT.get(id) > t + 1e-9)
+      bad(`(n2) ${id}: dug at ${hhmm(digT.get(id))}, already open at ${hhmm(t)}`);
+    // Cause, then effect: nothing a chest paid for may be staked out first.
+    for (const gid of c.grantIds) {
+      const sT = surveyT.get(gid);
+      if (sT === undefined) continue;
+      if (sT < t - 1e-9)
+        bad(`(n2) ${id}: reward ${gid} surveyed at ${hhmm(sT)}, chest not open until ${hhmm(t)}`);
+    }
+  }
+  for (const id of digT.keys())
+    if (!discT.has(id) && !truncated) bad(`(n2) ${id} was dug for and never opened`);
+  if (!truncated)
+    for (const c of chests)
+      if (c.found && !discT.has(c.id)) bad(`(n2) ${c.id} was found by the map but never opened`);
+  if (!truncated) {
+    for (const c of chests) {
+      const st = end.chests.get(c.id);
+      if (c.found && st !== 'open') bad(`(n2) ${c.id} is ${st ?? 'still buried'} at midnight`);
+      if (!c.found && st !== undefined) bad(`(n2) ${c.id} should have stayed buried, is ${st}`);
+    }
+  }
+  if (emptySnapshot(map).chests.size) bad(`(n2) chests are already disturbed at t=0`);
+
   /* (k) day arc: first road mid-morning, ledger well spread, quiet close */
   const roadEvents = ev.filter((e) => e.type === 'road');
   const firstRoad = roadEvents.length ? roadEvents[0].t : null;
@@ -608,6 +682,18 @@ function run(label, map, pace = 1) {
   );
   const foundLine = [...foundT.entries()].map(([k, v]) => `${k}@${hhmm(v)}`).join(' ');
   if (foundLine) console.log(`  foundings: ${foundLine}`);
+  if (chests.length) {
+    console.log(
+      `  chests: ` +
+        chests
+          .map(
+            (c) =>
+              `${c.id}/${c.reward}${c.grantIds.length ? `x${c.grantIds.length}` : ''}` +
+              (discT.has(c.id) ? `@${hhmm(discT.get(c.id))}` : c.found ? '@NEVER' : ' buried')
+          )
+          .join('  ')
+    );
+  }
   for (const m of fails) console.log(`  ! ${m}`);
   return { fails, ev, tl, map, lastBuild, pace };
 }
@@ -662,6 +748,39 @@ cases.push([
   makeFixture(5150, { buildings: [7, 6, 6, 6, 5], trees: 180, loopRoad: true, roadClears: 10 }),
 ]);
 cases.push(['fixture: one site only', makeFixture(31337, { buildings: [5], trees: 18 })]);
+cases.push([
+  'fixture: a coin hoard and a charter, both found',
+  makeFixture(60613, {
+    buildings: [5, 5, 4],
+    trees: 90,
+    roadClears: 6,
+    chests: [
+      { reward: 'coin', site: 1, found: true, grants: 2 },
+      { reward: 'charter', site: 2, found: true, grants: 1 },
+    ],
+  }),
+]);
+cases.push([
+  'fixture: chests nobody finds, and a trinket somebody does',
+  makeFixture(60614, {
+    buildings: [4, 4],
+    trees: 60,
+    chests: [
+      { reward: 'coin', site: 1, found: false, grants: 2 },
+      { reward: 'trinket', site: 1, found: true },
+    ],
+  }),
+]);
+cases.push([
+  // the pace control trimmed the reward out of the day: the find is real, the
+  // windfall never arrives, and the ledger has to cope
+  'fixture: a find whose reward is not in the map',
+  makeFixture(60615, {
+    buildings: [4, 3],
+    trees: 40,
+    chests: [{ reward: 'coin', site: 1, found: true, grants: 2, orphanGrant: true }],
+  }),
+]);
 
 if (generateMap) {
   for (const day of ['2026-08-02', '2026-08-03', '2026-12-25', '2027-01-01']) {
