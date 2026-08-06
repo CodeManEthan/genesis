@@ -35,7 +35,7 @@ import type {
   WorldSnapshot,
 } from './types.ts';
 import { mulberry32 } from './types.ts';
-import { dayTypeOf, stormWarp, type DayType } from './daytype.ts';
+import { dayTypeOf, marketSite, stormWarp, type DayType } from './daytype.ts';
 
 /* -------------------------------------------------------------------------- */
 /* small helpers                                                              */
@@ -1073,7 +1073,7 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
  * phenomenon, two where the thing has an end worth reporting, and written the
  * same way as everything else: dry, and about people rather than weather.
  */
-const WEATHER_LOG: Record<Exclude<DayType, 'normal'>, string[]> = {
+const WEATHER_LOG: Partial<Record<DayType, string[]>> = {
   mist: ['Mist sits low in {valley} until the sun gets under it.'],
   eclipse: [
     'Something gets in front of the sun. Lamps lit at two in the afternoon, and the birds fooled.',
@@ -1101,7 +1101,10 @@ const WEATHER_LOG: Record<Exclude<DayType, 'normal'>, string[]> = {
  */
 function weather(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
   const day = dayTypeOf(map.seed);
-  if (day.type === 'normal') return events;
+  const lines = WEATHER_LOG[day.type];
+  // An ordinary day, or a market day — which is a rare day with no weather in
+  // it at all, and gets its own narration below.
+  if (!lines) return events;
 
   const out =
     day.type === 'storm'
@@ -1124,12 +1127,130 @@ function weather(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x5c0d1e77) >>> 0);
   const valley = map.valleyName;
   const town = map.sites.length ? map.sites[Math.floor(rng() * map.sites.length)].name : valley;
-  WEATHER_LOG[day.type].forEach((tpl, i) => {
+  lines.forEach((tpl, i) => {
     if (i >= at.length) return;
     out.push({ t: clamp(at[i], 0.01, 23.97), type: 'log', text: fill(tpl, { valley, town }) });
   });
 
   for (const e of out) e.t = clamp(e.t, 0.01, 23.97);
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/* ================ MARKET DAY, and the festival it is not ================== *
+ * Two additions that write ledger lines and nothing else. Neither adds an
+ * event type: a market is stalls the scene paints from the day type, a festival
+ * is a bonfire the scene paints from a condition it can test itself, and the
+ * only thing the timeline owes either of them is words.
+ *
+ * Both sit here rather than inside `narrate` for the same reason the weather
+ * does: they are facts about *hours* — nine in the morning, after dark — and
+ * not about how hard the settlers are working, so they must be written after
+ * the pace scaling that moves everything else, or the stalls would be up at
+ * half past two on a hurried day and the ledger would still say nine.
+ * -------------------------------------------------------------------------- */
+
+const MARKET_OPEN_LOG = [
+  'Carts on every road into {town} before the light is properly up. It is a market day.',
+  'The {town} road is nose to tail from dawn: it is a market day, and everyone knew but us.',
+  'Trestles up on the green at {town}. Awnings, and an argument about pitches.',
+];
+
+const MARKET_TRADE_LOG = [
+  'Nobody at {town} gets a full day of work out of anyone. The stalls see to that.',
+  'Two shillings for a hen at {town}, which is either robbery or a bargain depending who you ask.',
+  'A man at the {town} market is selling nails by weight, and the carpenters have found him.',
+  'Wool, eggs, iron and gossip at {town}, in ascending order of volume.',
+];
+
+const MARKET_CLOSE_LOG = [
+  'The awnings come down at {town} in the last of the light. {valley} smells of other people’s cooking.',
+  'Stalls packed and the green trodden to mud at {town}. Worth it, apparently.',
+  'The market at {town} folds up at dusk and goes back down the road it came up.',
+];
+
+/** Three lines: the road in, the trading, and the awnings coming down. */
+function marketDay(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
+  const day = dayTypeOf(map.seed);
+  if (day.type !== 'market') return events;
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x5747a115) >>> 0);
+  const pick = (pool: string[]) => pool[Math.floor(rng() * pool.length)];
+  // The town named here is the town the scene pitches the stalls in, because it
+  // is literally the same function answering.
+  const where = marketSite(map);
+  const v = { valley: map.valleyName, town: where ? where.name : map.valleyName };
+  const out = events.slice();
+  const at: [number, string][] = [
+    [day.from - 0.55, fill(pick(MARKET_OPEN_LOG), v)],
+    [day.from + 3.4, fill(pick(MARKET_TRADE_LOG), v)],
+    [day.to + 0.2, fill(pick(MARKET_CLOSE_LOG), v)],
+  ];
+  for (const [t, text] of at) out.push({ t: clamp(t, 0.01, 23.97), type: 'log', text });
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/**
+ * THE FESTIVAL — the one thing in the day that is not drawn for, but earned.
+ *
+ * A valley that gets every last roof on before `FESTIVAL_BY` has an evening
+ * left over, and spends it: bunting between the houses of the founding town, a
+ * fire on the green, and everybody standing round it instead of going in.
+ *
+ * The test is deliberately made from the finished timeline rather than from the
+ * scheduler's internals, because that is the *only* form of it the scene can
+ * also run — the renderer never sees a Plan. So `festivalAt` is the single
+ * definition of the condition, and both the ledger below and `scene.fest` are
+ * the same call.
+ *
+ * Two facts have to hold, and the second is what makes a hurried day different
+ * from a truncated one:
+ *   the last roof is on before FESTIVAL_BY  — the day had light to spare
+ *   every planned roof is actually on       — nothing was left half-built
+ * A timeline paced below 1 runs off the end of midnight with walls still up on
+ * sticks, so it fails the second test however early its *last* roof happened
+ * to land, which is exactly right: nobody throws a party over a building site.
+ */
+const FESTIVAL_BY = 20.8;
+/** When the fire is lit. After full dark, and after the latest qualifying roof. */
+export const FESTIVAL_FROM = 21.0;
+
+/** @returns the hour the festival starts, or 0 on a day that did not earn one. */
+export function festivalAt(map: GenesisMap, tl: Timeline): number {
+  let want = 0;
+  for (const s of map.sites) want += s.buildings.length;
+  // The founding house is already standing at midnight and has no build events.
+  if (map.sites.length && map.sites[0].buildings.length) want -= 1;
+  if (want <= 0) return 0;
+
+  let done = 0;
+  let last = 0;
+  for (const e of tl.events) {
+    if (e.type !== 'build' || e.progress < 1) continue;
+    done++;
+    if (e.t > last) last = e.t;
+  }
+  return done >= want && last > 0 && last <= FESTIVAL_BY ? FESTIVAL_FROM : 0;
+}
+
+const FESTIVAL_LOG: [number, string][] = [
+  [0.05, 'The last roof went on with light to spare. Somebody has started stacking the offcuts.'],
+  [0.7, 'There is a fire on the green at {town}, and everyone is standing near it.'],
+];
+
+function festival(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
+  const from = festivalAt(map, { events });
+  if (!from) return events;
+  const town = map.sites.length ? map.sites[0].name : map.valleyName;
+  const out = events.slice();
+  for (const [dt, tpl] of FESTIVAL_LOG) {
+    out.push({
+      t: clamp(from + dt, 0.01, 23.97),
+      type: 'log',
+      text: fill(tpl, { town, valley: map.valleyName }),
+    });
+  }
   out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
   return out;
 }
@@ -1163,8 +1284,11 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
   if (pl.lastBuildT > 0.25) scalePlan(pl, target / pl.lastBuildT);
   const events = narrate(map, pl);
 
+  /** The rare-day passes, in the order they are allowed to see each other. */
+  const rare = (evs: GenesisEvent[]) => festival(map, marketDay(map, weather(map, evs)));
+
   const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
-  if (k === 1) return { events: weather(map, events) };
+  if (k === 1) return { events: rare(events) };
 
   // work rate k => everything happens 1/k as far into the day. Events pushed
   // past midnight simply never happen; the array is sorted, so the tail just
@@ -1178,7 +1302,7 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
     c.t = t;
     scaled.push(c);
   }
-  return { events: weather(map, scaled) };
+  return { events: rare(scaled) };
 }
 
 /** WorldSnapshot is structural; we hang a private cursor off it so that

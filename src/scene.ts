@@ -48,6 +48,8 @@
 import {
   PAL,
   buildBarrels,
+  buildBonfire,
+  buildBunting,
   buildBush,
   buildCampfire,
   buildCart,
@@ -62,6 +64,7 @@ import {
   buildHaystack,
   buildLamp,
   buildLumber,
+  buildMarketStall,
   buildNameBoard,
   buildQuarryBlocks,
   buildReeds,
@@ -74,6 +77,7 @@ import {
   buildStump,
   buildTree,
   buildWell,
+  drawBonfire,
   drawBot,
   drawCart,
   drawChestGlint,
@@ -84,6 +88,7 @@ import {
   mulberry32,
   poly,
   rect,
+  roofPeak,
   shade,
   type BotAction,
   type Ctx,
@@ -95,11 +100,15 @@ import {
   PLAIN_DAY,
   auroraAt,
   eclipseAt,
+  festivalFire,
+  marketSite,
+  marketStalls,
   mistAt,
   stormAt,
   workPace,
   type DayInfo,
   type Season,
+  type StallSpec,
 } from './daytype.ts';
 import {
   TH,
@@ -426,6 +435,13 @@ export interface VegLayer {
   props: Int32Array;
   /** `snap.props.size` at the last reconcile; -1 = never. */
   propSize: number;
+  /* MARKET — item slots for the stalls, empty except on a market day. They are
+   * allocated with everything else at bake time (item index has to stay
+   * synonymous with depth order for the life of the layer) and left unpainted
+   * until nine in the morning. */
+  stalls: number[];
+  /** Are the stalls currently painted into the layer? */
+  stallOn: boolean;
 }
 
 /**
@@ -508,6 +524,23 @@ export interface GenesisScene {
   day: DayInfo;
   /** Flat colour under the woodland pattern, seasoned to match it. */
   beyond: string;
+  /* MARKET+FESTIVAL ---------------------------------------------------- */
+  /** Market pitches, on a market day. Empty on every other kind of day. */
+  stalls: StallSpec[];
+  /** The town the market came to. Null unless this is a market day. */
+  market: SiteSpec | null;
+  /** Where the festival fire would be built, if the valley earns one. */
+  fire: Vec2 | null;
+  /**
+   * The hour the festival starts, or 0 on a day that did not earn one.
+   *
+   * The bake cannot answer this — it is a fact about the *timeline*, and the
+   * scene has never seen one — so the caller that built both sets it from
+   * `festivalAt(map, timeline)`. Left at 0, every festival path below is one
+   * comparison that fails, which is what a headless harness with no timeline
+   * should see.
+   */
+  fest: number;
 }
 
 export interface GView {
@@ -1079,6 +1112,13 @@ export function* buildGenesisSceneSteps(
     relight: 0,
     day,
     beyond: seasonGround('#3f7f66', day.season),
+    // MARKET+FESTIVAL — both are pure functions of the map. The stalls are only
+    // ever asked for on the day that has them; the fire is cheap and the scene
+    // does not yet know whether the valley is going to earn it.
+    stalls: day.type === 'market' ? marketStalls(map) : [],
+    market: day.type === 'market' ? marketSite(map) : null,
+    fire: festivalFire(map),
+    fest: 0,
   };
   scene.veg = yield* buildVeg(scene, W, H);
   yield;
@@ -1188,6 +1228,15 @@ function* buildVeg(
     }
   }
 
+  // MARKET — the pitches, after the dressing and on the same rank, so a stall
+  // in front of a well is in front of it. Slots only; nothing is painted until
+  // `syncVeg` sees nine in the morning.
+  const stalls: number[] = [];
+  for (const st of scene.stalls) {
+    stalls.push(add(buildMarketStall(st.seed, st.accent), st.gx, st.gy, R_PROP, pi++));
+    on.push(false);
+  }
+
   yield;
   // Sorted by depth, then by the rank the old per-frame pass implied, then by
   // build order — for the wood, whose ordering predates all this, by `bx`.
@@ -1208,6 +1257,7 @@ function* buildVeg(
   const sortedOn = order.map((i) => on[i]);
   for (let i = 0; i < slots.length; i++) slots[i] = pos[slots[i]];
   for (let i = 0; i < props.length; i++) if (props[i] >= 0) props[i] = pos[props[i]];
+  for (let i = 0; i < stalls.length; i++) stalls[i] = pos[stalls[i]];
 
   yield;
   const grid = new Map<number, number[]>();
@@ -1237,6 +1287,8 @@ function* buildVeg(
     felling: [],
     props,
     propSize: -1,
+    stalls,
+    stallOn: false,
   };
   yield;
   bakeVeg(scene, veg);
@@ -1348,6 +1400,17 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
     let pi = 0;
     for (const site of scene.map.sites) {
       for (const p of site.props) want(veg.props[pi++], snap.props.has(p.id));
+    }
+  }
+
+  // MARKET — two transitions in a whole day, each of them two to four patches:
+  // the trestles go up at nine and the awnings come down at dusk. Same
+  // mechanism as a prop appearing, driven by the clock instead of by an event.
+  if (veg.stalls.length) {
+    const open = marketOpen(scene, snap);
+    if (open !== veg.stallOn) {
+      veg.stallOn = open;
+      for (const i of veg.stalls) want(i, open);
     }
   }
 
@@ -1634,7 +1697,10 @@ function wanderPoint(site: SiteSpec, snap: WorldSnapshot, rng: () => number): Ve
 
 /** Re-derive bot counts, smoke anchors and mill wheels from the snapshot. */
 export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
-  const sig = snapSig(snap);
+  // MARKET — the crowd on the roads is the one thing here that changes on the
+  // clock rather than on an event, so the market's two transitions have to be
+  // part of the fingerprint or the sync would sleep straight through them.
+  const sig = snapSig(snap) + (marketOpen(scene, snap) ? '|mk' : '');
   if (sig === amb.sig) return;
   amb.sig = sig;
   const rng = amb.rng;
@@ -1720,28 +1786,48 @@ export function syncAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapsh
   amb.walkers = amb.walkers.filter((w) => (snap.roads.get(w.roadId) ?? 0) > 0.5);
   const onRoad = new Map<string, number>();
   for (const w of amb.walkers) onRoad.set(w.roadId, (onRoad.get(w.roadId) ?? 0) + 1);
+  // MARKET — while the stalls are up, the roads that lead to them carry the
+  // people going. Empty on every other day, and empty again once they come down.
+  const extraTraffic = marketOpen(scene, snap) ? marketTraffic(scene) : null;
   for (const road of scene.map.roads) {
     const frac = snap.roads.get(road.id) ?? 0;
     if (frac <= 0.5) continue;
     const highway = road.kind === 'highway';
-    const want = highway ? 2 : 1;
+    const base = highway ? 2 : 1;
+    const boost = extraTraffic?.get(road.id) ?? 0;
+    const want = base + boost;
     const have = onRoad.get(road.id) ?? 0;
     const geo = scene.roadGeo.get(road.id)!;
     for (let i = have; i < want; i++) {
       const s = geo.len * frac * rng();
       const at = alongPolyline(road.pts, geo, s);
+      // The coin is always tossed, so that a market day cannot shift the colour
+      // and gait of the ordinary walkers that share the road with the crowd.
+      const coin: 1 | -1 = rng() < 0.5 ? 1 : -1;
+      const going = boost > 0 && i >= base ? marketward(scene, road) : 0;
       amb.walkers.push({
         roadId: road.id,
         s,
-        dir: rng() < 0.5 ? 1 : -1,
+        dir: going || coin,
         phase: rng() * 8,
         color: BOT_COLORS[Math.floor(rng() * BOT_COLORS.length)],
         gx: at[0],
         gy: at[1],
         faceRight: true,
-        cart: highway && i === 0,
+        // Freight goes to market too: one more loaded cart on a market highway.
+        cart: highway && (i === 0 || (going !== 0 && i === base)),
         cargo: CARGO_COLORS[Math.floor(rng() * CARGO_COLORS.length)],
       });
+    }
+    // …and once the awnings come down, the road empties again.
+    if (have > want) {
+      let drop = have - want;
+      for (let i = amb.walkers.length - 1; i >= 0 && drop > 0; i--) {
+        if (amb.walkers[i].roadId === road.id) {
+          amb.walkers.splice(i, 1);
+          drop--;
+        }
+      }
     }
   }
 
@@ -1922,17 +2008,26 @@ export function stepAmbient(
   const dt = dtIn * workPace(scene.day, snap.t);
   const rng = amb.rng;
   const rate = paceRate(amb);
+  // FESTIVAL — on an evening the valley earned, the founding town's crew stops
+  // being a crew. Resolved once per tick rather than per bot.
+  const party = festivalOn(scene, snap) ? scene.fire : null;
+  const partySite = party ? scene.map.sites[0].id : '';
 
   for (const site of scene.map.sites) {
     if (!snap.founded.has(site.id)) continue;
     const crew = amb.crews.get(site.id);
     if (!crew || !crew.length) continue;
     const tasks = siteTasks(scene, site, snap);
+    const circle = party && site.id === partySite ? party : null;
 
     crew.forEach((bot, i) => {
       bot.phase += dt * rate;
       if (bot.arrive) {
         stepArrival(scene, bot, site, dt, rate);
+        return;
+      }
+      if (circle) {
+        gatherRound(bot, i, crew.length, circle, dt, rate, rng);
         return;
       }
       const task = tasks.length ? tasks[i % tasks.length] : null;
@@ -1999,6 +2094,43 @@ export function stepAmbient(
 
   stepDiggers(amb, dt, rate);
   stepSmoke(amb, dt);
+}
+
+/**
+ * FESTIVAL — one settler standing at a fire.
+ *
+ * A loose ring rather than a tidy one: the slot is `i`'s share of the circle,
+ * nudged by the jitter the bot has carried since it was made, so the same
+ * settler always stands in the same place and the circle is never a clock face.
+ * They face inwards, and they shuffle every few seconds, because the whole
+ * point of the shot is that the valley is *standing about*.
+ */
+function gatherRound(
+  bot: Bot,
+  i: number,
+  n: number,
+  fire: Vec2,
+  dt: number,
+  rate: number,
+  rng: () => number
+): void {
+  const a = (i / Math.max(1, n)) * Math.PI * 2 + bot.jx * 0.5;
+  const r = 1.9 + (i % 3) * 0.4 + bot.jy * 0.16;
+  bot.tx = fire[0] + Math.cos(a) * r;
+  bot.ty = fire[1] + Math.sin(a) * r;
+  if (moveTo(bot, dt, 'walk', rate)) return;
+  bot.action = 'idle';
+  // Face the fire: in screen space, that is whichever side of it they are on.
+  bot.faceRight = bot.gx - bot.gy < fire[0] - fire[1];
+  bot.timer -= dt;
+  if (bot.timer <= 0) {
+    bot.timer = 2.5 + rng() * 4;
+    // Clamped, because this is a random walk and an hour of it would otherwise
+    // put somebody in the river.
+    const pen = (v: number) => (v < -2 ? -2 : v > 2 ? 2 : v);
+    bot.jx = pen(bot.jx + (rng() - 0.5) * 0.5);
+    bot.jy = pen(bot.jy + (rng() - 0.5) * 0.5);
+  }
 }
 
 /**
@@ -2101,6 +2233,122 @@ export function settleAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   // into the middle of a storm still has to finish walking to where it lives.
   const k = 1 / Math.max(0.05, workPace(scene.day, snap.t));
   for (let i = 0; i < 120; i++) stepAmbient(scene, amb, snap, k / 12);
+}
+
+/* ==================== MARKET DAY, and the FESTIVAL ======================== *
+ * Two evenings' worth of presentation, both derived and neither stored: the
+ * market from `scene.day`, the festival from `scene.fest` plus the clock. No
+ * timeline event carries either one, so a scrub to 09:00 and back is exactly a
+ * scrub, and a paused world at 20:30 is the same world it was a frame ago.
+ * -------------------------------------------------------------------------- */
+
+/** Are the stalls up? Not before the town they came to exists. */
+function marketOpen(scene: GenesisScene, snap: WorldSnapshot): boolean {
+  const m = scene.market;
+  if (!m || !scene.stalls.length) return false;
+  return snap.t >= scene.day.from && snap.t < scene.day.to && snap.founded.has(m.id);
+}
+
+/**
+ * Extra walkers per road on a market day, keyed by road id.
+ *
+ * Everybody is going the same way, so the traffic thins with distance from the
+ * market: a road that ends in the market town carries three more than usual, a
+ * road into one of *its* neighbours carries one, and the far side of the valley
+ * has an ordinary Tuesday. Capped, because the road network at pace 4 is
+ * seventeen roads and the crowd is the frame's most expensive thing.
+ */
+function marketTraffic(scene: GenesisScene): Map<string, number> {
+  const out = new Map<string, number>();
+  const m = scene.market;
+  if (!m) return out;
+  const near = new Set<string>([m.id]);
+  for (const r of scene.map.roads) {
+    if (r.from === m.id) near.add(r.to);
+    else if (r.to === m.id) near.add(r.from);
+  }
+  let budget = 14;
+  for (const r of scene.map.roads) {
+    const hub = r.from === m.id || r.to === m.id;
+    const spoke = near.has(r.from) || near.has(r.to);
+    const n = Math.min(budget, hub ? 3 : spoke ? 1 : 0);
+    if (n > 0) {
+      out.set(r.id, n);
+      budget -= n;
+    }
+  }
+  return out;
+}
+
+/** Which way along `road` the market lies: +1 towards its tail, -1 to its head. */
+function marketward(scene: GenesisScene, road: RoadSpec): 1 | -1 | 0 {
+  const m = scene.market;
+  if (!m) return 0;
+  const head = road.pts[0];
+  const tail = road.pts[road.pts.length - 1];
+  return Math.hypot(tail[0] - m.gx, tail[1] - m.gy) <= Math.hypot(head[0] - m.gx, head[1] - m.gy)
+    ? 1
+    : -1;
+}
+
+/** Is the fire lit? Only on a day the valley earned, and only after dark. */
+function festivalOn(scene: GenesisScene, snap: WorldSnapshot): boolean {
+  return scene.fest > 0 && snap.t >= scene.fest && !!scene.fire;
+}
+
+/** One string of pennants, and where it hangs. */
+interface Bunting {
+  sprite: Sprite;
+  /** World pixel of the near anchor, and the depth the string draws at. */
+  x: number;
+  y: number;
+  depth: number;
+}
+
+const BUNTING = new WeakMap<GenesisScene, Bunting[]>();
+
+/**
+ * Strings between the roofs of the founding town, left to right.
+ *
+ * Baked once per scene and then only drawn: the anchors come off `roofPeak`,
+ * which is the same arithmetic `buildStructure` uses for the ridge, so the
+ * string is tied to the roof rather than to a guess about where the roof is.
+ * Consecutive-in-x pairs only — that is how a village hangs bunting, and it
+ * also guarantees the strings never cross.
+ */
+function buntingFor(scene: GenesisScene): Bunting[] {
+  const hit = BUNTING.get(scene);
+  if (hit) return hit;
+  const out: Bunting[] = [];
+  const site = scene.map.sites[0];
+  if (site) {
+    const tops = site.buildings
+      .map((b) => ({
+        x: isoX(b.gx, b.gy),
+        y: isoY(b.gx, b.gy),
+        top: isoY(b.gx, b.gy) - roofPeak(b.w, b.floors, b.roof) + 2,
+        seed: b.seed,
+      }))
+      .sort((a, b) => a.x - b.x || a.y - b.y);
+    for (let i = 0; i + 1 < tops.length && out.length < 4; i++) {
+      const a = tops[i];
+      const b = tops[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.top - a.top;
+      // Too far apart and it is a rope, not bunting; too close and the two
+      // roofs are the same silhouette and the string disappears into them.
+      const span = Math.hypot(dx, dy);
+      if (span < 22 || span > 130) continue;
+      out.push({
+        sprite: buildBunting(dx, dy, a.seed ^ b.seed),
+        x: a.x,
+        y: a.top,
+        depth: Math.max(a.y, b.y) + 3,
+      });
+    }
+  }
+  BUNTING.set(scene, out);
+  return out;
 }
 
 /* ====================== rare days, and the turning year ==================== *
@@ -2819,10 +3067,59 @@ export function renderGenesis(
     }
   }
 
+  /* ---- FESTIVAL: bunting between the roofs ----------------------------- */
+  // Deliberately *not* on the baked layer. A string is tied to two roofs and
+  // has to hang in front of both of them; the roofs are per-frame items, so the
+  // string has to be one too, at a depth just past the nearer of its anchors.
+  const feast = festivalOn(scene, snap);
+  if (feast) {
+    for (const bt of buntingFor(scene)) {
+      if (!inView(bt.x, bt.y)) continue;
+      const bx = Math.round(bt.x - bt.sprite.ox);
+      const by = Math.round(bt.y - bt.sprite.oy);
+      items.push({
+        depth: bt.depth,
+        bx,
+        by,
+        bw: bt.sprite.c.width,
+        bh: bt.sprite.c.height,
+        draw: (c) => c.drawImage(bt.sprite.c, bx, by),
+      });
+    }
+  }
+
   // Everything from here on moves every frame. The occlusion repair below runs
   // over these first, so that if it ever hits its budget it is the scenery that
   // goes unrepaired, never the crowd.
   const moversFrom = items.length;
+
+  /* ---- FESTIVAL: the fire ----------------------------------------------- */
+  // A mover, because it is the one thing in the valley that is never the same
+  // shape twice, and the biggest light source the day ever has.
+  if (feast && scene.fire) {
+    const fx = isoX(scene.fire[0], scene.fire[1]);
+    const fy = isoY(scene.fire[0], scene.fire[1]);
+    if (inView(fx, fy)) {
+      const sp = cached(scene, 'bonfire', () => buildBonfire(scene.map.seed));
+      const bx = Math.round(fx - sp.ox);
+      const by = Math.round(fy - sp.oy);
+      items.push({
+        depth: fy,
+        bx,
+        by,
+        bw: sp.c.width,
+        bh: sp.c.height,
+        draw: (c) => {
+          c.drawImage(sp.c, bx, by);
+          drawBonfire(c, fx, fy, clock);
+        },
+      });
+      // Bright enough to be the thing you look at, dim enough that the people
+      // standing in it are still people.
+      const flick = 0.86 + Math.sin(clock * 5.3) * 0.06 + Math.sin(clock * 2.1) * 0.05;
+      halos.push({ x: fx, y: fy - 6, r: 38, a: Math.max(0.3, sky.lamps) * 0.55 * flick });
+    }
+  }
 
   for (const w of amb.wheels) {
     if (!inView(w.x, w.y)) continue;
