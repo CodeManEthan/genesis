@@ -1034,6 +1034,11 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
         t = run.foundT + range(0.2, 0.9); // a well before anything else
       } else if (kind === 'nameboard' || kind === 'signpost') {
         t = second + range(0.05, 0.35); // once there are two roofs to name
+      } else if (kind === 'jetty' || kind === 'rowboat') {
+        // A town takes to the water once it has somewhere to sleep. Early
+        // enough that somebody gets a day's fishing out of it. (One draw, like
+        // every other branch here, so the stream shape does not move.)
+        t = second + range(0.3, 1.5);
       } else if (kind === 'lamp') {
         t = range(17.9, 19.2); // lit at dusk
       } else {

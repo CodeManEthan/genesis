@@ -92,7 +92,8 @@ export interface TreeSpec {
 /** Non-tree scenery. Kinds must be ones the vale's art.ts can draw:
  * bush | rock | flowers | reeds | stump | crop | haystack | fenceL | fenceR |
  * shed | cart | crates | lumber | barrels | well | lamp | signpost |
- * nameboard | stake | campfire | sheep | crane | quarry-blocks
+ * nameboard | stake | campfire | sheep | crane | quarry-blocks | jetty |
+ * rowboat
  */
 export interface PropSpec {
   id: string; // "pr88" (site dressing gets site prefix, e.g. "s2-well")
@@ -100,6 +101,23 @@ export interface PropSpec {
   gx: number;
   gy: number;
   seed: number;
+  /* -- boats and jetties (additive; absent for every other kind) ---------- */
+  /**
+   * Heading in SCREEN-ALIGNED u/v radians, for the handful of kinds that have
+   * to face something rather than stand square: a `jetty` points out over the
+   * water from its landward root, and the `rowboat` moored at its head lies on
+   * the same bearing. Absent means "no bearing", which is every other kind.
+   *
+   * u/v is the renderer's own space (screen x = u * TW/2, screen y = v * TH/2),
+   * so the art can use the angle directly without another projection.
+   */
+  dir?: number;
+  /**
+   * Deck length in u/v units, root to head — `jetty` only. A pier is as long as
+   * its water allows: out over a lake it runs the full JETTY_LEN, across a
+   * narrow river it stops well short of the far bank. Absent means JETTY_LEN.
+   */
+  len?: number;
 }
 
 export type StructureRole =

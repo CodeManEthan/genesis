@@ -19,7 +19,9 @@ import {
   buildDeer,
   buildDog,
   buildGrazingSheep,
+  buildJetty,
   buildNameBoard,
+  buildRowboat,
   buildSignpost,
   buildStake,
   buildStructure,
@@ -116,7 +118,7 @@ const PROP_POOLS = [
 const TREASURE_POOLS = ['chest-buried', 'chest-closed', 'chest-open'];
 
 /** Kinds not in the pools — built on demand by `propSprite()` in scene.ts. */
-const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane'];
+const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane', 'jetty', 'rowboat'];
 
 /**
  * What gen.ts actually emits, so the catalog can flag the rest:
@@ -133,6 +135,9 @@ const GENERATED = new Set<string>([
   'well', 'nameboard', 'lamp', 'signpost', 'campfire', 'lumber',
   // The stone yard, emitted with the essentials so it survives every pace.
   'quarry-blocks', 'crane',
+  // The water. A town whose rim reaches a bank gets a pier and a boat with the
+  // essentials; big lakes carry a free boat or two as wild scatter.
+  'jetty', 'rowboat',
   // The three states of a buried chest. gen.ts emits 0..2 ChestSpecs a day and
   // the timeline moves them between these sprites.
   ...TREASURE_POOLS,
@@ -877,6 +882,30 @@ export default function Catalog() {
         tagKind: 'info',
       })
     );
+    // ADDITIVE — boats and jetties. Both are baked per BEARING rather than
+    // pooled, so the shelf shows the same pier and the same boat pointing four
+    // different ways: that is the whole of the variation gen.ts asks for.
+    for (let q = 0; q < 4; q++) {
+      const dir = (q * Math.PI) / 2 + Math.PI / 4;
+      out.push(
+        item(`ex-jetty-${q}`, 'jetty', spriteCanvas(buildJetty(dir, 2.2, 131)), {
+          sub: `bearing ${q * 90 + 45}\u00b0`,
+          tag: 'generated',
+          tagKind: 'info',
+        })
+      );
+    }
+    // The two hulls in the bag, picked out by seed: seed 0 tars its boat, seed
+    // 3 washes it. gen.ts hands the boat whatever seed the day gives it.
+    for (const [sd, name] of [[0, 'tarred hull'], [3, 'washed hull']] as const) {
+      out.push(
+        item(`ex-boat-${sd}`, 'rowboat', spriteCanvas(buildRowboat(Math.PI / 4, sd)), {
+          sub: name,
+          tag: 'generated',
+          tagKind: 'info',
+        })
+      );
+    }
     return out;
   }, []);
 

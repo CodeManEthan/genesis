@@ -77,6 +77,16 @@ function segDist(p: Pt, a: Pt, b: Pt): number {
   return Math.hypot(p[0] - (a[0] + vx * t), p[1] - (a[1] + vy * t));
 }
 
+/** The point on segment a-b nearest `p`. `segDist` without the final hypot. */
+function segClosest(p: Pt, a: Pt, b: Pt): Pt {
+  const vx = b[0] - a[0];
+  const vy = b[1] - a[1];
+  const len2 = vx * vx + vy * vy || 1;
+  let t = ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / len2;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return [a[0] + vx * t, a[1] + vy * t];
+}
+
 function polyDist(p: Pt, line: Pt[]): number {
   let best = Infinity;
   for (let i = 0; i + 1 < line.length; i++) {
@@ -712,6 +722,36 @@ export const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', '
 
 /** Flavour dressing that shows up as a town matures. */
 export const FLAVOUR_PROPS = ['crop', 'haystack', 'crates', 'barrels', 'cart', 'shed'];
+
+/* --------------------------- boats and jetties --------------------------- *
+ * ADDITIVE BLOCK. A town builds a jetty when it has water to build one on and
+ * not otherwise, which is the whole point: it has to be earned by geography.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * How far a town's RIM may be from the RIVER bank and still get a jetty, in
+ * u/v. Measured rim-to-bank, so it means the same thing for a big town and a
+ * small one — the same convention as QUARRY_REACH.
+ *
+ * Tight, because the river is everywhere: half the valley's towns are within a
+ * few units of it, and at any generous figure a jetty stops being a feature of
+ * the map and becomes standard town furniture.
+ */
+export const JETTY_REACH = 1.2;
+
+/**
+ * The same, for a LAKE. Much longer, and deliberately so: towns are pushed well
+ * back off standing water when they are surveyed (nothing is ever built on a
+ * shore), so at the river's figure no lake in the valley would ever get a pier.
+ * A town will walk a little way for water it can actually moor a boat on.
+ */
+export const JETTY_LAKE_REACH = 5;
+
+/** Deck length out over the water, u/v. The art draws exactly this. */
+export const JETTY_LEN = 2.2;
+
+/** How far up the bank the landward end of the deck sits, u/v. */
+const JETTY_ROOT = 0.62;
 
 /** Base woodland mix per biome, before the day's forest character is applied. */
 const BASE_TREE_KINDS: Record<Biome, [TreeKind, number][]> = {
@@ -2676,6 +2716,71 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
+  /* ---- boats out on the open water -------------------------------------- *
+   * ADDITIVE BLOCK — boats and jetties.
+   *
+   * A lake with any size to it usually has a boat adrift on it that belongs to
+   * nobody in particular. These are TERRAIN, not dressing: they come out of a
+   * substream of the seed and the lake shapes alone, never out of the roster or
+   * the pace, so `scatter` stays byte-identical at every scale — which is what
+   * the harness's terrain check demands of it.
+   *
+   * They are appended after every other scatter pass, so no earlier rejection
+   * sampler can see them and no existing prop moves because of them.
+   * ------------------------------------------------------------------------ */
+  {
+    const brng = mulberry32((seed ^ 0x5eab1703) >>> 0);
+    /** Water this far inside the shore is open water, not the margin. */
+    const OPEN = 1.5;
+    /** Keep well clear of the bank any town would put its own jetty on. This is
+     * lake water, so it is the LAKE reach that decides how far that is. */
+    const OFF_TOWN = JETTY_LAKE_REACH + 1.5;
+    let afloat = 0;
+    /** Two boats adrift in the same square yard read as one accident. */
+    const moored: Pt[] = [];
+    for (const l of lakes) {
+      if (afloat >= 2) break;
+      // Only a lake with room to row on. The roll happens for every big lake
+      // whether or not the boat lands, so the stream does not depend on luck.
+      const roll = brng();
+      const dirRoll = brng();
+      const seedRoll = brng();
+      if (l.mean < 3.2 || roll > 0.72) continue;
+      for (let t = 0; t < 40; t++) {
+        const a = brng() * Math.PI * 2;
+        const rad = Math.sqrt(brng());
+        const p: Pt = [l.u + Math.cos(a) * l.rx * rad, l.v + Math.sin(a) * l.ry * rad];
+        if (lakeDist(p, l) > -OPEN) continue;
+        if (polyDist(p, river) < 1.2) continue;
+        let crowded = false;
+        for (const s of sites) {
+          if (dist(p, [s.u, s.v]) < s.r + OFF_TOWN) {
+            crowded = true;
+            break;
+          }
+        }
+        if (crowded) continue;
+        if (moored.some((q) => dist(p, q) < 3)) continue;
+        moored.push(p);
+        const [gx, gy] = uv(p[0], p[1]);
+        scatter.push({
+          id: `pr${scatter.length}`,
+          kind: 'rowboat',
+          gx,
+          gy,
+          seed: (l.seed + 9173 + afloat * 811) >>> 0,
+          dir: dirRoll * Math.PI * 2,
+        });
+        // Deliberately NOT pushed to `scatterUV`: that index is a land-spacing
+        // structure and a boat is not on the land.
+        afloat++;
+        // A second boat on the same water, now and then.
+        if (afloat < 2 && seedRoll < 0.34) continue;
+        break;
+      }
+    }
+  }
+
   /* ---- site dressing ---------------------------------------------------- */
   // Dressing is the one place the pace control is allowed to change what a
   // town CONTAINS rather than only how many plots it reaches — a town that
@@ -2700,6 +2805,177 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const siteTimber = siteBuildings.map((list) => list.reduce((n, b) => n + b.clears.length, 0));
   /** How much of each site's dressing today's pace actually reaches. */
   const sitePropCount: number[] = [];
+
+  /* ---- where a town would put a jetty ----------------------------------- *
+   * ADDITIVE BLOCK — boats and jetties.
+   *
+   * Every other piece of dressing is placed by `ok()`, which REJECTS water. A
+   * jetty is the one thing that wants to straddle the line: rooted on the bank,
+   * decked out over the water. So it does not go through `ok()` at all. It
+   * finds the bank explicitly instead:
+   *
+   *   1. aim at the nearest water — the river's centreline or a lake's middle;
+   *   2. march out along that bearing until the signed distance to open water
+   *      changes sign, then bisect for the crossing: that is the bank point;
+   *   3. take the bank's own normal there, from the numeric gradient of the
+   *      same signed distance, so the deck is square to the shore rather than
+   *      square to whatever direction the town happened to be lying in;
+   *   4. root the deck JETTY_ROOT up the bank and run it JETTY_LEN out, and
+   *      insist the head of it is genuinely wet.
+   *
+   * If any of that fails — no water in reach, a roof in the way, a shore too
+   * shallow to reach past — the town simply has no jetty, which is most of the
+   * point. Swinging the aim a few times either way slides the bank point along
+   * the shore, which is how a jetty gets out from under a building.
+   * ------------------------------------------------------------------------ */
+  const riverHalf = riverWidth * Math.SQRT2;
+
+  const jettyFor = (
+    site: (typeof sites)[number],
+    si: number
+  ): { root: Pt; dir: number; len: number } | null => {
+    const S: Pt = [site.u, site.v];
+    const span = site.r + JETTY_LAKE_REACH + JETTY_LEN + 2;
+    const segs = segsNearBox(river, S[0] - span, S[1] - span, S[0] + span, S[1] + span, 0.5);
+    const near = lakes.filter((l) => dist(S, [l.u, l.v]) < span + l.maxR);
+    if (!segs.length && !near.length) return null;
+
+    /** Signed distance to open water, u/v: negative in it, positive on land. */
+    const sd = (p: Pt): number => {
+      let best = Infinity;
+      for (const s of segs) {
+        const d = segDist(p, s[0], s[1]) - riverHalf;
+        if (d < best) best = d;
+      }
+      for (const l of near) {
+        const d = lakeDist(p, l);
+        if (d < best) best = d;
+      }
+      return best;
+    };
+    if (sd(S) <= 0) return null; // the green itself is under water: give up
+
+    // The nearest water of each sort, each judged against its own reach: the
+    // river is everywhere and has to be close, a lake is rare and worth a walk.
+    // Whichever has more slack is tried first; if nothing can be rooted on that
+    // shore, the other one still gets its turn.
+    const aims: { at: Pt; max: number; slack: number }[] = [];
+    let rd = Infinity;
+    let rq: Pt | null = null;
+    for (const s of segs) {
+      const q = segClosest(S, s[0], s[1]);
+      const d = dist(S, q) - riverHalf;
+      if (d < rd) {
+        rd = d;
+        rq = q;
+      }
+    }
+    if (rq && rd <= site.r + JETTY_REACH) {
+      aims.push({ at: rq, max: site.r + JETTY_REACH, slack: rd - site.r - JETTY_REACH });
+    }
+    let ld = Infinity;
+    let lq: Pt | null = null;
+    for (const l of near) {
+      const d = lakeDist(S, l);
+      if (d < ld) {
+        ld = d;
+        lq = [l.u, l.v];
+      }
+    }
+    if (lq && ld <= site.r + JETTY_LAKE_REACH) {
+      aims.push({ at: lq, max: site.r + JETTY_LAKE_REACH, slack: ld - site.r - JETTY_LAKE_REACH });
+    }
+    if (!aims.length) return null;
+    aims.sort((a, b) => a.slack - b.slack);
+
+    for (const pick of aims) {
+      const found = tryShore(pick.at, pick.max);
+      if (found) return found;
+    }
+    return null;
+
+    /** Walk the shore around `target` looking for somewhere to root a deck. */
+    function tryShore(target: Pt, MAXD: number): { root: Pt; dir: number; len: number } | null {
+      const aim = Math.atan2(target[1] - S[1], target[0] - S[0]);
+      // Straight at the water first, then along the shore either way.
+      for (let k = 0; k < 13; k++) {
+        const a = aim + Math.ceil(k / 2) * (k % 2 ? 1 : -1) * 0.17;
+        const cu = Math.cos(a);
+        const cv = Math.sin(a);
+        let lo = 0;
+        let hi = -1;
+        for (let d = 0.2; d <= MAXD + 0.4; d += 0.16) {
+          if (sd([S[0] + cu * d, S[1] + cv * d]) < 0) {
+            hi = d;
+            break;
+          }
+          lo = d;
+        }
+        if (hi < 0) continue;
+        for (let it = 0; it < 18; it++) {
+          const m = (lo + hi) / 2;
+          if (sd([S[0] + cu * m, S[1] + cv * m]) > 0) lo = m;
+          else hi = m;
+        }
+        const at = (lo + hi) / 2;
+        if (at > MAXD) continue;
+        const B: Pt = [S[0] + cu * at, S[1] + cv * at];
+  
+        // The bank's own normal, pointing inland: the gradient of `sd` at B.
+        const e = 0.09;
+        let nu = sd([B[0] + e, B[1]]) - sd([B[0] - e, B[1]]);
+        let nv = sd([B[0], B[1] + e]) - sd([B[0], B[1] - e]);
+        const nl = Math.hypot(nu, nv);
+        if (nl < 1e-6) {
+          nu = -cu;
+          nv = -cv;
+        } else {
+          nu /= nl;
+          nv /= nl;
+        }
+        const root: Pt = [B[0] + nu * JETTY_ROOT, B[1] + nv * JETTY_ROOT];
+  
+        // How much water there is to build over: walk on across it until the far
+        // side comes up. A lake runs out of patience before it runs out of water;
+        // the river gives back its own narrow width, and the deck stops at a
+        // fraction of it rather than half-bridging the stream.
+        let across = JETTY_LEN * 3;
+        for (let d = 0.2; d <= JETTY_LEN * 3; d += 0.14) {
+          if (sd([B[0] - nu * d, B[1] - nv * d]) > 0) {
+            across = d;
+            break;
+          }
+        }
+        const reach = Math.min(JETTY_LEN - JETTY_ROOT, across * 0.44);
+        if (reach < 0.7) continue; // shore too shallow to reach past
+        const head: Pt = [B[0] - nu * reach, B[1] - nv * reach];
+        if (sd(head) > -0.12) continue;
+        // Which water did the deck actually reach? `sd` takes the nearest bank
+        // of either sort, and a ray aimed at a lake can cross the river on the
+        // way there — so the reach is judged against the water the deck ends up
+        // over, never against the water it set out for.
+        let onLake = false;
+        for (const l of near) {
+          if (lakeDist(head, l) < 0) {
+            onLake = true;
+            break;
+          }
+        }
+        if (dist(S, root) > site.r + (onLake ? JETTY_LAKE_REACH : JETTY_REACH)) continue;
+        if (offRock(root, PROP_ROCK_CLEAR)) continue;
+        let clash = false;
+        for (const b of siteBuildings[si]) {
+          if (dist(root, [b.gx - b.gy, b.gx + b.gy]) < fpR(b.w) + 0.9) {
+            clash = true;
+            break;
+          }
+        }
+        if (clash) continue;
+        return { root, dir: Math.atan2(-nv, -nu), len: JETTY_ROOT + reach };
+      }
+      return null;
+    }
+  };
 
   const siteProps: PropSpec[][] = sites.map((site, si) => {
     const prng = mulberry32((seed + si * 60013 + 7) >>> 0);
@@ -2829,6 +3105,49 @@ function buildMap(seed: number, scale: number): GenesisMap {
       add(`${site.id}-crane`, 'crane', spot(0.6, yardA + 0.5), 81 + si * 7);
       add(`${site.id}-quarry1`, 'quarry-blocks', spot(0.66, yardA - 0.62), 91 + si * 7);
       add(`${site.id}-rubble`, 'rock', spot(0.82, yardA + 1.1), 101 + si * 7);
+    }
+
+    /* ---- the water, if this town has any ------------------------------- *
+     * ADDITIVE BLOCK — boats and jetties. Essentials tier, so it is there at
+     * every pace or at none, and the flavour tail below is still the only
+     * scale-dependent slice. Its own substream: the dressing stream above is
+     * what every existing prop's position comes out of, and a town with a
+     * jetty must not shuffle its own well because of it.
+     * -------------------------------------------------------------------- */
+    const jetty = jettyFor(site, si);
+    if (jetty) {
+      const jrng = mulberry32((seed + si * 74519 + 1301) >>> 0);
+      const side = jrng() < 0.5 ? 1 : -1;
+      const hull = (seed + si * 9403 + 17) >>> 0;
+      const [jgx, jgy] = uv(jetty.root[0], jetty.root[1]);
+      props.push({
+        id: `${site.id}-jetty`,
+        kind: 'jetty',
+        gx: jgx,
+        gy: jgy,
+        seed: (131 + si * 7) >>> 0,
+        dir: jetty.dir,
+        len: jetty.len,
+      });
+      placedUV.push(jetty.root);
+      // The boat lies alongside the head of the deck, on the same bearing.
+      const cd = Math.cos(jetty.dir);
+      const sv = Math.sin(jetty.dir);
+      const along = Math.max(0.55, jetty.len - 0.45);
+      const moor: Pt = [
+        jetty.root[0] + cd * along - sv * 0.72 * side,
+        jetty.root[1] + sv * along + cd * 0.72 * side,
+      ];
+      const [bgx, bgy] = uv(moor[0], moor[1]);
+      props.push({
+        id: `${site.id}-boat`,
+        kind: 'rowboat',
+        gx: bgx,
+        gy: bgy,
+        seed: hull,
+        dir: jetty.dir,
+      });
+      placedUV.push(moor);
     }
 
     /* ---- flavour tail: the only part the day's pace can shorten -------- */

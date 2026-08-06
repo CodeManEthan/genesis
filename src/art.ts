@@ -1608,9 +1608,190 @@ export function drawChestGlint(ctx: Ctx, x: number, y: number, t: number): void 
   }
 }
 
+/* --------------------------- boats and jetties --------------------------- *
+ * ADDITIVE BLOCK. Nothing in the Vale asks for either of these; Genesis draws
+ * them where a town meets the water.
+ *
+ * Both are authored in the renderer's screen-aligned u/v space rather than in
+ * tiles, because that is the space the pier's bearing is computed in: one u/v
+ * unit along u is TW/2 screen px across, one along v is TH/2 screen px down.
+ * `dir` is that bearing in radians — for a jetty, pointing out over the water
+ * from its landward root.
+ * ------------------------------------------------------------------------- */
+
+/** Screen pixels per u/v unit, along u and along v. */
+const UX = TW / 2;
+const VY = TH / 2;
+
+/** Project an (along, across) offset in u/v units to screen pixels. */
+function bearing(dir: number): (a: number, b: number) => Pt {
+  const cd = Math.cos(dir);
+  const sd = Math.sin(dir);
+  return (a, b) => [(a * cd - b * sd) * UX, (a * sd + b * cd) * VY];
+}
+
+/** Bounding box of a set of local points, with the anchor always inside it. */
+function spriteBox(pts: Pt[], pad: number, up: number, down: number) {
+  let x0 = 0;
+  let x1 = 0;
+  let y0 = 0;
+  let y1 = 0;
+  for (const p of pts) {
+    if (p[0] < x0) x0 = p[0];
+    if (p[0] > x1) x1 = p[0];
+    if (p[1] < y0) y0 = p[1];
+    if (p[1] > y1) y1 = p[1];
+  }
+  const ox = Math.ceil(-x0) + pad;
+  const oy = Math.ceil(-y0) + up;
+  return { w: ox + Math.ceil(x1) + pad, h: oy + Math.ceil(y1) + down, ox, oy };
+}
+
+/**
+ * A plank pier: posts driven into the bed, a deck of boards over them.
+ *
+ * The palette is the bridge deck's, deliberately — a jetty is the same crew
+ * with the same timber, and the two should read as one trade. The anchor is the
+ * LANDWARD root, on dry ground, so the sprite depth-sorts as a thing standing
+ * on the bank; the deck runs out from there along `dir`, over the water.
+ */
+export function buildJetty(dir: number, len = 2.2, seed = 0): Sprite {
+  const at = bearing(dir);
+  const HW = 0.25; // half deck width, u/v — a footway, not a wharf
+  const LIFT = 4; // deck stands this far above the water line
+  const a0 = -0.14;
+  const a1 = len;
+  const box = spriteBox(
+    [at(a0, -HW), at(a0, HW), at(a1, -HW), at(a1, HW)],
+    7,
+    LIFT + 8,
+    14
+  );
+  const rng = mulberry32((seed ^ 0x4a17b3) >>> 0);
+  return makeSprite(box.w, box.h, box.ox, box.oy, (ctx) => {
+    const P = (a: number, b: number, dy = 0): Pt => {
+      const p = at(a, b);
+      return [p[0], p[1] + dy];
+    };
+    // Wet shadow under the deck, on the water itself.
+    poly(ctx, [P(a0, -HW), P(a1, -HW), P(a1, HW), P(a0, HW)], PAL.shadow);
+    // Posts, in pairs, from the bed up to the boards.
+    for (let k = 0.06; k <= len + 0.001; k += 0.62) {
+      for (const side of [-1, 1]) {
+        const p = P(Math.min(k, len - 0.06), side * (HW - 0.04));
+        rect(ctx, p[0] - 1, p[1] - LIFT - 1, 2, LIFT + 9, PAL.woodDark);
+        rect(ctx, p[0] - 1, p[1] - LIFT - 1, 2, 1, PAL.wood);
+      }
+    }
+    // Deck: dark carcass, lighter boards, one bright plank edge along the head.
+    poly(
+      ctx,
+      [P(a0, -HW, -LIFT + 2), P(a1, -HW, -LIFT + 2), P(a1, HW, -LIFT + 2), P(a0, HW, -LIFT + 2)],
+      PAL.woodDark
+    );
+    poly(
+      ctx,
+      [P(a0, -HW, -LIFT), P(a1, -HW, -LIFT), P(a1, HW, -LIFT), P(a0, HW, -LIFT)],
+      PAL.wood
+    );
+    for (let k = a0; k < a1 - 0.02; k += 0.19) {
+      const w = k + 0.13 > a1 ? a1 - k : 0.13;
+      poly(
+        ctx,
+        [
+          P(k, -HW + 0.05, -LIFT),
+          P(k + w, -HW + 0.05, -LIFT),
+          P(k + w, HW - 0.05, -LIFT),
+          P(k, HW - 0.05, -LIFT),
+        ],
+        rng() < 0.5 ? PAL.woodLight : shade(PAL.woodLight, -0.08)
+      );
+    }
+    // A mooring bollard at the head, with its rope end.
+    const head = P(a1 - 0.16, -HW + 0.12, -LIFT);
+    rect(ctx, head[0] - 1, head[1] - 5, 2, 5, PAL.woodDark);
+    rect(ctx, head[0] - 1, head[1] - 6, 2, 1, PAL.woodLight);
+  });
+}
+
+/**
+ * A clinker rowboat, oars shipped. Two hulls in the bag — a tarred red and a
+ * washed blue — chosen off the seed, so a jetty and the boats out on the water
+ * are not all the same craft.
+ *
+ * The anchor is the waterline amidships. Genesis draws these per frame with a
+ * one-pixel bob, so nothing here may depend on the clock.
+ */
+export function buildRowboat(dir: number, seed = 0): Sprite {
+  const at = bearing(dir);
+  const rng = mulberry32((seed ^ 0x71c40d) >>> 0);
+  // Both hulls are chosen to sit OFF the water's own blues: a boat painted the
+  // colour of a lake is a boat nobody can see from the fitted overview.
+  const hull = rng() < 0.5 ? '#bd5a44' : '#d9a24e';
+  const HULL_L = 0.92;
+  const HW = 0.23;
+  const LIFT = 3;
+  // Bow, quarters, blunt transom — in (along, across) u/v.
+  const shape: Pt[] = [
+    [HULL_L, 0],
+    [HULL_L * 0.62, HW],
+    [-HULL_L * 0.6, HW * 0.86],
+    [-HULL_L * 0.8, HW * 0.44],
+    [-HULL_L * 0.8, -HW * 0.44],
+    [-HULL_L * 0.6, -HW * 0.86],
+    [HULL_L * 0.62, -HW],
+  ];
+  const box = spriteBox(shape.map(([a, b]) => at(a, b)), 6, LIFT + 6, 8);
+  return makeSprite(box.w, box.h, box.ox, box.oy, (ctx) => {
+    const P = (a: number, b: number, dy = 0): Pt => {
+      const p = at(a, b);
+      return [p[0], p[1] + dy];
+    };
+    const ring = (dy: number, k = 1) => shape.map(([a, b]) => P(a * k, b * k, dy));
+    // The boat's own shadow in the water, then the wetted hull, then the
+    // topsides. The bilge is kept small and dark: what should read from across
+    // the valley is the painted hull, not the inside of somebody's boat.
+    poly(ctx, ring(1), PAL.shadow);
+    poly(ctx, ring(0), shade(hull, -0.34));
+    poly(ctx, ring(-LIFT), hull);
+    poly(ctx, ring(-LIFT - 1, 0.88), shade(hull, 0.22)); // gunwale, catching light
+    poly(ctx, ring(-LIFT - 1, 0.58), shade(PAL.woodDark, -0.08)); // the bilge
+    // Two thwarts and the oars laid fore and aft along them.
+    for (const a of [0.2, -0.34]) {
+      poly(
+        ctx,
+        [
+          P(a, -HW * 0.7, -LIFT - 1),
+          P(a + 0.12, -HW * 0.7, -LIFT - 1),
+          P(a + 0.12, HW * 0.7, -LIFT - 1),
+          P(a, HW * 0.7, -LIFT - 1),
+        ],
+        PAL.wood
+      );
+    }
+    for (const side of [-1, 1]) {
+      const a = P(HULL_L * 0.52, side * HW * 0.42, -LIFT - 2);
+      const b = P(-HULL_L * 0.68, side * HW * 0.18, -LIFT - 2);
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const n = Math.max(2, Math.ceil(Math.hypot(dx, dy)));
+      for (let i = 0; i <= n; i++) {
+        rect(ctx, a[0] + (dx * i) / n, a[1] + (dy * i) / n, 1, 1, PAL.woodLight);
+      }
+      // The blade, flat on the gunwale.
+      rect(ctx, b[0] - 1, b[1] - 1, 2, 2, shade(PAL.woodLight, -0.16));
+    }
+  });
+}
+
 /* ------------------------------- dynamics ------------------------------- */
 
-export type BotAction = 'walk' | 'idle' | 'work' | 'carry';
+/**
+ * `fish` is additive and Genesis-only: the Vale never asks for it, and every
+ * pose branch below falls through to the plain standing arms when it does not
+ * recognise an action, so an older caller is unaffected.
+ */
+export type BotAction = 'walk' | 'idle' | 'work' | 'carry' | 'fish';
 
 /** A villager, ~14px tall, drawn straight into the frame buffer. */
 export function drawBot(
@@ -1661,6 +1842,11 @@ export function drawBot(
     ctx.fillRect(px - 5, top - 13, 10, 3);
     ctx.fillStyle = PAL.wood;
     ctx.fillRect(px - 5, top - 11, 10, 1);
+  } else if (action === 'fish') {
+    // Both hands out in front on the butt of the rod; the rod is drawn after
+    // the head so the line crosses the body rather than disappearing behind it.
+    ctx.fillRect(px + s * 3 - (faceRight ? 0 : 1), top - 9, 1, 3);
+    ctx.fillRect(px + s * 2 - (faceRight ? 0 : 1), top - 8, 1, 3);
   } else {
     ctx.fillRect(px - 4, top - 8 + (step > 0 ? 1 : 0), 1, 3);
     ctx.fillRect(px + 3, top - 8 + (step < 0 ? 1 : 0), 1, 3);
@@ -1677,6 +1863,30 @@ export function drawBot(
   if (action !== 'work') {
     ctx.fillRect(px + (faceRight ? 1 : -2), top - 12, 1, 1);
     ctx.fillRect(px + (faceRight ? -1 : 0), top - 12, 1, 1);
+  }
+
+  if (action === 'fish') {
+    // A rod is a two-pixel line and a slack line off its tip. Most of the day
+    // it rests low over the water; every few seconds it whips up for a cast and
+    // settles again, which is the whole of the animation.
+    const cast = Math.max(0, Math.sin(phase * 1.9) - 0.86) / 0.14;
+    const bx = px + s * 4;
+    const by = top - 8;
+    const tipX = bx + s * (13 - cast * 5);
+    const tipY = by - 6 - cast * 11;
+    const n = 14;
+    ctx.fillStyle = PAL.woodLight;
+    for (let i = 0; i <= n; i++) {
+      const x = Math.round(bx + ((tipX - bx) * i) / n);
+      const y = Math.round(by + ((tipY - by) * i) / n);
+      ctx.fillRect(x, y, 1, 2);
+    }
+    // The line, dropping from the tip to the water a few pixels ahead.
+    ctx.fillStyle = 'rgba(65, 58, 85, 0.55)';
+    const drop = py - 1 - tipY;
+    for (let y = 0; y < drop; y += 2) {
+      ctx.fillRect(Math.round(tipX + s * (y / drop) * 2), tipY + y, 1, 1);
+    }
   }
 }
 

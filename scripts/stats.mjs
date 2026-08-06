@@ -19,9 +19,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const { generateMap, generateMapUncached, woodCharacter, QUARRY_REACH } = await import(
-  join(root, 'src/components/designs/genesis/gen.ts')
-);
+const {
+  generateMap,
+  generateMapUncached,
+  woodCharacter,
+  QUARRY_REACH,
+  JETTY_LEN,
+  JETTY_REACH,
+  JETTY_LAKE_REACH,
+} = await import(join(root, 'src/components/designs/genesis/gen.ts'));
 const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
 
 /* ---------------------------- renderer coverage --------------------------- */
@@ -39,7 +45,25 @@ const PROP_SPRITES = new Set([
   'sheep', 'campfire', 'quarry-blocks',
   // resolved by name in propSprite() rather than from a pool
   'nameboard', 'signpost', 'stake', 'crane',
+  // boats and jetties: oriented, so they are baked per bearing rather than
+  // pooled. `rowboat` is the one kind the scenery layer does NOT bake at all —
+  // scene.ts draws it per frame so it can bob.
+  'jetty', 'rowboat',
 ]);
+
+/**
+ * The kinds that are ALLOWED to stand in the water, and the only exemption in
+ * check (v).
+ *
+ * A jetty is a pier: it is rooted on the bank and its deck is deliberately out
+ * over the water, so the prop's own anchor sits inside the shore margin every
+ * other prop is held out of. A rowboat is afloat — moored at a jetty head, or
+ * adrift on a big lake as wild scatter. Both are placed by their own
+ * bank-crossing solver in gen.ts (see JETTY_REACH), never by the dressing
+ * sampler that rejects water, so exempting them here removes no cover from
+ * anything else: every other kind is still tested exactly as before.
+ */
+const AFLOAT = new Set(['jetty', 'rowboat']);
 
 /* ------------------------------ uv geometry ------------------------------ */
 
@@ -725,16 +749,26 @@ function checks(seed, map, scale = 1) {
     // generator measures against its analytic shape and this measures against
     // the resolved polygon — a chord always sits marginally inside the curve.
     for (const t of map.trees) test(uvOf(t), 0.6, `tree ${t.id}`);
-    for (const p of map.scatter) test(uvOf(p), 0.25, `scatter ${p.id}`);
+    for (const p of map.scatter) {
+      if (AFLOAT.has(p.kind)) continue; // a boat adrift on the lake — see AFLOAT
+      test(uvOf(p), 0.25, `scatter ${p.id}`);
+    }
     for (const s of map.sites) {
       test(uvOf(s), s.radius + 1.9, `site ${s.id}`);
       for (const b of s.buildings) test(uvOf(b), fpR(b.w) + 0.9, `bldg ${b.id}`);
-      for (const p of s.props) test(uvOf(p), 0.8, `prop ${p.id}`);
+      for (const p of s.props) {
+        if (AFLOAT.has(p.kind)) continue; // the pier and its boat — see AFLOAT
+        test(uvOf(p), 0.8, `prop ${p.id}`);
+      }
     }
+    const afloat =
+      map.scatter.filter((p) => AFLOAT.has(p.kind)).length +
+      map.sites.reduce((n, s) => n + s.props.filter((p) => AFLOAT.has(p.kind)).length, 0);
     check(
       'v  nothing stands in a lake',
       bad === 0,
-      `${bad} in the water, least slack ${f1(worst)} at ${who}`
+      `${bad} in the water, least slack ${f1(worst)} at ${who}` +
+        (afloat ? `, ${afloat} afloat by design` : '')
     );
   } else {
     check('v  nothing stands in a lake', true, 'no lakes');
@@ -835,6 +869,51 @@ function checks(seed, map, scale = 1) {
       'y  outcrops clear of towns and water',
       bad === 0,
       `${map.outcrops?.length ?? 0} outcrops, tightest town gap ${worst === Infinity ? '-' : f1(worst)}`
+    );
+  }
+
+  /* (z) boats and jetties: a pier is rooted on dry bank, decks out over live
+     water, is within reach of the rim that earned it, and never comes without
+     the boat moored at its head. Free boats are afloat or they are nothing. */
+  {
+    const bad = [];
+    let piers = 0;
+    const riverHalf = map.riverWidth * Math.SQRT2;
+    /** Signed distance to open water: negative in it, positive on the land. */
+    const wet = (p) => Math.min(polyDist(p, river) - riverHalf, lakesShoreDist(p, rings));
+    for (const s of map.sites) {
+      const js = s.props.filter((p) => p.kind === 'jetty');
+      const bs = s.props.filter((p) => p.kind === 'rowboat');
+      if (js.length > 1) bad.push(`${s.id} has ${js.length} jetties`);
+      if (bs.length !== js.length) bad.push(`${s.id}: ${js.length} piers, ${bs.length} boats`);
+      for (const j of js) {
+        piers++;
+        if (typeof j.dir !== 'number') {
+          bad.push(`${j.id} has no bearing`);
+          continue;
+        }
+        const root = uvOf(j);
+        if (wet(root) < 0) bad.push(`${j.id} rooted in the water`);
+        const len = j.len ?? JETTY_LEN;
+        if (!(len > 1.2 && len <= JETTY_LEN + 1e-9)) bad.push(`${j.id} deck ${f1(len)}`);
+        const head = [root[0] + Math.cos(j.dir) * len, root[1] + Math.sin(j.dir) * len];
+        if (wet(head) > 0) bad.push(`${j.id} decks out over dry land`);
+        // River piers are held to the tight reach, lake piers to the long one.
+        // Which it is, is decided by where the deck ends up: a pier whose head
+        // is inside a lake outline is a lake pier however the river runs.
+        const off = d2(root, uvOf(s)) - s.radius;
+        const max = lakesShoreDist(head, rings) < 0 ? JETTY_LAKE_REACH : JETTY_REACH;
+        if (off > max + 0.5) bad.push(`${j.id} ${f1(off)} off the rim`);
+      }
+      for (const b of bs) if (wet(uvOf(b)) > 0.2) bad.push(`${b.id} moored on the beach`);
+    }
+    for (const p of map.scatter) {
+      if (p.kind === 'rowboat' && wet(uvOf(p)) > 0) bad.push(`${p.id} aground`);
+    }
+    check(
+      'z  jetties straddle the bank',
+      bad.length === 0,
+      bad.length ? bad.join(', ') : `${piers} pier(s) over ${map.sites.length} towns`
     );
   }
 
