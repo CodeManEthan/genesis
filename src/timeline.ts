@@ -44,6 +44,9 @@ import {
   /* ---- the prospector (additive) ---- */
   goldStrike,
   /* ---- end the prospector (additive) ---- */
+  /* ---- town rivalries (additive) ---- */
+  rivalryOf,
+  /* ---- end town rivalries (additive) ---- */
   type DayType,
 } from './daytype.ts';
 
@@ -1390,6 +1393,408 @@ function gold(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
 /* end the prospector (additive)                                              */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* town rivalries (additive) — the ledger keeps score                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * About one multi-town day in four, two neighbouring towns make a wager of it.
+ *
+ * ── WHAT THIS CHANGES IN THE WORLD ───────────────────────────────────────
+ * Nothing. Not one plot, not one crew, not one minute. `rivalryOf` runs on its
+ * own derived stream in `daytype.ts` and this pass runs on another, and between
+ * them they do exactly one thing: push `log` events onto a finished timeline.
+ * Delete both and every roof in every valley still goes on at the same second.
+ *
+ * ── IT IS A TIME TRIAL, NOT A HEAD-TO-HEAD, AND THAT IS NOT A FUDGE ──────
+ * The valley builds ONE TOWN AT A TIME. Measured across the rivalry days, the
+ * two towns' building sessions overlap by a median of zero hours: the older
+ * town is roofed and quiet hours before the younger one breaks ground. So
+ * "first to finish" is not a race at all — it is the founding order read back,
+ * and the earlier town would win one hundred times in a hundred.
+ *
+ * What IS contested is the clock. The older town sets a mark — so many roofs in
+ * so long, from its own first frame to its own last — and the younger one goes
+ * at it. Over a 250-seed sweep that splits about 2:1 with a lot of very near
+ * misses, which is a real result and reads like one. So the ledger runs the day
+ * as a time trial:
+ *
+ *   the wager    laid when the challenger breaks ground with the mark already
+ *                on the board.
+ *   the score    at the three-roof mark (and again three roofs later on a big
+ *                enough pair): both towns' splits, side by side.
+ *   the result   when the challenger tops out. Minutes per roof, both towns,
+ *                and one of them owes the other a barrel.
+ *
+ * ── WHY IT IS A SIBLING OF `weather` AND NOT A `narrate` PASS ─────────────
+ * Two reasons, and the first is the important one:
+ *
+ *   - `narrate` draws from one shared stream, and its FLAVOUR FILLER sizes
+ *     itself off `lines.length` (`need = clamp(want - lines.length, …)`).
+ *     Folding lines in there — as the chests, ruins, folk and stones all do —
+ *     shortens the filler, which moves that stream, which moves the SITE
+ *     DRESSING TIMES drawn after it. Props are world, not narration. Appending
+ *     out here instead leaves every existing valley byte-identical: same
+ *     buildings, same roads, same props, same hours, same existing lines. That
+ *     was verified by diff over 45 seeds x 2 scales x 3 paces before this
+ *     landed, and it is the invariant to re-check if anybody moves this call.
+ *   - The splits have to be read AFTER the storm warp and AFTER the pace
+ *     division, or a rained-off afternoon would be timed as if it had not
+ *     happened.
+ *
+ * The cost is that the ledger is up to `RIVAL_LINES_MAX` lines longer on a
+ * rivalry day, which the harness's readability window knows about.
+ *
+ * ── ON THE TEMPO ─────────────────────────────────────────────────────────
+ * `plan()` is bisected about forty-one times solving for `p`; this is not
+ * inside any of them. It runs once per `buildTimeline`, on the finished list.
+ */
+
+/** Ceiling on how much of a day's ledger a wager may take up: the challenge,
+ * two score lines, the result, and somebody paying. Exported because the
+ * harness's ledger-length window has to widen by exactly this much on a day
+ * `rivalryOf` says yes to, and the two must not drift apart. */
+export const RIVAL_LINES_MAX = 5;
+
+/** The second score line waits this many roofs past the first. In a small
+ * valley nobody ever gets there, which is the intent. */
+const RIVAL_SCORE_STEP = 3;
+
+/**
+ * Buildings a valley could plausibly stand a round in — the brewhouse and its
+ * oast/malting labels, the moot hall, and the charter house a treasure chest
+ * occasionally pays for. Deliberately SHORT: the loser's-alehouse line may only
+ * be written when the losing town genuinely raises one of these, and a bakery
+ * is not one. Where there is none the bet gets settled some other way. The
+ * valley never grows a building to suit a joke.
+ *
+ * ── ON "THE LOSER'S PUB GETS BUILT IN THE NEXT HOUR" ─────────────────────
+ * That was the shape of the original idea, and this world mostly cannot do it:
+ * gen.ts raises a town's LANDMARK FIRST (`landmark = si === 0 ? i === 1 : i === 0`),
+ * so an alehouse is standing hours before anybody loses a bet in it. Rather
+ * than move a building to fit the joke, there are two lines: one for a drinking
+ * house that is already open, and one — `RIVAL_PUB_NEW_LOG` — for the one case
+ * where the timing really does land, a CHARTER GILDHALL, which is appended to
+ * the roster by a treasure chest and so is genuinely the last thing the town
+ * finishes. Rare on purpose. If anybody ever reorders the plot loop so
+ * landmarks go up last, the fresh line starts firing on its own and needs no
+ * change here.
+ */
+const RIVAL_PUB_ROLES = new Set<string>(['brewhouse', 'hall', 'gildhall']);
+
+/** How long after the result a roof still counts as "and here it is". */
+const RIVAL_PUB_WINDOW = 2.0;
+
+const NUM = [
+  'no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine',
+  'ten', 'eleven', 'twelve',
+];
+
+/** Small counts read better as words in a ledger than as digits. */
+function count(n: number): string {
+  return n >= 0 && n < NUM.length ? NUM[n] : String(n);
+}
+
+const MINS: Record<number, string> = {
+  5: 'five', 10: 'ten', 15: 'fifteen', 20: 'twenty', 25: 'twenty-five',
+  30: 'thirty', 35: 'thirty-five', 40: 'forty', 45: 'forty-five', 50: 'fifty',
+  55: 'fifty-five',
+};
+
+/** A span of hours, as somebody standing in a field would say it. Rounded to
+ * five minutes, because nobody in this valley owns a watch. */
+function spell(h: number): string {
+  const mins = Math.max(5, Math.round((h * 60) / 5) * 5);
+  const hh = Math.floor(mins / 60);
+  const mm = mins % 60;
+  const hw = hh === 1 ? 'an hour' : `${count(hh)} hours`;
+  if (!hh) return `${MINS[mm] ?? mm} minutes`;
+  if (!mm) return hw;
+  return `${hw} and ${MINS[mm] ?? mm} minutes`;
+}
+
+const RIVAL_CHALLENGE_LOG = [
+  '{a} put up {an} roofs in {atime} and has not stopped saying so. {bf} breaks ground at {b} and bets a barrel on beating it.',
+  '{a}’s mark is on the board: {an} roofs, {atime}. First frame up at {b}, and {bf} says that is not much of a mark.',
+  '{af} sends the {a} figures over to {b} — {an} roofs in {atime} — which {bf} takes as an invitation. There is a barrel on it now.',
+  'A wager between {a} and {b}: {a} did {an} roofs in {atime}, and {b} has just started. Nobody writes the terms down, which will be a problem this evening.',
+  '{b} breaks ground with {a}’s time to beat — {an} roofs, {atime}. {bf} shakes on it and tells the crew nothing until noon.',
+  'Word goes down the road that {b} is going at {a}’s mark of {atime}. Both crews deny there is a race. Both crews get quicker.',
+];
+
+/** `{n}` is spelled out, so no template may open with it — a ledger line
+ * starting "three roofs up at…" reads as a dropped capital. */
+const RIVAL_SCORE_LOG = [
+  'That is {n} roofs up at {b} in {btime}. {a} took {atime} for the same {n}. {lead} is ahead.',
+  'Split at {n} roofs: {b} {btime}, {a} {atime}. {leadf} has become very hard to be around.',
+  'The ledger is asked for the score and gives it: {n} roofs, {b} in {btime}, {a} in {atime}.',
+  '{b} reaches {n} roofs at {btime} against {a}’s {atime}. {trail} is told this by a man on a cart.',
+  'That is {n} up at {b} — {btime}. {a} wanted {atime} for that. A cart goes between them with nothing on it but news.',
+];
+
+/** …and when the two splits round to the same words, which happens more often
+ * than you would think. Saying one town "is ahead" on identical figures reads
+ * as a bug in the ledger, so it does not get said. */
+const RIVAL_SCORE_LEVEL_LOG = [
+  'Level at {n} roofs: {b} and {a} both on {btime}. Nobody is enjoying this.',
+  'Split at {n} roofs and nothing in it — {btime} apiece. The cart between {a} and {b} goes back empty.',
+  '{a} and {b} are dead level at {n} roofs, {btime} each, and both crews have stopped talking.',
+];
+
+/**
+ * The result. Note that every one of these leads with the RATE — minutes to the
+ * roof — and only then gives the totals, because the two towns are rarely the
+ * same size and a bare "{wtime} against {ltime}" reads as a mistake the moment
+ * the winner is the bigger town that took longer. The rate is the wager; the
+ * totals are the evidence.
+ */
+const RIVAL_SETTLE_LOG = [
+  '{win} takes the wager at {wrate} to the roof against {lrate}. {winf} says very little about it, which is worse.',
+  'That is the race: {win} {wn} roofs in {wtime}, {lose} {ln} in {ltime}. {wrate} the roof against {lrate}, and {losef} asks to see the figures twice.',
+  '{win} wins it on the clock — {wrate} a roof against {lrate} — and somebody at {win} rings something that is not a bell, at length.',
+  'Last rafter at {b}, and the wager goes to {win}: {wrate} the roof against {lrate}. {winf} is already asking after the terms of the next one.',
+  '{lose} loses it by the clock, {lrate} a roof against {win}’s {wrate}. Nobody at {lose} wants to hear about the weather.',
+];
+
+/** …and for the ones where the rounding cannot separate them. */
+const RIVAL_SETTLE_CLOSE_LOG = [
+  '{win} takes it by a margin nobody can name: {wrate} to the roof, and so did {lose}. The difference is in seconds, and {losef} wants them counted again.',
+  'Too close to call, and called anyway. {win} and {lose} both come out at {wrate} a roof; the ledger gives it to {win} and stands well back.',
+  '{win} and {lose} finish within a breath of each other — {wrate} the roof apiece over {wn} and {ln} — so the wager goes to {win} on the ledger’s word alone.',
+];
+
+/** Drawn only when the losing town's alehouse tops out around the result —
+ * the coincidence the whole joke rests on, and never invented. */
+const RIVAL_PUB_NEW_LOG = [
+  '{win} takes the wager; {losef} stands the first round at {label}, {lose}, which is barely dry.',
+  '{label} at {lose} gets its roof within the hour of the bet being lost. {losef} pays up in it that night, standing on planks.',
+  'They settle it at {label} in {lose} with the shavings still on the floor. {losef} pays.',
+  'The last thing {lose} finishes is {label}, which is convenient, because {losef} owes {win} a barrel.',
+];
+
+/** Drawn when the loser already had somewhere to drink. */
+const RIVAL_PUB_STANDING_LOG = [
+  '{win} takes the wager; {losef} stands the first round at {label} in {lose}.',
+  'The bet is settled at {label}, {lose}. {losef} pays, and {win} drinks it slowly to make a point.',
+  'Half of {win} walks over to {label} at {lose} to watch {losef} pay for something.',
+];
+
+/** …and when there is nowhere in the losing town to settle anything. */
+const RIVAL_NOPUB_LOG = [
+  'No alehouse in {lose} yet, so the wager is settled on the green at {win}, out of a jug.',
+  '{losef} sends the barrel over to {win} on the last cart of the day, and walks behind it.',
+  '{losef} concedes to {winf} on the road between them and asks for terms on the next one.',
+  'The bet is paid out at the {win} well, there being nowhere better in {lose} to do it.',
+];
+
+/**
+ * Every wager template, grouped by the moment it belongs to, exported FOR THE
+ * HARNESS ONLY.
+ *
+ * A test has to be able to tell a wager line from a flavour line, and the
+ * alternative was to hang a marker field off the `log` event — which would then
+ * have to be carried through `applyEvent` (twice), the snapshot, and
+ * `serialize()`, for a fact that is purely about words. Matching the finished
+ * text back to its template costs the runtime nothing and keeps the event
+ * shape exactly as it was. Add a pool below and add it here too, or the
+ * harness will quietly stop seeing that line.
+ */
+export const RIVAL_POOLS = {
+  challenge: RIVAL_CHALLENGE_LOG,
+  score: RIVAL_SCORE_LOG,
+  level: RIVAL_SCORE_LEVEL_LOG,
+  settle: RIVAL_SETTLE_LOG,
+  close: RIVAL_SETTLE_CLOSE_LOG,
+  pubNew: RIVAL_PUB_NEW_LOG,
+  pubStanding: RIVAL_PUB_STANDING_LOG,
+  nopub: RIVAL_NOPUB_LOG,
+} as const;
+
+/** One town's day at the trade, as the ledger times it. */
+interface RivalRun {
+  site: SiteSpec;
+  /** first frame up */
+  from: number;
+  /** roof times, in order */
+  roofs: number[];
+  /** roofs this town was always going to raise today */
+  want: number;
+  /** the last of them, or null if the sun went down first */
+  end: number | null;
+  /** the town's alehouse, if it raises one */
+  pub: { t: number; label: string } | null;
+}
+
+function rivalry(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
+  const riv = rivalryOf(map);
+  if (!riv) return events;
+
+  /* --- time the two sessions off the finished schedule -------------------- */
+  const runs = new Map<string, RivalRun>();
+  for (const site of [riv.a, riv.b]) {
+    runs.set(site.id, {
+      site,
+      from: Infinity,
+      roofs: [],
+      // the founding homestead's first house is standing at midnight and is
+      // nobody's achievement, so it is not part of anybody's time
+      want: site.buildings.length - (map.sites.length && map.sites[0].id === site.id ? 1 : 0),
+      end: null,
+      pub: null,
+    });
+  }
+  const siteOfBuilding = new Map<string, string>();
+  const specOf = new Map<string, BuildingSpec>();
+  for (const s of map.sites) {
+    for (const b of s.buildings) {
+      siteOfBuilding.set(b.id, s.id);
+      specOf.set(b.id, b);
+    }
+  }
+  for (const e of events) {
+    if (e.type !== 'build') continue;
+    const r = runs.get(siteOfBuilding.get(e.buildingId) ?? '');
+    if (!r) continue;
+    if (e.t < r.from) r.from = e.t;
+    if (e.progress < 1) continue;
+    r.roofs.push(e.t);
+    const spec = specOf.get(e.buildingId);
+    // The LAST one, not the first: `events` is time-ordered, and a town that
+    // raises both a moot hall in the morning and a charter house at dusk should
+    // settle its debts in whichever was finished nearest the wager falling due.
+    if (spec && RIVAL_PUB_ROLES.has(spec.role)) r.pub = { t: e.t, label: spec.label };
+  }
+  for (const r of runs.values()) {
+    if (r.want > 0 && r.roofs.length >= r.want) r.end = r.roofs[r.want - 1];
+  }
+
+  // Who set the mark and who is going at it: whoever broke ground first, with
+  // the roster order as a tie-break so the answer never rides on event order.
+  const ra = runs.get(riv.a.id)!;
+  const rb = runs.get(riv.b.id)!;
+  const [held, going] = ra.from <= rb.from ? [ra, rb] : [rb, ra];
+
+  // No mark, no wager: if the day ran out before the older town finished, or
+  // before the younger one broke ground, there was never anything to bet on.
+  if (held.end === null || !Number.isFinite(going.from)) return events;
+  if (going.roofs.length < riv.mark || held.roofs.length < riv.mark) return events;
+
+  const heldSpan = held.end - held.from;
+
+  /* --- and say so -------------------------------------------------------- */
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x77616765) >>> 0); // 'wage'
+  const draw = makeDrawer(rng);
+  const who = (r: RivalRun) => r.site.founder ?? `somebody at ${r.site.name}`;
+
+  const out = events.slice();
+  const say = (t: number, text: string, siteId: string) =>
+    out.push({ t: clamp(t, 0.01, 23.97), type: 'log', text, siteId });
+
+  const base = {
+    valley: map.valleyName,
+    a: held.site.name,
+    b: going.site.name,
+    af: who(held),
+    bf: who(going),
+    an: count(held.want),
+    atime: spell(heldSpan),
+  };
+
+  // The wager needs both facts on the table: the mark set, and the challenger
+  // out of the ground. On the rare seed where the two sessions overlap that is
+  // the later of the two, not the challenger's first frame.
+  const challengeT = Math.max(going.from, held.end) + 0.03 + rng() * 0.12;
+  say(challengeT, fill(draw(RIVAL_CHALLENGE_LOG), base), going.site.id);
+
+  /* --- the splits, at one or two marks ------------------------------------ */
+  for (let k = 0; k < 2; k++) {
+    const n = riv.mark + k * RIVAL_SCORE_STEP;
+    if (going.roofs.length < n || held.roofs.length < n) continue;
+    const at = going.roofs[n - 1];
+    if (at <= challengeT) continue;
+    // The challenger's last roof is the RESULT, not a split — a race does not
+    // get a running score for the finish line.
+    if (going.end !== null && at >= going.end - 0.01) continue;
+    const goingSplit = at - going.from;
+    const heldSplit = held.roofs[n - 1] - held.from;
+    const ahead = goingSplit < heldSplit ? going : held;
+    const behind = ahead === going ? held : going;
+    const atime = spell(heldSplit);
+    const btime = spell(goingSplit);
+    // One draw either way — the level pool is a different bag, not an extra
+    // roll, exactly as the close-result pool is below.
+    say(
+      at + 0.04,
+      fill(draw(atime === btime ? RIVAL_SCORE_LEVEL_LOG : RIVAL_SCORE_LOG), {
+        ...base,
+        n: count(n),
+        atime,
+        btime,
+        lead: ahead.site.name,
+        leadf: who(ahead),
+        trail: behind.site.name,
+      }),
+      going.site.id,
+    );
+  }
+
+  /* --- the result, and who bought the drinks ------------------------------ */
+  // A day the sun goes down on has no result: the challenger is still building
+  // at midnight and the wager stands over to a valley that will not exist.
+  if (going.end !== null) {
+    const goingSpan = going.end - going.from;
+    const spanOf = (r: RivalRun) => (r === going ? goingSpan : heldSpan);
+    // Minutes per roof, because the two towns are rarely the same size. A dead
+    // heat goes to the mark that was already standing.
+    const rateOf = (r: RivalRun) => spanOf(r) / Math.max(1, r.want);
+    const goingWins = rateOf(going) < rateOf(held);
+    const win = goingWins ? going : held;
+    const lose = goingWins ? held : going;
+    const v = {
+      ...base,
+      win: win.site.name,
+      lose: lose.site.name,
+      winf: who(win),
+      losef: who(lose),
+      wn: count(win.want),
+      ln: count(lose.want),
+      wtime: spell(spanOf(win)),
+      ltime: spell(spanOf(lose)),
+      wrate: spell(rateOf(win)),
+      lrate: spell(rateOf(lose)),
+    };
+    // One draw either way, so the stream shape does not depend on how close it
+    // was: the near-dead-heat pool is a different bag, not an extra roll.
+    const close = v.wrate === v.lrate;
+    const result = fill(draw(close ? RIVAL_SETTLE_CLOSE_LOG : RIVAL_SETTLE_LOG), v);
+    say(going.end + 0.04, result, win.site.id);
+
+    // The losing town's alehouse — if the losing town actually has one, and if
+    // it is standing anywhere near the hour the bet falls due. Otherwise the
+    // bet gets settled some other way. No building is ever invented for this.
+    const pub = lose.pub;
+    if (pub && pub.t <= going.end + RIVAL_PUB_WINDOW) {
+      // Freshly roofed, or up since the morning — two different jokes, and the
+      // ledger is not allowed to tell the first one about the second building.
+      const fresh = pub.t > going.end - 0.75;
+      say(
+        Math.max(going.end + 0.2, pub.t + 0.05),
+        fill(draw(fresh ? RIVAL_PUB_NEW_LOG : RIVAL_PUB_STANDING_LOG), { ...v, label: pub.label }),
+        lose.site.id,
+      );
+    } else {
+      say(going.end + 0.3 + rng() * 0.3, fill(draw(RIVAL_NOPUB_LOG), v), lose.site.id);
+    }
+  }
+
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* end town rivalries (additive)                                              */
+/* -------------------------------------------------------------------------- */
+
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
   const range = (a: number, b: number) => a + rng() * (b - a);
@@ -1862,8 +2267,15 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
   /** The rare-day passes, in the order they are allowed to see each other.
    * The prospector (additive) goes outermost: his three lines are wall-clock
    * facts, so they must land after the storm warp and after the pace division
-   * rather than be carried through either of them. */
-  const rare = (evs: GenesisEvent[]) => gold(map, festival(map, marketDay(map, weather(map, evs))));
+   * rather than be carried through either of them.
+   *
+   * Town rivalries (additive) sit directly outside `weather` because that is
+   * the innermost point at which the build times are FINAL: the storm warp has
+   * been applied and the pace division has already happened, so the score the
+   * ledger reports is the score the rooftops show. Everything outside it only
+   * appends log lines, which the rivalry neither reads nor minds. */
+  const rare = (evs: GenesisEvent[]) =>
+    gold(map, festival(map, marketDay(map, rivalry(map, weather(map, evs)))));
 
   const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
   if (k === 1) return { events: rare(events) };
