@@ -154,6 +154,7 @@ import {
   FLOOD_DRIFT,
   riverMood,
   starsAt,
+  type RiverMood,
   /* ---- end more day types (additive) ---- */
   type DayInfo,
   type Season,
@@ -1112,6 +1113,88 @@ export function bakeLake(ctx: Ctx, lk: LakeSpec): void {
 }
 
 /**
+ * The river, laid into the ground bake: banks, water, foam, and whatever the
+ * day's mood does to all three.
+ *
+ * Lifted OUT of `buildGenesisSceneSteps` unchanged — same lines, same order,
+ * same two rng streams (`mulberry32(808)` for the foam and `0xd2007` for the
+ * drought's stones, the second one still appended strictly after the first) —
+ * so that the catalog page can show the three moods of the water without
+ * keeping its own copy of them. A second copy is the one way a workbench
+ * quietly stops describing the world it is supposed to be the inventory of.
+ *
+ * `river` arrives already run past the map edge, and `mood` is `CALM_RIVER` on
+ * every day but two: on an ordinary day every half-width below is multiplied by
+ * one and the draw counts are the counts they always were, which is what keeps
+ * the archive's rivers identical to the byte.
+ */
+export function bakeRiver(ctx: Ctx, river: Vec2[], rw: number, mood: RiverMood): void {
+  /** Half-width of the water itself, and of the banks it is held between. */
+  const ww = rw * mood.water;
+  const bw = rw * mood.bank;
+  if (mood.kind === 'flood') {
+    // Silt: the meadow the water was on this morning, well outside the banks.
+    strip(ctx, river, bw + 1.8, mix(PAL.dirtEdge, PAL.sand, 0.45));
+  }
+  strip(ctx, river, bw + 0.75, PAL.sand);
+  strip(ctx, river, bw + 0.34, shade(PAL.sand, -0.12));
+  if (mood.kind === 'drought') {
+    // The bed the water has come off, at the full width of the channel it is
+    // not filling any more: pale dry gravel, and a darker damp line down the
+    // middle where it has only just stopped being river.
+    strip(ctx, river, rw, mix(PAL.sand, PAL.dirtPale, 0.5));
+    strip(ctx, river, rw * 0.7, shade(PAL.dirtEdge, 0.26));
+  }
+  strip(ctx, river, ww, PAL.waterDeep);
+  strip(ctx, river, ww * 0.76, PAL.water);
+  strip(ctx, river, ww * 0.34, PAL.waterLight);
+  const wrng = mulberry32(808);
+  // Nine flecks a segment on an ordinary day; a flood is white with them and a
+  // drought has barely enough water to make one. `mood.foam` is 1 everywhere
+  // else, so the draw count — and therefore every fleck in the archive — is
+  // untouched.
+  const nFoam = Math.round(9 * mood.foam);
+  for (let i = 0; i + 1 < river.length; i++) {
+    for (let k = 0; k < nFoam; k++) {
+      const t = (k + wrng()) / nFoam;
+      const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
+      const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
+      const off = (wrng() - 0.5) * ww * 1.1;
+      rect(ctx, isoX(gx, gy) + off * 16, isoY(gx, gy) + off * 6, 3 + wrng() * 4, 1, PAL.waterFoam);
+    }
+  }
+  if (mood.kind === 'drought') {
+    // ...and what the water has left behind on the way down: stones standing
+    // proud of the bed, and mud drying round them. Its own stream, appended
+    // after the foam loop, so an ordinary river never asks it a question.
+    const drng = mulberry32(0xd2007);
+    for (let i = 0; i + 1 < river.length; i++) {
+      for (let k = 0; k < 9; k++) {
+        const t = (k + drng()) / 9;
+        const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
+        const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
+        // Out in the exposed ring: past the thread of water, inside the bank.
+        const side = drng() < 0.5 ? -1 : 1;
+        const off = side * (ww * 1.25 + drng() * Math.max(0.12, rw - ww * 1.3));
+        const x = isoX(gx, gy) + off * 16;
+        const y = isoY(gx, gy) + off * 6;
+        if (drng() < 0.62) {
+          // Dark body, lit top, one pixel of shadow under it. Pale grey on pale
+          // sand disappears; a stone has to be a good deal darker than the bed
+          // it is sitting on before it reads as standing proud of it at all.
+          const w = 2 + Math.round(drng() * 3);
+          rect(ctx, x, y + 2, w + 1, 1, shade(PAL.dirtEdge, -0.3));
+          rect(ctx, x, y, w, 2, PAL.stoneDark);
+          rect(ctx, x, y - 1, w, 1, PAL.stone);
+        } else {
+          rect(ctx, x - 1, y, 3 + Math.round(drng() * 4), 1, shade(PAL.dirtEdge, -0.24));
+        }
+      }
+    }
+  }
+}
+
+/**
  * The ground under an outcrop: bare rock showing through the biome tint, by
  * `rocky` (0 at the edge of the influence, 1 at the heart of it). Exported so
  * the catalog can show the tint on its own.
@@ -1472,72 +1555,7 @@ export function* buildGenesisSceneSteps(
   // the map says it is: `map.river` and `map.riverWidth` are read, never
   // written, so the bridges, fords, jetties, boats and the prospector's
   // gravel bar all stand exactly where they stood.
-  const river = extendEnds(map.river, OVER_V);
-  const mood = riverMood(day);
-  const rw = map.riverWidth;
-  /** Half-width of the water itself, and of the banks it is held between. */
-  const ww = rw * mood.water;
-  const bw = rw * mood.bank;
-  if (mood.kind === 'flood') {
-    // Silt: the meadow the water was on this morning, well outside the banks.
-    strip(ctx, river, bw + 1.8, mix(PAL.dirtEdge, PAL.sand, 0.45));
-  }
-  strip(ctx, river, bw + 0.75, PAL.sand);
-  strip(ctx, river, bw + 0.34, shade(PAL.sand, -0.12));
-  if (mood.kind === 'drought') {
-    // The bed the water has come off, at the full width of the channel it is
-    // not filling any more: pale dry gravel, and a darker damp line down the
-    // middle where it has only just stopped being river.
-    strip(ctx, river, rw, mix(PAL.sand, PAL.dirtPale, 0.5));
-    strip(ctx, river, rw * 0.7, shade(PAL.dirtEdge, 0.26));
-  }
-  strip(ctx, river, ww, PAL.waterDeep);
-  strip(ctx, river, ww * 0.76, PAL.water);
-  strip(ctx, river, ww * 0.34, PAL.waterLight);
-  const wrng = mulberry32(808);
-  // Nine flecks a segment on an ordinary day; a flood is white with them and a
-  // drought has barely enough water to make one. `mood.foam` is 1 everywhere
-  // else, so the draw count — and therefore every fleck in the archive — is
-  // untouched.
-  const nFoam = Math.round(9 * mood.foam);
-  for (let i = 0; i + 1 < river.length; i++) {
-    for (let k = 0; k < nFoam; k++) {
-      const t = (k + wrng()) / nFoam;
-      const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
-      const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
-      const off = (wrng() - 0.5) * ww * 1.1;
-      rect(ctx, isoX(gx, gy) + off * 16, isoY(gx, gy) + off * 6, 3 + wrng() * 4, 1, PAL.waterFoam);
-    }
-  }
-  if (mood.kind === 'drought') {
-    // ...and what the water has left behind on the way down: stones standing
-    // proud of the bed, and mud drying round them. Its own stream, appended
-    // after the foam loop, so an ordinary river never asks it a question.
-    const drng = mulberry32(0xd2007);
-    for (let i = 0; i + 1 < river.length; i++) {
-      for (let k = 0; k < 9; k++) {
-        const t = (k + drng()) / 9;
-        const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
-        const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
-        // Out in the exposed ring: past the thread of water, inside the bank.
-        const side = drng() < 0.5 ? -1 : 1;
-        const off = side * (ww * 1.25 + drng() * Math.max(0.12, rw - ww * 1.3));
-        const x = isoX(gx, gy) + off * 16;
-        const y = isoY(gx, gy) + off * 6;
-        if (drng() < 0.62) {
-          // Dark body, lit top, one pixel of shadow under it. Pale grey on pale
-          // sand disappears; a stone has to be a good deal darker than the bed
-          // it is sitting on before it reads as standing proud of it at all.
-          const w = 2 + Math.round(drng() * 3);
-          rect(ctx, x, y + 2, w + 1, 1, shade(PAL.dirtEdge, -0.3));
-          rect(ctx, x, y, w, 2, PAL.stoneDark);
-          rect(ctx, x, y - 1, w, 1, PAL.stone);
-        } else {
-          rect(ctx, x - 1, y, 3 + Math.round(drng() * 4), 1, shade(PAL.dirtEdge, -0.24));
-        }
-      }
-    }
-  }
+  bakeRiver(ctx, extendEnds(map.river, OVER_V), map.riverWidth, riverMood(day));
 
   yield;
   /* ---- indexes --------------------------------------------------------- */
@@ -3712,7 +3730,9 @@ const STAR_LANES = 6;
 const STAR_GAP = 9;
 const SALT_STARS = 0x5a11fa11;
 
-function paintStars(
+/** Exported for the catalog page, which shows the shower on its own dark sky;
+ * nothing in the renderer calls it from outside this module. */
+export function paintStars(
   ctx: Ctx,
   a: number,
   dw: number,
@@ -6694,7 +6714,7 @@ function stepDebris(scene: GenesisScene, wl: Wildlife, dt: number): void {
  * purpose: a plank the size of a cart reads as a boat, and a boat on a flood
  * is a different story about the valley than the one being told.
  */
-function drawFlotsam(ctx: Ctx, x: number, y: number, kind: 0 | 1 | 2, lift: number): void {
+export function drawFlotsam(ctx: Ctx, x: number, y: number, kind: 0 | 1 | 2, lift: number): void {
   const yy = y + lift;
   if (kind === 0) {
     // A length of board, riding flat.

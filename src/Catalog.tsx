@@ -40,14 +40,43 @@ import {
   drawRipple,
   drawWheel,
   isoTile,
+  mix,
   shade,
+  /* ---- never catalogued until now: ruins, market, festival, gold ---- */
+  buildBonfire,
+  buildBunting,
+  buildMarketStall,
+  buildRubble,
+  buildRuinWall,
+  drawBonfire,
+  drawChestGlint,
+  drawPanner,
+  giltStructure,
+  /* ---- wildlife round two, and how the eclipse finds it ---- */
+  buildCattle,
+  buildDuck,
+  buildFox,
+  buildHorse,
+  buildPerchedBird,
+  /* ---- boats underway: the two figures drawn over a baked hull ---- */
+  drawPunter,
+  drawRower,
+  /* ---- living details II: the lean is a transform over the standing art ---- */
+  drawLeaningTree,
   type BotAction,
   type BuildMaterial,
   type Ctx,
+  type RuinArt,
   type Sprite,
+  type StructureSpec,
 } from '../vale/art';
 import {
   bakeLake,
+  /* ---- more day types: the river's three moods, and what rides on one ---- */
+  bakeRiver,
+  drawFlotsam,
+  paintStars,
+  /* ---- end more day types ---- */
   drawBridge,
   drawFirefly,
   drawFord,
@@ -61,6 +90,9 @@ import {
 import {
   ACCENTS,
   COMMON_ROLES,
+  /* ---- the ferry (additive) ---- */
+  FERRY_LEN,
+  /* ---- end the ferry (additive) ---- */
   FLAVOUR_PROPS,
   LANDMARK_ROLES,
   QUARRY_REACH,
@@ -68,8 +100,18 @@ import {
   WOOD_CHARACTER_NAMES,
   sampleLake,
 } from './gen';
-import { PLAIN_DAY, type DayInfo, type Season } from './daytype';
-import type { Biome, RoofStyle, StructureRole, TreeKind, Vec2 } from './types';
+import {
+  DAY_TYPES,
+  PLAIN_DAY,
+  riverMood,
+  starsAt,
+  type DayInfo,
+  type DayType,
+  type Season,
+} from './daytype';
+/* ---- living details II (additive): the fall is arithmetic, in living.ts ---- */
+import { LEAN_FOR, leanOf } from './living.ts';
+import { isoX, isoY, type Biome, type RoofStyle, type StructureRole, type TreeKind, type Vec2 } from './types';
 
 /* ------------------------------ enumerations ----------------------------- */
 
@@ -228,6 +270,9 @@ interface Item {
   sub?: string;
   tag?: string;
   tagKind?: 'generic' | 'unused' | 'info';
+  /** Blit magnification. ×3 unless the cell is a slab of terrain rather than a
+   * sprite, in which case it would swamp the sheet at that size. */
+  scale?: number;
   c: HTMLCanvasElement;
 }
 
@@ -235,18 +280,18 @@ const item = (key: string, label: string, c: HTMLCanvasElement, extra: Partial<I
   ({ key, label, c: trim(c), ...extra });
 
 /** Blit one baked sprite at ×3, pixels hard. */
-function Pix({ c }: { c: HTMLCanvasElement }) {
+function Pix({ c, scale = SCALE }: { c: HTMLCanvasElement; scale?: number }) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    el.width = c.width * SCALE;
-    el.height = c.height * SCALE;
+    el.width = c.width * scale;
+    el.height = c.height * scale;
     const g = el.getContext('2d')!;
     g.imageSmoothingEnabled = false;
     g.clearRect(0, 0, el.width, el.height);
     g.drawImage(c, 0, 0, c.width, c.height, 0, 0, el.width, el.height);
-  }, [c]);
+  }, [c, scale]);
   return <canvas ref={ref} className="pix" />;
 }
 
@@ -254,7 +299,7 @@ function Cell({ it }: { it: Item }) {
   return (
     <figure className="cell">
       <div className="art">
-        <Pix c={it.c} />
+        <Pix c={it.c} scale={it.scale} />
       </div>
       <figcaption>
         <span className="name">{it.label}</span>
@@ -412,14 +457,60 @@ function fordCanvas(): HTMLCanvasElement {
     [3, -3],
   ];
   return bake(150, 66, 75, 40, (ctx) => {
-    strip(ctx, river, 0.95 + 0.75, PAL.sand);
-    strip(ctx, river, 0.95, PAL.waterDeep);
-    strip(ctx, river, 0.95 * 0.76, PAL.water);
-    strip(ctx, river, 0.95 * 0.34, PAL.waterLight);
+    // The water through the renderer's own river bake rather than a hand-rolled
+    // stack of strips, so a change to the banks reaches this cell too.
+    bakeRiver(ctx, river, RIVER_W, riverMood(PLAIN_DAY));
     paintRoad(ctx, road, 'track', 0.4, 2024);
     drawFord(ctx, river, 0, 0, 3.4);
   });
 }
+
+/* ---- the ferry (additive) ------------------------------------------------ */
+
+/** Tile space from the (u, v) the ferry's geometry is stated in. */
+const fromUV = (u: number, v: number): Vec2 => [(v + u) / 2, (v - u) / 2];
+
+/**
+ * The whole crossing in one cell: two landing stages facing each other across
+ * the water, and the punt out in the stream between them.
+ *
+ * The stages are `buildJetty` at FERRY_LEN — the ferry has no landing art of
+ * its own, deliberately: a landing IS a short pier, and giving it a second
+ * sprite would be two things to keep in step for no gain. The punt is not a
+ * pier and is not a rowboat, and that is where the art does diverge.
+ */
+function ferryCanvas(): HTMLCanvasElement {
+  const river: Vec2[] = [
+    [-5, -5],
+    [0, 0],
+    [5, 5],
+  ];
+  // The landward roots. A root sits FERRY_LEN back from the bank, so the deck
+  // head lands on the water's edge: the bank is at the water's own half-width
+  // measured perpendicular, which is RIVER_W * sqrt(2) along u.
+  const root = RIVER_W * Math.SQRT2 + FERRY_LEN;
+  const [ax, ay] = fromUV(-root, 0);
+  const [bx, by] = fromUV(root, 0);
+  return bake(230, 150, 115, 78, (ctx) => {
+    const jitter = [0.0, -0.035, 0.04, -0.015];
+    for (let v = -10; v <= 10; v++) {
+      for (let u = -8; u <= 8; u++) {
+        if ((u + v) & 1) continue;
+        const h = (Math.imul(u | 0, 374761393) ^ Math.imul(v | 0, 668265263)) >>> 0;
+        isoTile(ctx, u * 16, v * 8, shade(PAL.biome.meadow, jitter[h % 4]));
+      }
+    }
+    bakeRiver(ctx, river, RIVER_W, riverMood(PLAIN_DAY));
+    const put = (sp: Sprite, gx: number, gy: number) =>
+      ctx.drawImage(sp.c, Math.round(isoX(gx, gy) - sp.ox), Math.round(isoY(gx, gy) - sp.oy));
+    put(buildJetty(0, FERRY_LEN, 131), ax, ay);
+    put(buildJetty(Math.PI, FERRY_LEN, 138), bx, by);
+    put(buildPunt(0, 131), 0, 0);
+    drawPunter(ctx, isoX(0, 0), isoY(0, 0), 0, 1.1, '#6cc4d9');
+  });
+}
+
+/* ---- end the ferry (additive) -------------------------------------------- */
 
 const ROAD_KINDS: { kind: 'highway' | 'lane' | 'track'; width: number }[] = [
   { kind: 'highway', width: 0.62 },
@@ -502,6 +593,118 @@ function outcropCanvas(rocky: number): HTMLCanvasElement {
 }
 
 const SEASONS: Season[] = ['winter', 'spring', 'summer', 'autumn'];
+
+/* ---- more day types (additive): the water ------------------------------- */
+
+/**
+ * `map.riverWidth` is a CONSTANT in gen.ts — every valley's river is the same
+ * width, and the scarcity a ferry needs comes from how far a reach of it runs
+ * from the nearest crossing, not from how wide it is. Kept here as a named
+ * number so the three moods below are drawn at the width the world uses.
+ */
+const RIVER_W = 0.95;
+
+/**
+ * A straight reach of river, two segments of it, running along +gx/+gy — which
+ * on an isometric screen is straight down the middle. Two segments rather than
+ * one because the foam is drawn per segment, and a single-segment river would
+ * show half the flecks a real one carries.
+ */
+const REACH: Vec2[] = [
+  [-3, -3],
+  [0, 0],
+  [3, 3],
+];
+
+/** Terrain slabs blit at ×2: at the sheet's ×3 a flooded river is 450px of
+ * cell and everything else on the shelf disappears beside it. */
+const SLAB = 2;
+
+/**
+ * One reach of river, painted for one day.
+ *
+ * `bakeRiver()` is literally the ground bake's river block — lifted out of
+ * `buildGenesisSceneSteps` so this page cannot describe a river the world does
+ * not lay down — and `riverMood()` is the whole of the flood/drought mechanism:
+ * three multipliers, (1, 1, 1) on every ordinary day.
+ */
+function riverCanvas(day: DayInfo): HTMLCanvasElement {
+  return bake(200, 112, 100, 56, (ctx) => {
+    const jitter = [0.0, -0.035, 0.04, -0.015];
+    for (let v = -8; v <= 8; v++) {
+      for (let u = -7; u <= 7; u++) {
+        if ((u + v) & 1) continue;
+        const h = (Math.imul(u | 0, 374761393) ^ Math.imul(v | 0, 668265263)) >>> 0;
+        isoTile(ctx, u * 16, v * 8, shade(PAL.biome.meadow, jitter[h % 4]));
+      }
+    }
+    bakeRiver(ctx, REACH, RIVER_W, riverMood(day));
+  });
+}
+
+/** One piece of what a flood is carrying, on a scrap of its own water. */
+function flotsamCanvas(kind: 0 | 1 | 2): HTMLCanvasElement {
+  return bake(28, 20, 14, 12, (ctx) => {
+    ctx.fillStyle = PAL.water;
+    ctx.fillRect(-14, -12, 28, 20);
+    ctx.fillStyle = PAL.waterDeep;
+    ctx.fillRect(-14, 2, 28, 6);
+    drawFlotsam(ctx, 0, 0, kind, 0);
+  });
+}
+
+/* ---- end more day types (additive) -------------------------------------- */
+
+/* ---- living details II (additive): a tree going over --------------------- */
+
+/**
+ * One tree at one moment of its fall.
+ *
+ * There is no art here at all, which is the point: `leanOf()` hands back a
+ * horizontal shear about the foot of the trunk and a squash, and the STANDING
+ * sprite is drawn through them. A shear rather than a rotation because every
+ * tree carries its own flat ground shadow at that anchor — rotate it and the
+ * shadow tips up into the air with the crown.
+ */
+function leanCanvas(kind: TreeKind, phase: number, dir: number): HTMLCanvasElement {
+  const sp = buildTree(TREE_INDEX[kind], 11 + kind.length * 13);
+  const { k, squash } = leanOf(kind, dir, phase);
+  const reach = Math.ceil(Math.abs(k) * sp.c.height) + 4;
+  return bake(sp.c.width + reach * 2, sp.c.height + 4, sp.ox + reach, sp.oy, (ctx) => {
+    drawLeaningTree(ctx, sp, 0, 0, k, squash);
+  });
+}
+
+/* ---- end living details II (additive) ------------------------------------ */
+
+/**
+ * What each day type owns in this catalog — which is the honest measure of how
+ * much ART a day type is, as against how much narration.
+ */
+const DAY_TYPE_ART: Record<DayType, string> = {
+  normal: 'everything below is the ordinary day; two thirds of seeds.',
+  mist: 'a screen-space fog wash until mid-morning. No sprite of its own.',
+  eclipse: 'bends the Sky curve (see above) so the lamps light at two in the afternoon — and the only day type the WILDLIFE reads: hunkered birds, deer that do not bolt, huddled stock, a daylight fox.',
+  storm: 'a rain curtain and a dimmed sky, plus the one real time-warp in the world. No sprite of its own.',
+  aurora: 'screen-space curtains over the night. No sprite of its own.',
+  market: 'stalls in a town square and extra traffic on the roads between — see Occasions.',
+  stars: 'six analytic lanes of meteor, screen-space, over the finished frame.',
+  flood: 'a wider river, a silt band outside the banks, and eight pieces of wreckage going past.',
+  drought: 'a thread of water in an unmoved channel, a dry gravel bed, a damp centre line and nine stones a segment.',
+};
+
+/* ---- ruins (never catalogued) -------------------------------------------- */
+
+/** What is left of whoever was here before. `standing` is how much of the old
+ * wall height is still up; below about a third it is a footing, not a wall. */
+const RUINS: (RuinArt & { label: string; sub: string })[] = [
+  { kind: 'corner', w: 40, floors: 2, standing: 0.45, seed: 3311, label: 'corner', sub: 'two faces, one quoin · 45% up' },
+  { kind: 'corner', w: 40, floors: 2, standing: 0.45, material: 'stone', seed: 3311, label: 'corner · stone', sub: 'the same wall, quarried' },
+  { kind: 'tower', w: 32, floors: 2, standing: 0.4, seed: 4477, label: 'tower', sub: 'a notched drum · 40% of shaft + storeys' },
+  { kind: 'tower', w: 32, floors: 3, standing: 0.6, material: 'stone', seed: 4477, label: 'tower · stone', sub: 'taller, and more of it left' },
+];
+
+/* ---- end ruins ----------------------------------------------------------- */
 
 /* ---------------------------------- sky ----------------------------------- */
 
@@ -604,6 +807,105 @@ function SkyStrip({ day, from, to, hours }: { day: DayInfo; from?: number; to?: 
     </div>
   );
 }
+
+/* ---- more day types (additive): the shower ------------------------------- */
+
+/** The night the stars fall on, and the hour of it this panel is showing. */
+const STAR_DAY: DayInfo = { type: 'stars', season: 'summer', from: 21.4, to: 24 };
+const STAR_AT = 22.6;
+const STARS_W = 420;
+const STARS_H = 150;
+/** How long the composited panel beside the live one holds its shutter open. */
+const STAR_EXPOSURE = 40;
+const STAR_SEED = 4711;
+
+/**
+ * The meteor shower, on the sky it is actually drawn on.
+ *
+ * SCREEN-SPACE, in device pixels, over the finished frame — the same layer the
+ * aurora is on — so this panel is a slab of valley green under the night
+ * multiply with `paintStars` over the top, and not a sprite. That green is the
+ * whole reason the streak is drawn twice: a single hairline of white over a
+ * valley that is dark green under a multiply is invisible, and the wide dim
+ * bloom under the narrow bright one is what makes it read as light.
+ *
+ * Every lane is an analytic function of the clock, so a paused panel is
+ * identical to itself and reduced motion simply holds one frame.
+ */
+function StarsPanel() {
+  const still =
+    typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const live = useRef<HTMLCanvasElement>(null);
+  const long = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const sky = skyAt(STAR_AT, STAR_DAY);
+    const a = starsAt(STAR_DAY, STAR_AT);
+    const night = (g: Ctx) => {
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.globalAlpha = 1;
+      g.globalCompositeOperation = 'source-over';
+      g.fillStyle = PAL.biome.meadow;
+      g.fillRect(0, 0, STARS_W, STARS_H);
+      g.save();
+      g.globalCompositeOperation = 'multiply';
+      g.globalAlpha = sky.a;
+      g.fillStyle = sky.css;
+      g.fillRect(0, 0, STARS_W, STARS_H);
+      g.restore();
+    };
+
+    // The long exposure: forty seconds of the same six lanes, sampled every
+    // third of a second onto one canvas. Not what a frame looks like — a frame
+    // is usually empty, which is the honest answer to "how much shower is
+    // there" — but the only way to see the whole shape of the thing at once.
+    const le = long.current;
+    if (le) {
+      le.width = STARS_W;
+      le.height = STARS_H;
+      const g = le.getContext('2d')!;
+      night(g);
+      for (let c = 0; c < STAR_EXPOSURE; c += 0.34) {
+        paintStars(g, a, STARS_W, STARS_H, c, 1, STAR_SEED);
+      }
+    }
+
+    const el = live.current;
+    if (!el) return;
+    el.width = STARS_W;
+    el.height = STARS_H;
+    const g = el.getContext('2d')!;
+    const paint = (clock: number) => {
+      night(g);
+      paintStars(g, a, STARS_W, STARS_H, clock, 1, STAR_SEED);
+    };
+    if (still) {
+      paint(0);
+      return;
+    }
+    let raf = 0;
+    const t0 = performance.now();
+    const loop = (now: number) => {
+      raf = requestAnimationFrame(loop);
+      paint((now - t0) / 1000);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [still]);
+  return (
+    <div className="starpair">
+      <figure>
+        <canvas ref={live} className="stars" />
+        <figcaption>one frame · about a third of a star alight at any instant</figcaption>
+      </figure>
+      <figure>
+        <canvas ref={long} className="stars" />
+        <figcaption>{STAR_EXPOSURE}s of the same six lanes, composited</figcaption>
+      </figure>
+    </div>
+  );
+}
+
+/* ---- end more day types (additive) --------------------------------------- */
 
 /* -------------------------------- animated -------------------------------- */
 
@@ -730,19 +1032,29 @@ const COVERAGE: { head: string; body: string }[] = [
       'structFor() in scene.ts always passes condition: 1, so the weathering mix (greyed walls, faded roof) never shows. A frontier holding that has stood since dawn could weather a little.',
   },
   {
-    head: 'Nothing uses the water',
+    head: 'The lakes do not know what day it is',
     body:
-      'CLOSED. Boats and jetties gave the water piers and moored hulls, fords gave the tracks a way through it, and BOATS UNDERWAY gave the hulls somewhere to go: a rowing loop on the river, a drift across a lake, and — on the seeds whose river runs a long way from any bridge — a ferry punt shuttling between two landing stages with passengers who walk down, ride over, and walk away up the far bank.',
+      'The water is worked now — piers, moored hulls, rowing loops, a ferry punt, a ford — and flood and drought repaint the river under all of it. What they do not touch is standing water: a river-fed lake stays brim full while its river is a thread, because draining it would strand the jetties and beach the boats moored to them, which looks worse than leaving it. Deliberate, and still a gap. So is the rest of the day-type blind spot: the prospector kneels in mid-channel on a flood day, a ford lays its pale shallows over a dry gravel bed on a drought day, and the ferry punts across two feet of water without noticing.',
   },
   {
-    head: 'The wildlife is four animals and no predators',
+    head: 'The flood is three planks and the drought is nine stones',
     body:
-      'deer, dog, grazing sheep, bird — plus fireflies and a fish. No horse on the highway, no cattle in the farm biome, nothing that hunts and nothing anyone owns. Birds also never perch: they fly a line and fade.',
+      'Everything the two rare rivers own is in this catalog: a silt band, a gravel bed, a damp centre line, three kinds of small wreckage and a stone. Nothing bigger ever comes down — no boat torn off its mooring, no drowned tree, no hurdle wrapped round a bridge pier — and nothing on the bank reacts: no sandbags, no wet mark up a wall, no cracked mud where a field meets the water. Both days are a repainted strip and some flotsam, and they read as weather rather than as an event.',
+  },
+  {
+    head: 'Eleven animals, one predator, and nothing indoors',
+    body:
+      'bird (flying and perched), deer, dog, sheep, horse, cattle, fox, duck, fish, firefly. The fox is the only thing that hunts and it hunts nothing — it crosses and is gone. Still missing from the backlog: owls or wolf-eyes at the treeline at night, rabbits at a warren, and cats on a finished windowsill. Nothing has young, and no animal is ever in or on a building except the birds on a ridge.',
+  },
+  {
+    head: 'The eclipse is the only weather the animals read',
+    body:
+      'Half an hour of false dusk and the valley answers it: birds hunker on the ridge in their own sprite, deer come out and do not bolt, cattle and horses draw together, fireflies come up at the bottom of the dip and the fox walks in daylight. Nothing else in the sky gets that treatment — a storm soaks a valley whose deer graze on regardless, mist hides nothing from anybody, and no bot ever looks up. And the people do not read the eclipse either: the crews keep building through the dark.',
   },
   {
     head: 'The season repaints leaves and grass, and stops there',
     body:
-      'seasonCanvas runs over the six DECIDUOUS pools and the ground tint. crop, haystack, reeds and flowers are summer art in every month, so a winter valley still has a green cornfield in it.',
+      'seasonCanvas runs over the six DECIDUOUS pools and the ground tint. crop (all three ages), haystack (all three), reeds and flowers are summer art in every month, so a winter valley still has a green cornfield and a fresh-cut rick in it. The water never freezes and the ricks never sit under snow.',
   },
   {
     head: 'The fall is a transform, not a drawing',
@@ -758,6 +1070,21 @@ const COVERAGE: { head: string; body: string }[] = [
     head: 'The log is hauled by nobody',
     body:
       'A felled trunk lies for 90 world-minutes and then stops existing. No carrier walks out to it and no cart takes it. The yard it should have gone to does now grow — but on the fraction of the wood within reach that has come down, not on any particular log arriving, so the two halves of the timber economy still only rhyme.',
+  },
+  {
+    head: 'The ferry is the only vessel with a job',
+    body:
+      'A punt shuttles all day and carries up to three people. Every other hull on the water is a rowing loop that ends where it began: nothing is ever loaded, no boat takes the day’s timber anywhere, and a fishing town’s boats catch nothing that is ever seen. There is no ferryman’s hut at either landing, no chain, no toll board, and the crossing has no name — the one place in the valley with two structures facing each other over the water, and no sign that anybody lives off it.',
+  },
+  {
+    head: 'The rivalry is a paragraph with no picture',
+    body:
+      'About a third of multi-town days run a time trial between two towns and the ledger keeps score, and NOTHING in the valley shows it: no pennant on the leader, no board, no crowd at the finish, not a pixel. Verified against the wave — rivalries touched daytype.ts and timeline.ts only. It is the only feature in Genesis that exists entirely in prose, and either that is the point or it wants one banner.',
+  },
+  {
+    head: 'The pools are no longer the whole inventory',
+    body:
+      'Ruins, standing stones, market stalls, bunting, the bonfire, the gilded roof, the ferry, the prospector, the flood’s wreckage and the chest glint are all shelved here — and not one of them comes through makePools() or a PropSpec. Each is drawn straight into the frame by scene.ts from map or day-type data, which means this page stopped being able to enumerate the valley automatically some time ago: every one of those rows is a hand-written cell, and the next feature that draws itself the same way will be missing from here until somebody writes one for it too. That is the standing maintenance cost of the catalog, and it is worth saying out loud on the catalog.',
   },
 ];
 
@@ -862,6 +1189,59 @@ export default function Catalog() {
     );
   }, [night]);
 
+  /* ---- the prospector's one day in twenty (additive) --------------------- */
+
+  /**
+   * A gold strike, which is the only thing in the valley that repaints a
+   * finished building. `giltStructure` runs OVER a baked sprite — same
+   * silhouette, same anchor, gold laid along the eaves, the ridge and the
+   * finial — so it costs a cache-key dimension and no new art.
+   */
+  const gilded = useMemo(() => {
+    const gild = (role: StructureRole, accent: string, seed: number, roof: RoofStyle) => {
+      const spec: StructureSpec = {
+        role,
+        accent,
+        w: SPECIMEN[role].w,
+        floors: SPECIMEN[role].floors,
+        roof,
+        progress: 1,
+        condition: 1,
+        chimney: SPECIMEN[role].chimney,
+        cupola: SPECIMEN[role].cupola,
+        awning: SPECIMEN[role].awning,
+        banner: SPECIMEN[role].banner,
+        lit: night,
+        seed,
+      };
+      const sp = buildStructure(spec);
+      giltStructure(sp, spec);
+      return sp.c;
+    };
+    return [
+      item('gd-hall-plain', 'hall', structure('hall', SPECIMEN.hall, '#9b8fe8', 1, night, 6001, 'hip'), {
+        sub: 'the same hall, on an ordinary day',
+      }),
+      item('gd-hall', 'hall · gilded', gild('hall', '#9b8fe8', 6001, 'hip'), {
+        sub: 'eaves, ridge, finial',
+        tag: '1 seed in 20',
+        tagKind: 'info',
+      }),
+      item('gd-cottage', 'cottage · gilded', gild('cottage', '#f0c75e', 6002, 'thatch'), {
+        sub: 'a thatched roof takes the gold too',
+        tag: '1 seed in 20',
+        tagKind: 'info',
+      }),
+      item('gd-chapel', 'chapel · gilded', gild('chapel', '#63c9a8', 6003, 'gable'), {
+        sub: 'cupola and all',
+        tag: '1 seed in 20',
+        tagKind: 'info',
+      }),
+    ];
+  }, [night]);
+
+  /* ---- end the prospector's one day in twenty (additive) ----------------- */
+
   const roofs = useMemo(() => {
     const kinds: RoofStyle[] = ['hip', 'gable', 'thatch', 'flat'];
     return kinds.map((r) =>
@@ -906,6 +1286,35 @@ export default function Catalog() {
     }
     return out;
   }, []);
+
+  /* ---- living details II (additive) -------------------------------------- */
+
+  /**
+   * The last five world-minutes of a chop, for the three kinds that fall most
+   * differently. `ease` is a statement about WHEN a tree commits and `tilt`
+   * about how far it reaches when it lands, so a fir is still standing to look
+   * at when a willow of the same age is halfway down.
+   */
+  const falling = useMemo(() => {
+    const out: Item[] = [];
+    const kinds: [TreeKind, number, string][] = [
+      ['fir', 1, 'tilt 0.90 · ease 3.0 — goes all at once'],
+      ['oak', 1, 'tilt 0.62 · ease 2.0'],
+      ['willow', -1, 'tilt 0.50 · ease 1.1 — leaning from the first blow'],
+    ];
+    for (const [kind, dir, sub] of kinds) {
+      for (const p of [0, 0.4, 0.75, 1]) {
+        out.push(
+          item(`ln-${kind}-${p}`, kind, leanCanvas(kind, p, dir), {
+            sub: p === 0 ? sub : `phase ${p.toFixed(2)}`,
+          })
+        );
+      }
+    }
+    return out;
+  }, []);
+
+  /* ---- end living details II (additive) ---------------------------------- */
 
   const poolItems = (kinds: string[], prefix: string): Item[] => {
     const out: Item[] = [];
@@ -1053,8 +1462,46 @@ export default function Catalog() {
     return out;
   }, []);
 
+  /* ---- drawn straight into the frame, never through a pool --------------- */
+
+  /**
+   * The day-type dressing: what a market day and a festival evening put on the
+   * ground. None of these is a PropSpec and none is pooled — `daytype.ts`
+   * decides where they go and `scene.ts` bakes them per site, so the only way
+   * they can appear in an inventory is by hand.
+   */
+  const occasions = useMemo(() => {
+    const out: Item[] = [];
+    for (const [seed, accent] of [[517, '#ef7f93'], [833, '#63c9a8'], [211, '#f0c75e']] as const) {
+      out.push(
+        item(`oc-stall-${seed}`, 'market stall', spriteCanvas(buildMarketStall(seed, accent)), {
+          sub: 'awning in the town accent',
+          tag: 'market day',
+          tagKind: 'info',
+        })
+      );
+    }
+    for (const [dx, dy, name] of [[54, -10, 'a short span'], [110, 16, 'across a square']] as const) {
+      out.push(
+        item(`oc-bunt-${dx}`, 'bunting', spriteCanvas(buildBunting(dx, dy, 404 + dx)), {
+          sub: `${name} · sag is a property of the whole string`,
+          tag: 'festival',
+          tagKind: 'info',
+        })
+      );
+    }
+    out.push(
+      item('oc-fire', 'bonfire (unlit)', spriteCanvas(buildBonfire(77)), {
+        sub: 'the flames go on per frame — see Inhabitants',
+        tag: 'festival',
+        tagKind: 'info',
+      })
+    );
+    return out;
+  }, []);
+
   const anims = useMemo<Anim[]>(() => {
-    const actions: BotAction[] = ['walk', 'carry', 'work', 'idle'];
+    const actions: BotAction[] = ['walk', 'carry', 'work', 'idle', 'fish'];
     const list: Anim[] = actions.map((a, i) => ({
       key: `bot-${a}`,
       label: `bot · ${a}`,
@@ -1063,7 +1510,8 @@ export default function Catalog() {
       h: 24,
       ox: 9,
       oy: 21,
-      draw: (ctx, t) => drawBot(ctx, 0, 0, ['#ef7f93', '#63c9a8', '#9b8fe8', '#6cc4d9'][i], true, a, t),
+      draw: (ctx, t) =>
+        drawBot(ctx, 0, 0, ['#ef7f93', '#63c9a8', '#9b8fe8', '#6cc4d9', '#e98fc3'][i], true, a, t),
     }));
     list.push({
       key: 'bot-left',
@@ -1134,8 +1582,99 @@ export default function Catalog() {
       oy: 15,
       draw: (ctx, t) => drawWheel(ctx, 0, 0, t),
     });
+
+    /* ---- boats underway (additive) --------------------------------------- *
+     * Both figures are drawn per frame over an ALREADY BAKED hull, at the
+     * hull's own waterline anchor, which is why a heading may change as often
+     * as it likes without minting a sprite: the hull is quantised to a
+     * sixteen-step bearing ladder and the person on it is not quantised at all.
+     * ---------------------------------------------------------------------- */
+    const hull = buildRowboat(Math.PI / 4, 0);
+    list.push({
+      key: 'rower',
+      label: 'rowboat · under way',
+      sub: 'drawRower over a baked hull',
+      w: hull.c.width + 26,
+      h: hull.c.height + 16,
+      ox: hull.ox + 13,
+      oy: hull.oy + 8,
+      draw: (ctx, t) => {
+        ctx.drawImage(hull.c, -hull.ox, -hull.oy);
+        drawRower(ctx, 0, 0, Math.PI / 4, t * 3.2, '#ef7f93');
+      },
+    });
+    const punt = buildPunt(Math.PI / 4, 11);
+    list.push({
+      key: 'punter',
+      label: 'punt · the ferryman',
+      sub: 'drawPunter — pole down, walked back',
+      w: punt.c.width + 30,
+      h: punt.c.height + 22,
+      ox: punt.ox + 15,
+      oy: punt.oy + 16,
+      draw: (ctx, t) => {
+        ctx.drawImage(punt.c, -punt.ox, -punt.oy);
+        drawPunter(ctx, 0, 0, Math.PI / 4, t * 2.1, '#6cc4d9');
+      },
+    });
+    /* ---- end boats underway (additive) ----------------------------------- */
+
+    /* ---- the prospector, the fire and the glint -------------------------- */
+    // One man, every day, between GOLD_FROM and GOLD_TO: he wades to a gravel
+    // bar and swirls a pan, and one day in twenty finds something. `rich` is
+    // the strike, and it is the only difference between the two cells.
+    for (const [rich, name] of [[false, 'an ordinary day'], [true, 'a gold strike']] as const) {
+      list.push({
+        key: `panner-${rich}`,
+        label: `prospector · panning${rich ? ' (rich)' : ''}`,
+        sub: name,
+        w: 30,
+        h: 28,
+        ox: 15,
+        oy: 22,
+        draw: (ctx, t) => drawPanner(ctx, 0, 0, '#c8a86a', true, 1, t, rich),
+      });
+    }
+    list.push({
+      key: 'panner-walk',
+      label: 'prospector · wading',
+      sub: 'the ordinary walk, pan carried flat',
+      w: 30,
+      h: 28,
+      ox: 15,
+      oy: 22,
+      draw: (ctx, t) => drawPanner(ctx, 0, 0, '#c8a86a', true, 0, t, false),
+    });
+    const fire = buildBonfire(77);
+    list.push({
+      key: 'bonfire',
+      label: 'bonfire · alight',
+      sub: 'buildBonfire + drawBonfire',
+      w: fire.c.width + 8,
+      h: fire.c.height + 8,
+      ox: fire.ox + 4,
+      oy: fire.oy + 4,
+      draw: (ctx, t) => {
+        ctx.drawImage(fire.c, -fire.ox, -fire.oy);
+        drawBonfire(ctx, 0, 0, t);
+      },
+    });
+    const mound = pools['chest-buried']?.[0];
+    list.push({
+      key: 'glint',
+      label: 'chest · glint',
+      sub: 'drawChestGlint — how a buried chest is found',
+      w: 34,
+      h: 34,
+      ox: 17,
+      oy: 22,
+      draw: (ctx, t) => {
+        if (mound) ctx.drawImage(mound.c, -mound.ox, -mound.oy);
+        drawChestGlint(ctx, 0, 0, t);
+      },
+    });
     return list;
-  }, []);
+  }, [pools]);
 
   /**
    * The fauna. Everything below is the same builder the wildlife pass calls;
@@ -1272,6 +1811,94 @@ export default function Catalog() {
         ctx.globalAlpha = 1;
       },
     });
+
+    /* ---- wildlife, round two (additive) ---------------------------------- *
+     * Drawn to one scale ladder, measured at the anchor: duck 5px · fox 10px ·
+     * sheep 12px · deer 17px · cattle 17px · horse 21px. They all stand on the
+     * same ground diamond, so that ladder is what the eye actually compares.
+     * ---------------------------------------------------------------------- */
+    for (const [seed, coat] of [[3, 'bay'], [7, 'grey']] as const) {
+      const poses = [buildHorse(0, true, seed), buildHorse(1, true, seed)];
+      list.push({
+        key: `wl-horse-${seed}`,
+        label: `horse · ${coat}`,
+        sub: 'head up / down at the grass',
+        w: 32,
+        h: 32,
+        ox: 15,
+        oy: 27,
+        draw: (ctx, t) => {
+          const sp = poses[Math.floor(t / 2.2) % 2];
+          ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+        },
+      });
+    }
+    for (const [seed, name] of [[3, 'plain'], [7, 'belted']] as const) {
+      const cows = [buildCattle(seed, true, false), buildCattle(seed, true, true)];
+      list.push({
+        key: `wl-cow-${seed}`,
+        label: `cattle · ${name}`,
+        sub: 'buildCattle(seed, faceRight, grazing)',
+        w: 30,
+        h: 26,
+        ox: 14,
+        oy: 21,
+        draw: (ctx, t) => {
+          const sp = cows[Math.floor(t / 1.9) % 2];
+          ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+        },
+      });
+    }
+    const foxes = [buildFox(0, true), buildFox(1, true)];
+    list.push({
+      key: 'wl-fox',
+      label: 'fox · trot',
+      sub: 'one night in three, and 7 eclipses in 10',
+      w: 24,
+      h: 20,
+      ox: 10,
+      oy: 15,
+      draw: (ctx, t) => {
+        const sp = foxes[Math.floor(t * 4) % 2];
+        ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+      },
+    });
+    const ducks = [buildDuck(0, true), buildDuck(1, true)];
+    list.push({
+      key: 'wl-duck',
+      label: 'duck · bob',
+      sub: 'five pixels, so the frames are a head bob',
+      w: 16,
+      h: 14,
+      ox: 7,
+      oy: 9,
+      draw: (ctx, t) => {
+        const sp = ducks[Math.floor(t * 2.5) % 2];
+        ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+      },
+    });
+    // Perching birds sit on the RIDGE of a finished roof, which is why the
+    // hunkered variant keeps the same footprint and the same six-pixel origin:
+    // an eclipse must not move a bird half a pixel along the tiles.
+    const perched: [boolean, boolean, string, string][] = [
+      [true, false, 'perched', 'facing right'],
+      [false, false, 'perched', 'facing left'],
+      [true, true, 'perched · hunkered', 'eclipse — head into the shoulders'],
+    ];
+    for (const [face, hunk, label, sub] of perched) {
+      const sp = buildPerchedBird(face, hunk);
+      list.push({
+        key: `wl-perch-${face}-${hunk}`,
+        label: `bird · ${label}`,
+        sub,
+        w: 12,
+        h: 12,
+        ox: face ? 5 : 7,
+        oy: 8,
+        draw: (ctx) => ctx.drawImage(sp.c, -sp.ox, -sp.oy),
+      });
+    }
+    /* ---- end wildlife, round two (additive) ------------------------------ */
     return list;
   }, []);
 
@@ -1298,6 +1925,74 @@ export default function Catalog() {
       ],
     []
   );
+
+  /* ---- more day types + the ferry (additive) ----------------------------- */
+
+  /**
+   * The same reach of the same river on the three days it can be painted for.
+   * The mood is three multipliers and nothing else — the map's own `river` and
+   * `riverWidth` are read and never written — so nothing under the water moves
+   * between these cells: a bridge, a pier or a gravel bar is in the same place
+   * in all three.
+   */
+  const rivers = useMemo(
+    () =>
+      (
+        [
+          [PLAIN_DAY, 'normal', '×1 water · ×1 banks · 9 flecks a segment'],
+          [
+            { type: 'flood', season: 'summer', from: 8, to: 19 } as DayInfo,
+            'flood',
+            '×1.6 water · ×1.62 banks · ×2.4 foam · silt 1.8 tiles out',
+          ],
+          [
+            { type: 'drought', season: 'summer', from: 8, to: 19 } as DayInfo,
+            'drought',
+            '×0.4 water in an UNMOVED channel · dry bed at the old width · damp centre line',
+          ],
+        ] as const
+      ).map(([day, label, sub]) =>
+        item(`rv-${label}`, `river · ${label}`, riverCanvas(day), { sub, scale: SLAB })
+      ),
+    []
+  );
+
+  /** Eight of these ride a flood down the valley and wrap round the arclength;
+   * downstream is simply the end further down the screen. */
+  const flotsam = useMemo(
+    () =>
+      ([0, 1, 2] as const).map((k) =>
+        item(`fl-${k}`, 'wreckage', flotsamCanvas(k), {
+          sub: ['a length of board', 'a branch with green on it', 'what is left of a hurdle'][k],
+          tag: 'flood day',
+          tagKind: 'info',
+        })
+      ),
+    []
+  );
+
+  /** The crossing whole, and the two hulls that are not the same shape. */
+  const ferry = useMemo(
+    () => [
+      item('fy-cross', 'ferry crossing', ferryCanvas(), {
+        sub: `two landings at FERRY_LEN ${FERRY_LEN}, punt amidships`,
+        scale: SLAB,
+      }),
+      item('fy-stage', 'landing stage', spriteCanvas(buildJetty(0, FERRY_LEN, 131)), {
+        sub: 'buildJetty at the ferry’s own length',
+      }),
+      item('fy-pier', 'pier, for scale', spriteCanvas(buildJetty(0, 2.2, 131)), {
+        sub: 'a town’s jetty is more than twice as long',
+      }),
+      item('fy-punt', 'punt', spriteCanvas(buildPunt(0, 11)), { sub: 'flat both ends, ramped' }),
+      item('fy-boat', 'rowboat, for shape', spriteCanvas(buildRowboat(0, 0)), {
+        sub: 'a curve with a bow — the punt is a rectangle',
+      }),
+    ],
+    []
+  );
+
+  /* ---- end more day types + the ferry (additive) -------------------------- */
 
   const roads = useMemo(
     () => ROAD_KINDS.map((r) => item(`rd-${r.kind}`, r.kind, roadCanvas(r.kind, r.width), { sub: `width ${r.width}` })),
@@ -1326,6 +2021,28 @@ export default function Catalog() {
           sub: k === 0 ? 'rocky 0 — plain moor' : `rocky ${k.toFixed(1)}`,
         })
       ),
+    []
+  );
+
+  /**
+   * Whoever was here before. Ruins are map data with no PropSpec and no pool —
+   * `ruinSprite()` bakes one per RuinSpec — and one of them per day is the
+   * GHOST, whose kind, size and position are a pure function of yesterday's
+   * seed and are the only thread between two days of the valley.
+   */
+  const ruins = useMemo(
+    () => [
+      ...RUINS.map((r) =>
+        item(`ru-${r.kind}-${r.material ?? 'timber'}-${r.floors}`, r.label, spriteCanvas(buildRuinWall(r)), {
+          sub: r.sub,
+        })
+      ),
+      ...[2911, 5507].map((s, i) =>
+        item(`ru-rub-${s}`, 'rubble', spriteCanvas(buildRubble(s, 32 + i * 12)), {
+          sub: `a footing and nothing standing · w${32 + i * 12}`,
+        })
+      ),
+    ],
     []
   );
 
@@ -1372,14 +2089,21 @@ export default function Catalog() {
   }, []);
 
   const counts = {
-    structures: structures.length + materials.length + stages.length + roofs.length,
-    trees: trees.length + treeStates.length + treeAfter.length,
-    props: props.length + treasure.length + extras.length + cropStages.length + growthStages.length,
+    structures: structures.length + materials.length + gilded.length + stages.length + roofs.length,
+    trees: trees.length + treeStates.length + falling.length + treeAfter.length,
+    props:
+      props.length +
+      treasure.length +
+      extras.length +
+      occasions.length +
+      cropStages.length +
+      growthStages.length,
     inhabitants: anims.length,
     wildlife: wildlife.length,
+    water: rivers.length + flotsam.length + ferry.length,
     infra: bridges.length + roads.length + grounds.length,
-    terrain: lakes.length + outcrops.length + monuments.length + seasons.length,
-    palette: ACCENTS.length + SKY_DAYS.length,
+    terrain: lakes.length + outcrops.length + ruins.length + monuments.length + seasons.length,
+    palette: ACCENTS.length + SKY_DAYS.length + DAY_TYPES.length,
   };
 
   return (
@@ -1405,6 +2129,7 @@ export default function Catalog() {
         <a href="#props">Props <b>{counts.props}</b></a>
         <a href="#inhabitants">Inhabitants <b>{counts.inhabitants}</b></a>
         <a href="#wildlife">Wildlife <b>{counts.wildlife}</b></a>
+        <a href="#water">Water <b>{counts.water}</b></a>
         <a href="#infrastructure">Infrastructure <b>{counts.infra}</b></a>
         <a href="#terrain">Terrain <b>{counts.terrain}</b></a>
         <a href="#palette">Palette <b>{counts.palette}</b></a>
@@ -1428,6 +2153,13 @@ export default function Catalog() {
             note={`spec.material — absent is 'timber'. Every plot of a town that came up within QUARRY_REACH (${QUARRY_REACH} u/v units) of an outcrop is 'stone': coursed walls with staggered joints, quoins alternating at the corner, dressed lintels over the openings, and a roof of slate mixed from the town's own accent. gen.ts short-circuits the thatch roll on stone, so no combination of seeds produces a thatched masonry cottage.`}
             items={materials}
           />
+          {/* ---- the prospector's one day in twenty (additive) ---- */}
+          <Row
+            title={`Gold strike (${gilded.length})`}
+            note="About one seed in twenty, the prospector finds something, and the nearest town's roofs are gilt for the rest of the day. giltStructure() runs over the finished sprite — gold along the two eaves the camera sees, up the ridge and out to the finial — so the building keeps its silhouette, its anchor and its cache entry, plus one dimension on the key. A gildhall is skipped: gilding the gilding reads as a bug."
+            items={gilded}
+          />
+          {/* ---- end the prospector's one day in twenty (additive) ---- */}
           <Row title="Progress stages" note="Shared by every role — shown on a house." items={stages} />
           <Row title="Roof styles" items={roofs} />
         </Section>
@@ -1444,6 +2176,13 @@ export default function Catalog() {
             note="A tree under the axe is the standing sprite offset ±2px; once felled it is replaced by a stump."
             items={treeStates}
           />
+          {/* ---- living details II (additive) ---- */}
+          <Row
+            title={`Going over (${falling.length})`}
+            note={`The last ${Math.round(LEAN_FOR * 60)} world-minutes of a chop, hung off the plan's own chop-done so the instant the tilt reaches full is the instant the stump and the log land. There is NO ART HERE: leanOf() hands back a horizontal shear about the foot of the trunk and a squash, and the standing sprite is drawn through them — a shear rather than a rotation because every tree carries its own flat ground shadow at that anchor, and rotating it tips the shadow into the air with the crown. Per kind: the ease is a statement about when a tree commits and the tilt about how far it reaches when it lands. The direction is the way its trunk is about to lie, off the shared logOffset.`}
+            items={falling}
+          />
+          {/* ---- end living details II (additive) ---- */}
           {/* ---- living details (additive) ---- */}
           <Row
             title={`After the axe (${treeAfter.length})`}
@@ -1480,6 +2219,12 @@ export default function Catalog() {
             items={treasure}
           />
           <Row title={`Seeded extras (${EXTRA_PROPS.length})`} items={extras} />
+          {/* ---- market day and the festival: dressing with no PropSpec ---- */}
+          <Row
+            title={`Occasions (${occasions.length})`}
+            note="Neither a pool nor a PropSpec: daytype.ts decides where a market day's stalls stand and where the festival's fire is lit, and scene.ts bakes them per site. A stall wears its town's accent on the awning and carries two things off the FESTIVE palette; a string of bunting is baked per SPAN, because the sag belongs to the whole line — a short run between two cottages barely dips and one across a square hangs like a washing line. The bonfire is a woodpile until the flames go on over it every frame."
+            items={occasions}
+          />
         </Section>
 
         <Section
@@ -1495,10 +2240,35 @@ export default function Catalog() {
           id="wildlife"
           title="Wildlife"
           count={counts.wildlife}
-          blurb="Everything alive that nobody built. Deer work the treeline at either end of the day, the flock drifts and grazes, a dog trots the green, birds cross the wood, a fish clears the river and leaves a ring, and the fireflies come up over the marsh after dark. Same ~8fps clock as the inhabitants above."
+          blurb="Everything alive that nobody built. Deer work the treeline at either end of the day, the flock drifts and grazes, a dog trots the green, birds cross the wood and perch on finished ridges, horses hold a paddock and cattle a pasture, ducks work the water, a fox crosses one night in three, a fish clears the river and leaves a ring, and the fireflies come up over the marsh after dark. Half an hour of eclipse and most of them behave as if it were evening — the hunkered bird is the one variant the dark has art of its own for. Same ~8fps clock as the inhabitants above."
         >
           <Inhabitants anims={wildlife} />
         </Section>
+
+        {/* ---- boats, the ferry and the two rare rivers (additive) ---- */}
+        <Section
+          id="water"
+          title="Water"
+          count={counts.water}
+          blurb="What the valley does with its river. The moods are presentation only — flood and drought repaint the water and move nothing, so a bridge, a pier and a gravel bar are in the same place on all three days and every archived river is identical to the byte."
+        >
+          <Row
+            title={`The river, three ways (${rivers.length})`}
+            note="One reach of one river through bakeRiver(), the ground bake's own river block. riverMood() is the entire world-visible mechanism of the two rare days: three multipliers, (1, 1, 1) on every other day there has ever been. The drought's trick is that the CHANNEL does not move — the exposed bed only exists because the banks stay where they were — and its stones are drawn dark with a lit top and a shadow pixel, because pale grey on pale sand disappears."
+            items={rivers}
+          />
+          <Row
+            title={`Flood wreckage (${flotsam.length})`}
+            note="Eight pieces ride a flood, wrapping round the river's arclength at a brisk walk. Downstream is worked out rather than stored: isoY is monotone in (gx + gy), so the end further down the screen is the end the water is going to. Small on purpose — a plank the size of a cart reads as a boat, and a boat on a flood is a different story."
+            items={flotsam}
+          />
+          <Row
+            title={`The ferry (${ferry.length})`}
+            note={`On about 29% of seeds, a reach of river that runs at least ${13} tiles from any crossing gets a ferry: two landing stages facing each other and a punt working between them all day. It carries no road — the crossing pass is closed and the roads declined to cross here — so it is terrain, drawn from its own generator substream. A landing is buildJetty at FERRY_LEN (${FERRY_LEN}), a good deal shorter than a town's pier, and the punt is deliberately not a rowboat: a rowboat is a curve with a bow, a punt is a rectangle with a ramp at each end, and at this size that is the whole difference between somebody's boat and the crossing.`}
+            items={ferry}
+          />
+        </Section>
+        {/* ---- end boats, the ferry and the two rare rivers (additive) ---- */}
 
         <Section
           id="infrastructure"
@@ -1527,6 +2297,13 @@ export default function Catalog() {
             note="outcropTint() — the biome tint pulled towards bare stone under every outcrop, so a quarry reads as exposed rock rather than as a tidy pile of stones on a lawn."
             items={outcrops}
           />
+          {/* ---- ruins (never catalogued until now) ---- */}
+          <Row
+            title={`Ruins (${ruins.length})`}
+            note="Whoever was here before. A ruin is map data with neither a PropSpec nor a pool — one bake per RuinSpec — and `standing` is how much of the old wall height is still up: below about sixteen pixels a wall stops reading as a wall and turns into a platform, so that is the floor. A corner is two faces meeting at the front quoin; a tower is measured the way buildStructure builds one, shaft and all, so 40% of a tower is a lot more stone than 40% of a hall. One ruin a day is the GHOST — kind, size and place are a pure function of YESTERDAY's seed, and it is the only thread between two days of the valley."
+            items={ruins}
+          />
+          {/* ---- end ruins ---- */}
           {/* ---- standing stones (additive) ---- */}
           <Row
             title={`Standing stones (${monuments.length} kinds)`}
@@ -1576,6 +2353,37 @@ export default function Catalog() {
               </div>
             ))}
           </div>
+          {/* ---- more day types (additive) ---- */}
+          <div className="row">
+            <h3>Falling stars</h3>
+            <p className="note">
+              SCREEN-SPACE, in device pixels, drawn after the fireflies on the finished frame —
+              the same layer the aurora is on, and the reason this panel is a slab of valley green
+              under the night multiply rather than a sprite. Six lanes on a nine-to-eighteen second
+              cycle, each an analytic function of the clock: no state, no reset hook, and a paused
+              frame identical to itself. About one star every two seconds, a third of one alight at
+              any instant. Each streak is drawn twice — a wide dim bloom under a narrow bright
+              trail — because a single hairline of white over a valley that is green under a
+              multiply cannot be seen at all.
+            </p>
+            <StarsPanel />
+          </div>
+          <div className="row">
+            <h3>Day types ({DAY_TYPES.length})</h3>
+            <p className="note">
+              The lottery a seed draws from, in table order — APPEND-ONLY, because inserting a row
+              re-cuts every boundary below it and changes what day an already-archived seed was.
+              Two thirds of days are <code>normal</code>. What each one owns in this catalog:
+            </p>
+            <ul className="daytypes">
+              {DAY_TYPES.map((d) => (
+                <li key={d}>
+                  <b>{d}</b> <span>{DAY_TYPE_ART[d]}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          {/* ---- end more day types (additive) ---- */}
           <div className="row">
             <h3>Accents ({ACCENTS.length})</h3>
             <div className="swatches">
@@ -1712,6 +2520,15 @@ const CSS = `
   color:rgba(65,58,85,.5); white-space:nowrap; }
 .cat .note code { font-size:.72rem; background:rgba(65,58,85,.07); border-radius:3px;
   padding:0 .2rem; }
+.cat .starpair { display:flex; flex-wrap:wrap; gap:.8rem; }
+.cat .starpair figure { margin:0; max-width:420px; }
+.cat .starpair figcaption { font-size:.7rem; color:rgba(65,58,85,.55); margin-top:.25rem; }
+.cat .stars { display:block; width:100%; max-width:420px; height:auto;
+  border-radius:5px; border:1px solid var(--line); }
+.cat .daytypes { list-style:none; margin:.3rem 0 0; padding:0; max-width:88ch; }
+.cat .daytypes li { font-size:.76rem; margin-bottom:.28rem; }
+.cat .daytypes b { font-weight:600; }
+.cat .daytypes span { color:rgba(65,58,85,.6); }
 .cat .swatches { display:flex; flex-wrap:wrap; gap:.4rem; }
 .cat .sw { display:flex; flex-direction:column; gap:.2rem; align-items:center; }
 .cat .sw span { width:56px; height:34px; border-radius:6px; border:1px solid var(--line); }
