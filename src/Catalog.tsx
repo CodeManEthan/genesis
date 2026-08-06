@@ -108,7 +108,11 @@ const BIOMES: Biome[] = ['meadow', 'forest', 'farm', 'wetland', 'moor'];
 /** Non-tree pool kinds, in `makePools()` order (scene.ts). */
 const PROP_POOLS = [
   'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
-  'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
+  'fenceR',
+  // The stone forms, next to the timber they replace: a quarry town walls its
+  // fields and stands its lamps on dressed block. Same footprint, same anchor.
+  'drystoneL', 'drystoneR',
+  'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp', 'lamp-stone',
   'sheep', 'campfire',
   // The stone yard of a quarry town: dressed blocks waiting to go up.
   'quarry-blocks',
@@ -127,16 +131,21 @@ const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane', 'jetty', 'rowboa
 /**
  * What gen.ts actually emits, so the catalog can flag the rest:
  *  - wild scatter  SCATTER_KINDS (gen.ts, "wild scatter"): bush, rock, stump,
- *    flowers, sheep, reeds — plus fenceL/fenceR from the field-fence pass.
- *  - site essentials (gen.ts, site dressing): well, nameboard, lamp, signpost,
- *    campfire, lumber — plus quarry-blocks and crane in the stone yard of any
- *    town that came up within QUARRY_REACH of an outcrop.
+ *    flowers, sheep, reeds — plus fenceL/fenceR from the field-fence pass, or
+ *    drystoneL/drystoneR where the town nearest the panel builds in stone.
+ *  - site essentials (gen.ts, site dressing): well, nameboard, lamp (or
+ *    lamp-stone in a quarry town), signpost, campfire, lumber — plus
+ *    quarry-blocks and crane in the stone yard of any town that came up within
+ *    QUARRY_REACH of an outcrop.
  *  - flavour tail: FLAVOUR_PROPS = crop, haystack, crates, barrels, cart, shed.
  * `stake` has a builder and a propSprite case but no generator ever asks for it.
  */
 const GENERATED = new Set<string>([
   'bush', 'rock', 'stump', 'flowers', 'sheep', 'reeds', 'fenceL', 'fenceR',
   'well', 'nameboard', 'lamp', 'signpost', 'campfire', 'lumber',
+  // The stone the material reaches past the walls into: field walls on a quarry
+  // town's lanes, and its lamps on dressed posts.
+  'drystoneL', 'drystoneR', 'lamp-stone',
   // The stone yard, emitted with the essentials so it survives every pace.
   'quarry-blocks', 'crane',
   // The water. A town whose rim reaches a bank gets a pier and a boat with the
@@ -374,7 +383,7 @@ const spriteCanvas = (sp: Sprite): HTMLCanvasElement => sp.c;
 
 /* ------------------------------ infrastructure ---------------------------- */
 
-function bridgeCanvas(stage: 1 | 2 | 3): HTMLCanvasElement {
+function bridgeCanvas(stage: 1 | 2 | 3, material?: BuildMaterial): HTMLCanvasElement {
   // A straight reach of river running along +gx/+gy, so the deck crosses it
   // left-to-right on screen.
   const river: Vec2[] = [
@@ -382,7 +391,7 @@ function bridgeCanvas(stage: 1 | 2 | 3): HTMLCanvasElement {
     [5, 5],
   ];
   return bake(150, 66, 75, 40, (ctx) => {
-    drawBridge(ctx, river, 0, 0, 4, stage);
+    drawBridge(ctx, river, 0, 0, 4, stage, material);
   });
 }
 
@@ -693,9 +702,9 @@ const COVERAGE: { head: string; body: string }[] = [
       'Almost every new piece of role furniture — porch, notice board, crates, bench, hanging sign, window boxes — hangs off the two faces the camera can see. The two back faces are blank render on every building in the valley, which is right for the fixed camera and wrong the moment anything ever rotates it.',
   },
   {
-    head: 'Stone stops at the walls',
+    head: 'Stone reaches past the walls, and stops at the well',
     body:
-      'material: "stone" reaches coursed walls, quoins, lintels and a slate roof, and nothing else. A quarry town’s well, lamps, fences and signpost are the same timber-and-render props a meadow town puts up, and there is no drystone wall or stone bridge anywhere in the set.',
+      'material: "stone" now carries beyond the coursed walls, quoins, lintels and slate roof it used to end at. A quarry town’s lamps stand on dressed posts (lamp-stone, the same lantern at the same height, so the night halo does not move); the field runs on the lanes nearest it are drystone rather than picket, panel by panel, so a boundary between a stone parish and a timber one changes hands halfway along; and a crossing whose two towns both quarry — or which comes up within STONE_BRIDGE_REACH of bare rock — is built as piers, arch and slate-coped parapet over exactly the timber bridge’s span. What is still timber-and-render in a town of masons: the well, the nameboard, the signpost, the cart, the shed. The well is the loudest of them — a stone town drawing water out of a plank-and-shingle well head.',
   },
   {
     head: 'The flat roof is drawable and never generated',
@@ -1185,6 +1194,15 @@ export default function Catalog() {
         ...([1, 2, 3] as const).map((s) =>
           item(`br-${s}`, `bridge stage ${s}`, bridgeCanvas(s), {
             sub: s === 1 ? 'pilings' : s === 2 ? 'deck' : 'rails / done',
+          })
+        ),
+        // The same crossing, same span, same footprint, built by masons: what a
+        // road between two quarry towns — or any crossing that comes up within
+        // STONE_BRIDGE_REACH of bare rock — puts over the water instead.
+        ...([1, 2, 3] as const).map((s) =>
+          item(`brs-${s}`, `stone bridge stage ${s}`, bridgeCanvas(s, 'stone'), {
+            sub: s === 1 ? 'piers' : s === 2 ? 'arch + causeway' : 'parapets / done',
+            tag: 'material: stone',
           })
         ),
         // What the lightest road class does instead. No stages: it is terrain

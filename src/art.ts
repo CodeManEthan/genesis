@@ -3633,3 +3633,114 @@ export function buildDuck(frame: 0 | 1, faceRight: boolean): Sprite {
     rect(ctx, 1, -4 + bob, 1, 1, FUR.duckPale); // collar
   });
 }
+
+/* -------------------------- stone past the walls ------------------------- *
+ * ADDITIVE BLOCK. Nothing in the Vale asks for either of these; Genesis puts
+ * them up wherever a town has an outcrop within reach and builds in stone.
+ *
+ * Both are drop-in replacements for a timber prop and share its footprint and
+ * its anchor to the pixel — `buildDrystone` for `buildFence`, `buildStoneLamp`
+ * for `buildLamp` — so the generator swaps one kind string for another and
+ * nothing else about the placement has to know.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A run of drystone wall along the screen-x axis: the same 34px panel a picket
+ * fence spans, walled in what the quarry throws away rather than fenced in
+ * split timber.
+ *
+ * Two courses of irregular stone over a solid band. The band is the whole
+ * trick: the stones on top of it are axis-aligned rectangles stepping down a
+ * 2:1 diagonal, so drawn on their own they would read as a broken line of
+ * blocks. Filled in behind, the same steps read as coursing.
+ */
+export function buildDrystone(dir: 'l' | 'r', seed: number): Sprite {
+  const w = 34;
+  const s = dir === 'l' ? 1 : -1;
+  const rng = mulberry32(seed);
+  /** Wall body, art px, footing to crown — a wall to lean on, not to hide behind. */
+  const H = 9;
+  const yAt = (x: number) => (s * x) / 2;
+
+  return makeSprite(w + 4, 34, (w + 4) / 2, 22, (ctx) => {
+    /** A band running the length of the panel, between two heights. */
+    const band = (top: number, bot: number, color: string) =>
+      poly(ctx, [
+        [-w / 2, yAt(-w / 2) + top],
+        [w / 2, yAt(w / 2) + top],
+        [w / 2, yAt(w / 2) + bot],
+        [-w / 2, yAt(-w / 2) + bot],
+      ], color);
+
+    band(1, 2.4, PAL.shadow);
+    band(-H, 1, PAL.masonryShade);
+
+    // Two courses, the upper started a stone's width along so the joints of one
+    // land over the middles of the other — the whole point of laying stone dry.
+    for (const course of [0, 1] as const) {
+      const top = course === 0 ? -4.5 : -8.5;
+      const h = course === 0 ? 5.5 : 4.5;
+      let x = -w / 2 + (course === 0 ? 0 : 2 + rng() * 2);
+      while (x < w / 2 - 1) {
+        const bw = Math.min(3 + Math.floor(rng() * 4), w / 2 - x);
+        const y = yAt(x + bw / 2) + top;
+        const tint = 0.16 - rng() * 0.3;
+        rect(ctx, x, y, bw, h, shade(PAL.masonry, tint));
+        rect(ctx, x, y, bw, 1, shade(PAL.masonry, tint + 0.22));
+        rect(ctx, x + bw, y, 1, h, shade(PAL.masonryShade, -0.18));
+        x += bw + 1;
+      }
+    }
+    // The bed the upper course sits on: one line down the whole run, laid over
+    // both courses, because it is the only joint in a dry wall that IS
+    // continuous — the vertical ones are deliberately staggered and are not.
+    band(-4.8, -4.0, shade(PAL.masonryShade, -0.2));
+
+    // Coping: flat slates set along the crown, which is what keeps the rain out
+    // of a wall with no mortar in it.
+    band(-H - 2.4, -H - 0.6, mix(PAL.slate, PAL.masonry, 0.34));
+    band(-H - 2.4, -H - 1.7, mix(PAL.slate, PAL.masonry, 0.62));
+
+    // Moss in the shaded joints, and a tuft of it at the footing.
+    for (let i = 0; i < 7; i++) {
+      const x = -w / 2 + rng() * (w - 2);
+      rect(ctx, x, yAt(x) - 1 - rng() * 7, 1 + Math.floor(rng() * 2), 1, PAL.moss);
+    }
+    for (let i = 0; i < 3; i++) {
+      const x = -w / 2 + 3 + rng() * (w - 6);
+      rect(ctx, x, yAt(x), 2, 1, shade(PAL.moss, -0.1));
+    }
+  });
+}
+
+/**
+ * A lamp on a dressed stone post — what a quarry town raises instead of the
+ * iron shaft, out of the same blocks its walls are coursed from.
+ *
+ * The lantern is buildLamp()'s, pixel for pixel and at the same height, so the
+ * night halo the scene hangs off the prop lands in the same place on both.
+ */
+export function buildStoneLamp(): Sprite {
+  return makeSprite(18, 42, 9, 37, (ctx) => {
+    poly(ctx, diamond(1, 1, 14), PAL.shadow);
+    poly(ctx, diamond(0, 0, 12), PAL.stoneDark);
+    poly(ctx, diamond(0, -2, 12), PAL.masonryShade);
+    poly(ctx, diamond(0, -3, 10), PAL.masonry);
+
+    rect(ctx, -3, -24, 3, 21, PAL.masonry);
+    rect(ctx, 0, -24, 3, 21, PAL.masonryShade);
+    for (const y of [-10, -17]) rect(ctx, -3, y, 6, 1, shade(PAL.masonryShade, -0.26));
+    rect(ctx, -1, -21, 1, 3, shade(PAL.masonryShade, -0.18));
+
+    // Slate cap, corbelled a shade proud of the post, with the lantern on it.
+    rect(ctx, -5, -26, 10, 2, mix(PAL.slate, PAL.masonry, 0.3));
+    rect(ctx, -5, -26, 10, 1, mix(PAL.slate, PAL.masonry, 0.62));
+
+    rect(ctx, -3, -32, 6, 6, shade(PAL.glassLit, -0.05));
+    rect(ctx, -4, -33, 8, 1, PAL.ink);
+    rect(ctx, -4, -26, 8, 1, PAL.ink);
+    rect(ctx, -1, -35, 1, 2, PAL.ink);
+  });
+}
+
+/* ------------------------ end stone past the walls ----------------------- */

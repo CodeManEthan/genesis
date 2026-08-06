@@ -24,6 +24,7 @@ const {
   generateMapUncached,
   woodCharacter,
   QUARRY_REACH,
+  STONE_BRIDGE_REACH,
   JETTY_LEN,
   JETTY_REACH,
   JETTY_LAKE_REACH,
@@ -46,6 +47,9 @@ const PROP_SPRITES = new Set([
   'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
   'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
   'sheep', 'campfire', 'quarry-blocks',
+  // The stone forms of fenceL/fenceR and lamp. Same footprint, same anchor;
+  // which of each pair gets emitted is a pure function of quarry-ness.
+  'drystoneL', 'drystoneR', 'lamp-stone',
   // resolved by name in propSprite() rather than from a pool
   'nameboard', 'signpost', 'stake', 'crane',
   // boats and jetties: oriented, so they are baked per bearing rather than
@@ -176,6 +180,30 @@ const ringLen = (ring) => {
 /** A town builds in stone iff every plot on its roster says so. */
 const isQuarryTown = (s) =>
   s.buildings.length > 0 && s.buildings.every((b) => b.material === 'stone');
+
+/**
+ * The FULL town roster, memoised per seed.
+ *
+ * Several of gen.ts's rules are functions of the roster the busiest day would
+ * raise rather than of the roster today actually raises — quarry-ness itself,
+ * and now everything downstream of it. Terrain is the clearest case: which
+ * fence runs are walled in stone is decided by the nearest town over the FULL
+ * roster, because `scatter` has to come out byte-identical at every pace, and a
+ * rule keyed to today's trimmed roster could not manage that.
+ *
+ * The full roster is exactly the roster at the top of the pace ladder: gen.ts
+ * sizes the array from siteFactor(SCALE_MAX) and then founds
+ * min(siteFactor(S), array length) of it, so at 4x the two are the same number.
+ */
+let rosterSeed = null;
+let rosterSites = null;
+const fullRoster = (seed) => {
+  if (rosterSeed !== seed) {
+    rosterSeed = seed;
+    rosterSites = generateMap(seed, 4).sites;
+  }
+  return rosterSites;
+};
 
 /* ------------------------------- reporting ------------------------------- */
 
@@ -1083,10 +1111,91 @@ function checks(seed, map, scale = 1) {
   }
 
   /* (x) quarry towns: stone is all-or-nothing per town, earned by an outcrop,
-     never thatched, and always kitted out with the stone yard */
+     never thatched, always kitted out with the stone yard — and, since the
+     material stopped stopping at the walls, lit by stone lamps, walled rather
+     than fenced in the fields nearest it, and joined to its fellows by stone
+     crossings wherever the rule says so. Every one of those is a pure function
+     of quarry-ness or of the terrain, so each is checkable exactly, not
+     statistically: the harness recomputes the rule and demands the same answer.
+
+     `quarry` is the roster index -> quarry-ness map the generator works from,
+     rebuilt here from the buildings alone so this check never has to trust the
+     thing it is checking. */
   {
     let bad = 0;
     let detail = [];
+    const quarry = map.sites.map(isQuarryTown);
+    const outc = map.outcrops ?? [];
+    // Terrain rules read the FULL roster — the same list the generator reads —
+    // because `scatter` and `bridges` have to come out the same at every pace
+    // and a rule keyed to today's trimmed roster could not manage that.
+    const roster = fullRoster(seed);
+    const rosterQuarry = new Map(roster.map((s) => [s.id, isQuarryTown(s)]));
+
+    // Lamps. A quarry town's are stone-posted, everyone else's are iron; there
+    // is no third answer and no town with one of each.
+    for (let i = 0; i < map.sites.length; i++) {
+      const s = map.sites[i];
+      const want = quarry[i] ? 'lamp-stone' : 'lamp';
+      const wrong = s.props.filter(
+        (p) => (p.kind === 'lamp' || p.kind === 'lamp-stone') && p.kind !== want
+      ).length;
+      if (wrong) {
+        bad++;
+        detail.push(`${s.id} ${wrong} ${want === 'lamp' ? 'stone' : 'iron'} lamp(s)`);
+      }
+    }
+
+    // Field boundaries. Every run in `scatter` belongs to whichever town of the
+    // full roster is nearest it, and takes that town's material.
+    for (const p of map.scatter) {
+      const dry = p.kind === 'drystoneL' || p.kind === 'drystoneR';
+      if (!dry && p.kind !== 'fenceL' && p.kind !== 'fenceR') continue;
+      const c = uvOf(p);
+      let ni = 0;
+      let nd = Infinity;
+      for (let i = 0; i < roster.length; i++) {
+        const d = d2(c, uvOf(roster[i]));
+        if (d < nd) {
+          nd = d;
+          ni = i;
+        }
+      }
+      if (dry !== rosterQuarry.get(roster[ni].id)) {
+        bad++;
+        detail.push(`${p.id} ${p.kind} by ${roster[ni].id}`);
+      }
+    }
+
+    // Crossings. Stone iff both towns the road joins quarry, or the crossing
+    // itself came up within STONE_BRIDGE_REACH of bare rock.
+    for (const b of map.bridges) {
+      const road = map.roads.find((r) => r.id === b.roadId);
+      if (!road) {
+        bad++;
+        detail.push(`${b.id} orphan road ${b.roadId}`);
+        continue;
+      }
+      const qa = rosterQuarry.get(road.from);
+      const qz = rosterQuarry.get(road.to);
+      const rock = outc.length
+        ? Math.min(...outc.map((o) => d2(uvOf(b), uvOf(o)) - o.radius))
+        : Infinity;
+      const want = (qa && qz) || rock <= STONE_BRIDGE_REACH + 1e-6;
+      if (want !== (b.material === 'stone')) {
+        bad++;
+        detail.push(
+          `${b.id} ${b.material ?? 'timber'} but ${road.from}/${road.to} ${
+            qa ? 'stone' : 'timber'
+          }/${qz ? 'stone' : 'timber'}, rock ${rock === Infinity ? '-' : f1(rock)}`
+        );
+      }
+      if (b.material !== undefined && b.material !== 'stone') {
+        bad++;
+        detail.push(`${b.id} explicit-timber`);
+      }
+    }
+
     for (const s of map.sites) {
       const stone = s.buildings.filter((b) => b.material === 'stone').length;
       const timber = s.buildings.filter((b) => b.material !== undefined && b.material !== 'stone').length;
@@ -1116,11 +1225,17 @@ function checks(seed, map, scale = 1) {
         detail.push(`${s.id} no stone yard`);
       }
     }
-    const stoneTowns = map.sites.filter(isQuarryTown).length;
+    const stoneTowns = quarry.filter(Boolean).length;
+    const stoneBr = map.bridges.filter((b) => b.material === 'stone').length;
+    const dryRuns = map.scatter.filter(
+      (p) => p.kind === 'drystoneL' || p.kind === 'drystoneR'
+    ).length;
     check(
       'x  quarry towns coherent',
       bad === 0,
-      detail.length ? detail.join(', ') : `${stoneTowns}/${map.sites.length} stone towns`
+      detail.length
+        ? detail.join(', ')
+        : `${stoneTowns}/${map.sites.length} stone towns, ${stoneBr}/${map.bridges.length} stone bridges, ${dryRuns} drystone panels`
     );
   }
 

@@ -91,9 +91,14 @@ export interface TreeSpec {
 
 /** Non-tree scenery. Kinds must be ones the vale's art.ts can draw:
  * bush | rock | flowers | reeds | stump | crop | haystack | fenceL | fenceR |
- * shed | cart | crates | lumber | barrels | well | lamp | signpost |
- * nameboard | stake | campfire | sheep | crane | quarry-blocks | jetty |
- * rowboat
+ * drystoneL | drystoneR | shed | cart | crates | lumber | barrels | well |
+ * lamp | lamp-stone | signpost | nameboard | stake | campfire | sheep | crane |
+ * quarry-blocks | jetty | rowboat
+ *
+ * `drystoneL/R` and `lamp-stone` are the stone forms of `fenceL/R` and `lamp`.
+ * They share their timber twin's footprint and anchor exactly, and which of the
+ * pair gets emitted is a pure function of the nearest town's quarry-ness — no
+ * randomness is spent on the choice.
  */
 export interface PropSpec {
   id: string; // "pr88" (site dressing gets site prefix, e.g. "s2-well")
@@ -235,6 +240,18 @@ export interface BridgeSpec {
   gx: number;
   gy: number;
   span: number; // tiles, ~3.5..5
+  /**
+   * What the crossing is BUILT of. Absent means 'timber' — the pilings, plank
+   * deck and rail every bridge was before quarry towns had anything to say
+   * about it, so an older fixture or a hand-written spec draws what it drew.
+   *
+   * 'stone' is masonry piers, an arch and a slate-coped parapet over exactly
+   * the same footprint and span. Like BuildingSpec.material it is a pure
+   * function of the FULL roster and the terrain — both towns the road joins
+   * quarry, or the crossing itself lands within STONE_BRIDGE_REACH of bare
+   * rock — so it costs no randomness and never moves under the pace scale.
+   */
+  material?: BuildMaterial;
 }
 
 /**

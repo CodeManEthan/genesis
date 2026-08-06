@@ -1507,8 +1507,10 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
         // enough that somebody gets a day's fishing out of it. (One draw, like
         // every other branch here, so the stream shape does not move.)
         t = second + range(0.3, 1.5);
-      } else if (kind === 'lamp') {
-        t = range(17.9, 19.2); // lit at dusk
+      } else if (kind === 'lamp' || kind === 'lamp-stone') {
+        // A quarry town's lamp stands on a stone post; it is still a lamp and
+        // is still lit at dusk. Same branch, so the same single draw.
+        t = range(17.9, 19.2);
       } else {
         t = lo + ((i + 1) / (props.length + 1)) * (hi - lo) + range(-0.2, 0.2);
       }

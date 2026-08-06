@@ -58,6 +58,9 @@ import {
   buildCrane,
   buildCrates,
   buildCropRow,
+  /* ---- stone past the walls (additive) ---- */
+  buildDrystone,
+  /* ---- end stone past the walls (additive) ---- */
   buildFence,
   buildFlowerPatch,
   buildForestPattern,
@@ -79,6 +82,9 @@ import {
   buildShed,
   buildSignpost,
   buildStake,
+  /* ---- stone past the walls (additive) ---- */
+  buildStoneLamp,
+  /* ---- end stone past the walls (additive) ---- */
   /* ---- standing stones (additive) ---- */
   buildStones,
   /* ---- end standing stones (additive) ---- */
@@ -137,6 +143,7 @@ import {
   /* ---- standing stones (additive) ---- */
   type StoneSpec,
   /* ---- end standing stones (additive) ---- */
+  type BuildMaterial,
   type SiteSpec,
   type TreeSpec,
   type Vec2,
@@ -228,6 +235,14 @@ export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
     haystack: pool(4, (i) => buildHaystack(79 + i * 5)),
     fenceL: pool(1, () => buildFence('l')),
     fenceR: pool(1, () => buildFence('r')),
+    /* ---- stone past the walls (additive) ---- *
+     * The same run of field boundary, walled rather than fenced, on the lanes
+     * whose nearest town quarries. Pooled deeper than the picket panel because
+     * every stone in one is irregular and one repeated wall reads as wallpaper.
+     * ------------------------------------------------------------------------ */
+    drystoneL: pool(3, (i) => buildDrystone('l', 149 + i * 37)),
+    drystoneR: pool(3, (i) => buildDrystone('r', 151 + i * 41)),
+    /* ---- end stone past the walls (additive) ---- */
     shed: pool(4, (i) => buildShed(83 + i * 31)),
     cart: pool(2, (i) => buildCart(i === 0)),
     crates: pool(3, (i) => buildCrates(89 + i * 13)),
@@ -235,6 +250,9 @@ export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
     barrels: pool(3, (i) => buildBarrels(101 + i * 19)),
     well: pool(1, () => buildWell()),
     lamp: pool(1, () => buildLamp()),
+    /* ---- stone past the walls (additive) ---- */
+    'lamp-stone': pool(1, () => buildStoneLamp()),
+    /* ---- end stone past the walls (additive) ---- */
     sheep: pool(3, (i) => buildSheep(103 + i * 23)),
     campfire: pool(1, () => buildCampfire()),
     // Buried treasure, in its three states. Never a PropSpec — chests are their
@@ -3187,7 +3205,7 @@ export function renderGenesis(
   for (const br of scene.map.bridges) {
     const stage = snap.bridges.get(br.id) ?? 0;
     if (!stage) continue;
-    drawBridge(g, scene.map.river, br.gx, br.gy, br.span, stage);
+    drawBridge(g, scene.map.river, br.gx, br.gy, br.span, stage, br.material);
   }
   if (P) lap('roads');
 
@@ -3264,11 +3282,14 @@ export function renderGenesis(
     for (const p of site.props) {
       const slot = scene.veg.props[pi++];
       if (slot < 0 || !scene.veg.on[slot]) continue;
-      if (sky.lamps > 0.02 && (p.kind === 'lamp' || p.kind === 'campfire')) {
+      // A stone post carries the same lantern at the same height as an iron
+      // one, so it throws exactly the same light — the kind string is the only
+      // thing that differs and the halo must not notice.
+      const lamp = p.kind === 'lamp' || p.kind === 'lamp-stone';
+      if (sky.lamps > 0.02 && (lamp || p.kind === 'campfire')) {
         const x = isoX(p.gx, p.gy);
         const y = isoY(p.gx, p.gy);
         if (inView(x, y)) {
-          const lamp = p.kind === 'lamp';
           halos.push({
             x,
             y: y - (lamp ? 14 : 2),
@@ -3785,14 +3806,27 @@ export function drawFord(ctx: Ctx, river: Vec2[], gx: number, gy: number, span: 
   }
 }
 
-/** A bridge at one of its three build stages. Exported for the catalog. */
+/**
+ * A bridge at one of its three build stages. Exported for the catalog.
+ *
+ * `material` mirrors BuildingSpec's and BridgeSpec's: absent is the timber
+ * crossing this has always drawn — pilings, plank deck, rail — and 'stone' is
+ * the masonry one a quarry road builds instead. The two share this function's
+ * orientation and footprint maths exactly, because they share a footprint and a
+ * span exactly: only what stands on it differs.
+ *
+ *   stage 1   timber: pilings driven in    stone: piers set in the bed
+ *   stage 2   timber: deck boards          stone: the arch springs, deck over it
+ *   stage 3   timber: rails                stone: slate-coped parapets
+ */
 export function drawBridge(
   ctx: Ctx,
   river: Vec2[],
   gx: number,
   gy: number,
   span: number,
-  stage: 1 | 2 | 3
+  stage: 1 | 2 | 3,
+  material?: BuildMaterial
 ): void {
   // Orient the deck across the local current, exactly like the Vale does.
   let bi = 0;
@@ -3817,16 +3851,129 @@ export function drawBridge(
     return [isoX(px, py), isoY(px, py)];
   };
 
-  // Stage 1 — pilings driven into the ford.
-  for (let k = -half; k <= half + 0.01; k += 1.1) {
-    for (const side of [-1, 1]) {
-      const p = corner(Math.min(k, half), side * depth);
-      rect(ctx, p[0] - 1, p[1] - 10, 2, 12, PAL.woodDark);
-      rect(ctx, p[0] - 1, p[1] - 11, 2, 1, PAL.wood);
+  /* ---- stone past the walls (additive) ---- *
+   * Everything above is the shared geometry and stays shared. Below, each of
+   * the three stages picks its trade. The stone side keeps to the same
+   * `corner()` footprint the timber side uses, so a bridge that changes
+   * material does not move by a pixel.
+   * ------------------------------------------------------------------------ */
+  const stone = material === 'stone';
+  /** Masonry, its shaded face, and the near-black of a joint. */
+  const M = PAL.masonry;
+  const MS = PAL.masonryShade;
+  const MD = shade(PAL.masonryShade, -0.28);
+  /** Slate coping, and the light catching its top arris. */
+  const COPE = mix(PAL.slate, PAL.masonry, 0.34);
+  const COPE_LIT = mix(PAL.slate, PAL.masonry, 0.62);
+  /** Which bank of the deck faces the camera — the one further down-screen. */
+  const front = corner(0, depth)[1] > corner(0, -depth)[1] ? depth : -depth;
+  /** Deck edges, in draw order: the far parapet goes up before the near one. */
+  const sides: number[] =
+    corner(0, -depth)[1] <= corner(0, depth)[1] ? [-depth, depth] : [depth, -depth];
+
+  if (stone && stage === 1) {
+    // Stage 1 — the piers, and only at stage 1. Unlike a piling, which stays in
+    // sight for the life of the bridge and ends up as a rail post, a pier is
+    // swallowed by the arch that is turned over it: from stage 2 on, what the
+    // camera sees at the springings is the spandrel, not the block behind it.
+    const PIER = 9;
+    for (const k of [-half * 0.72, half * 0.72]) {
+      const q: Pt[] = [
+        corner(k - 0.34, -depth),
+        corner(k + 0.34, -depth),
+        corner(k + 0.34, depth),
+        corner(k - 0.34, depth),
+      ];
+      // The block, drawn as a curtain hung off every edge of the footprint
+      // rather than off the two the camera can see. A river runs at whatever
+      // bearing it likes, and at some of them one of those two faces is edge-on
+      // and the other carries the whole block — picking them by name gives two
+      // piers of the same bridge different silhouettes. Overdraw in one tone
+      // costs nothing and is the same shape from every direction.
+      for (let i = 0; i < 4; i++) {
+        const p = q[i];
+        const n = q[(i + 1) % 4];
+        poly(ctx, [[p[0], p[1] - PIER], [n[0], n[1] - PIER], [n[0], n[1]], [p[0], p[1]]], MS);
+      }
+      poly(ctx, q.map((p) => [p[0], p[1] - PIER] as Pt), M);
+      const x0 = Math.min(q[0][0], q[1][0], q[2][0], q[3][0]);
+      const x1 = Math.max(q[0][0], q[1][0], q[2][0], q[3][0]);
+      const yb = Math.max(q[0][1], q[1][1], q[2][1], q[3][1]);
+      // The wet course at the waterline, two laid courses above it, and the
+      // arris where the cap meets the face — which is what keeps an iso box
+      // from reading as a flat rectangle when the deck happens to lie square.
+      rect(ctx, x0, yb - 2, x1 - x0, 2, MD);
+      for (const h of [3, 6]) rect(ctx, x0, yb - PIER + h, x1 - x0, 1, MD);
+      rect(ctx, x0, yb - PIER, x1 - x0, 1, shade(M, 0.24));
+    }
+  } else if (!stone) {
+    // Stage 1 — pilings driven into the ford.
+    for (let k = -half; k <= half + 0.01; k += 1.1) {
+      for (const side of [-1, 1]) {
+        const p = corner(Math.min(k, half), side * depth);
+        rect(ctx, p[0] - 1, p[1] - 10, 2, 12, PAL.woodDark);
+        rect(ctx, p[0] - 1, p[1] - 11, 2, 1, PAL.wood);
+      }
     }
   }
 
-  if (stage >= 2) {
+  if (stone && stage >= 2) {
+    // Stage 2 — the arch springs and the causeway goes over it.
+    //
+    // The spandrel is drawn a screen column at a time rather than as a polygon,
+    // because the one shape that matters here is the void UNDER it: a half
+    // round rising out of the water, which is exactly the thing a scanline fill
+    // of an outline cannot give you cheaply.
+    const a0 = corner(-half, front);
+    const a1 = corner(half, front);
+    const lo = a0[0] <= a1[0] ? a0 : a1;
+    const hi = a0[0] <= a1[0] ? a1 : a0;
+    const run = hi[0] - lo[0] || 1;
+    /** Spandrel drop below the deck, and how high the arch bites into it. */
+    const FACE = 10;
+    const RISE = 7.5;
+    for (let x = Math.round(lo[0]); x <= Math.round(hi[0]); x++) {
+      const t = (x - lo[0]) / run;
+      const y = lo[1] + (hi[1] - lo[1]) * t;
+      // The arch occupies the middle of the span; either end is solid abutment.
+      const a = (t - 0.13) / 0.74;
+      const bite = a > 0 && a < 1 ? RISE * Math.sqrt(Math.max(0, 1 - (2 * a - 1) ** 2)) : 0;
+      const h = FACE - bite;
+      if (h <= 0) continue;
+      rect(ctx, x, y, 1, h, x % 7 === 0 ? MD : MS);
+      // The ring of voussoirs following the curve — the one course of the whole
+      // job that is cut to a curve, so it is the one that catches the light.
+      if (bite > 0.5) rect(ctx, x, y + h - 2, 1, 2, x % 7 === 0 ? MS : M);
+    }
+    // The causeway: flagged, kerbed, and a shade lighter than the walls under it.
+    poly(
+      ctx,
+      [corner(-half, -depth), corner(half, -depth), corner(half, depth), corner(-half, depth)],
+      MD
+    );
+    poly(
+      ctx,
+      [
+        corner(-half, -depth + 0.22),
+        corner(half, -depth + 0.22),
+        corner(half, depth - 0.22),
+        corner(-half, depth - 0.22),
+      ],
+      mix(M, PAL.stoneLight, 0.4)
+    );
+    for (let k = -half + 0.6; k < half - 0.2; k += 1.2) {
+      poly(
+        ctx,
+        [
+          corner(k, -depth + 0.3),
+          corner(k + 0.08, -depth + 0.3),
+          corner(k + 0.08, depth - 0.3),
+          corner(k, depth - 0.3),
+        ],
+        mix(M, PAL.stone, 0.5)
+      );
+    }
+  } else if (stage >= 2) {
     poly(
       ctx,
       [corner(-half, -depth), corner(half, -depth), corner(half, depth), corner(-half, depth)],
@@ -3856,7 +4003,47 @@ export function drawBridge(
     }
   }
 
-  if (stage >= 3) {
+  if (stone && stage >= 3) {
+    // Stage 3 — parapets, slate on the crown. Far side first, so the near wall
+    // reads as standing in front of the causeway rather than behind it.
+    const WALL = 8;
+    for (const d of sides) {
+      const a = corner(-half, d);
+      const b = corner(half, d);
+      const near = d === front;
+      poly(
+        ctx,
+        [[a[0], a[1] - WALL], [b[0], b[1] - WALL], [b[0], b[1] - 1], [a[0], a[1] - 1]],
+        // The near wall shows its outer face and the far one its inner: one is
+        // in the light and the other is looking away from it.
+        near ? M : shade(MS, -0.12)
+      );
+      for (let k = -half + 0.55; k < half; k += 1.05) {
+        const p = corner(k, d);
+        rect(ctx, p[0], p[1] - WALL + 1, 1, WALL - 2, MD);
+      }
+      poly(
+        ctx,
+        [
+          [a[0], a[1] - WALL - 2.2],
+          [b[0], b[1] - WALL - 2.2],
+          [b[0], b[1] - WALL + 0.4],
+          [a[0], a[1] - WALL + 0.4],
+        ],
+        COPE
+      );
+      poly(
+        ctx,
+        [
+          [a[0], a[1] - WALL - 2.2],
+          [b[0], b[1] - WALL - 2.2],
+          [b[0], b[1] - WALL - 1.2],
+          [a[0], a[1] - WALL - 1.2],
+        ],
+        COPE_LIT
+      );
+    }
+  } else if (stage >= 3) {
     for (const side of [-1, 1]) {
       const a = corner(-half, side * depth);
       const b = corner(half, side * depth);
@@ -3876,6 +4063,7 @@ export function drawBridge(
       }
     }
   }
+  /* ---- end stone past the walls (additive) ---- */
 }
 
 /** The pixels thrown up when a lid comes off. Over everything, like the smoke. */

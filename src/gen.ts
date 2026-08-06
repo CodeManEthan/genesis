@@ -664,6 +664,16 @@ function makeOutcrops(
  */
 export const QUARRY_REACH = 6;
 
+/**
+ * How near a river crossing has to come to bare rock before the crossing is
+ * built out of it, whatever the towns at either end build in. Measured from the
+ * crossing to the outcrop's rim, so it means what it says however big the rock.
+ *
+ * Generous next to QUARRY_REACH on purpose: a town has to LIVE beside its
+ * quarry, a bridge only has to be within carting distance of one.
+ */
+export const STONE_BRIDGE_REACH = 8;
+
 const quarriesFrom = (u: number, v: number, r: number, outcrops: Outcrop[]): Outcrop | null => {
   let best: Outcrop | null = null;
   let bd = Infinity;
@@ -2255,6 +2265,15 @@ function buildMap(seed: number, scale: number): GenesisMap {
   /** How many of the roster actually get founded today. */
   const nSites = clamp(Math.round(nBase * siteFactor(S)), 2, sites.length);
 
+  /**
+   * The outcrop each town quarries, or null. Read off the FULL roster and the
+   * terrain alone, so a town is a quarry town at every pace or at none — which
+   * is what lets everything downstream of it (walls, roofs, the stone yard, the
+   * bridges its roads carry, its lamps and its field walls) be chosen as a pure
+   * function of it, without a single extra draw from any stream.
+   */
+  const siteQuarry = sites.map((s) => quarriesFrom(s.u, s.v, s.r, outcrops));
+
   /* ---- road network ---------------------------------------------------- */
   // Every town joins via the NEAREST town founded before it — Prim's rule, but
   // with "already connected" pinned to the roster order rather than to Prim's
@@ -2368,12 +2387,29 @@ function buildMap(seed: number, scale: number): GenesisMap {
     // by the road class alone — no rng, so the main stream is untouched. A
     // highway or a lane has carts on it and gets a bridge; a track is a line
     // of footfall and a pack pony, and it simply goes through the water.
+    // Both towns quarry, so the masons are at both ends of the job and there is
+    // nobody left who would rather have planks. Decided once per road.
+    const stoneEnds = siteQuarry[a] !== null && siteQuarry[b] !== null;
     for (const p of crossings(line, river)) {
       const [cgx, cgy] = uv(p[0], p[1]);
       if (kind === 'track') {
         fords.push({ id: `fd${fords.length}`, roadId: id, gx: cgx, gy: cgy, span: 3.4 });
       } else {
-        bridges.push({ id: `br${bridges.length}`, roadId: id, gx: cgx, gy: cgy, span: 4.2 });
+        // …or the crossing itself comes up beside bare rock, in which case the
+        // material is lying on the bank and only a fool would cart timber to it.
+        // Both tests are pure functions of the full roster and the terrain, so
+        // the material costs no draw and is the same at every pace.
+        let rock = Infinity;
+        for (const o of outcrops) rock = Math.min(rock, dist(p, [o.u, o.v]) - o.radius);
+        const stone = stoneEnds || rock <= STONE_BRIDGE_REACH;
+        bridges.push({
+          id: `br${bridges.length}`,
+          roadId: id,
+          gx: cgx,
+          gy: cgy,
+          span: 4.2,
+          ...(stone ? { material: 'stone' as const } : null),
+        });
       }
     }
   });
@@ -2767,12 +2803,6 @@ function buildMap(seed: number, scale: number): GenesisMap {
   /** Plots the town would reach at the baseline pace, and at the busiest. */
   const siteBuiltBase: number[] = [];
   const siteBuiltMax: number[] = [];
-
-  /**
-   * The outcrop each town quarries, or null. Read off the FULL roster and the
-   * terrain alone, so a town is a quarry town at every pace or at none.
-   */
-  const siteQuarry = sites.map((s) => quarriesFrom(s.u, s.v, s.r, outcrops));
 
   sites.forEach((site, si) => {
     const brng = mulberry32((seed * 7919 + si * 104729 + 17) >>> 0);
@@ -3247,6 +3277,19 @@ function buildMap(seed: number, scale: number): GenesisMap {
       }
       return 'meadow';
     };
+    /** Roster index of the town whose ground this is. FULL roster, always. */
+    const nearestSite = (p: Pt): number => {
+      let best = 0;
+      let bd = Infinity;
+      for (let i = 0; i < sites.length; i++) {
+        const d = dist(p, [sites[i].u, sites[i].v]);
+        if (d < bd) {
+          bd = d;
+          best = i;
+        }
+      }
+      return best;
+    };
     const fenceOk = (p: Pt): boolean => {
       if (p[0] < bounds.u0 + 1 || p[0] > bounds.u1 - 1) return false;
       if (p[1] < bounds.v0 + 1 || p[1] > bounds.v1 - 1) return false;
@@ -3278,7 +3321,6 @@ function buildMap(seed: number, scale: number): GenesisMap {
       const near = polyNear(at, line);
       // Nearest isometric diagonal to the lane: (1,1) is +gx, (-1,1) is +gy.
       const alongGx = Math.abs(near.tu + near.tv) >= Math.abs(near.tv - near.tu);
-      const kind = alongGx ? 'fenceL' : 'fenceR';
       const sgn =
         (alongGx ? near.tu + near.tv : near.tv - near.tu) >= 0 ? 1 : -1;
       const step: Pt = alongGx
@@ -3300,9 +3342,18 @@ function buildMap(seed: number, scale: number): GenesisMap {
       if (run.length < 3) continue;
       run.forEach((p, k) => {
         const [gx, gy] = uv(p[0], p[1]);
+        // A field boundary takes after the town whose field it is: a quarry
+        // town walls its ground in the stone already lying about, a meadow town
+        // splits timber for it. Read per PANEL, off the FULL roster — the same
+        // list the quarry-ness itself is read off — so it is a pure function of
+        // the terrain: no draw is spent on it, the stream shape is untouched,
+        // and a run that happens to cross the ground between a stone town and a
+        // timber one changes hands halfway along, which is what a boundary
+        // between two parishes has always looked like.
+        const dry = siteQuarry[nearestSite(p)] !== null;
         scatter.push({
           id: `pr${scatter.length}`,
-          kind,
+          kind: alongGx ? (dry ? 'drystoneL' : 'fenceL') : (dry ? 'drystoneR' : 'fenceR'),
           gx,
           gy,
           seed: (seed + runs * 1741 + k * 59) >>> 0,
@@ -3665,9 +3716,14 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
     add(`${site.id}-sign`, 'nameboard', spot(0.8, signA), 21 + si);
 
+    // A quarry town's lamps stand on dressed stone posts rather than on iron:
+    // same lantern, same height, same hour it is lit. Pure function of the
+    // town's quarry-ness, which is read off the full roster, so the kind is the
+    // only thing that changes and it changes at every pace or at none.
+    const lampKind = siteQuarry[si] ? 'lamp-stone' : 'lamp';
     const lamps = site.r > 6.5 ? 2 : 1;
     for (let i = 0; i < lamps; i++) {
-      add(`${site.id}-lamp${i}`, 'lamp', spot(0.44, signA + Math.PI * (0.6 + i)), 31 + i + si * 3);
+      add(`${site.id}-lamp${i}`, lampKind, spot(0.44, signA + Math.PI * (0.6 + i)), 31 + i + si * 3);
     }
 
     // A finger post where three or more lanes meet.
