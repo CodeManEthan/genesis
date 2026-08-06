@@ -21,6 +21,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TH, TW, hashSeed, type GenesisMap, type Timeline, type WorldSnapshot } from './types';
+import { dayInfo } from './daytype.ts';
 import {
   buildGenesisScene,
   makeAmbient,
@@ -171,6 +172,27 @@ function dayKey(d = new Date()): string {
 }
 
 const daySeed = (d?: Date) => hashSeed(dayKey(d));
+
+/**
+ * Which month a seed belongs to, or null if it belongs to no date at all.
+ *
+ * This is the one place that knows whether a seed came out of the calendar, and
+ * it is the only thing the season needs: a LIVE world — and the one waiting on
+ * the other side of midnight — is in the season the visitor is actually in,
+ * while a browsed seed has no month and derives a season of its own, so ‹ and ›
+ * walk through the year as well as through the valleys.
+ */
+function monthOfSeed(seed: number): number | null {
+  const now = new Date();
+  for (let k = -1; k <= 1; k++) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + k, 12);
+    if (daySeed(d) === seed) return d.getMonth() + 1;
+  }
+  return null;
+}
+
+/** What kind of day this seed is, and what time of year. */
+const dayFor = (seed: number) => dayInfo(seed, monthOfSeed(seed));
 
 /** Tomorrow's seed, for pre-generating the world the clock is about to reach. */
 function nextDaySeed(): number {
@@ -375,7 +397,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       setTDisp(t0);
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
-      sceneRef.current = buildGenesisScene(world.map);
+      sceneRef.current = buildGenesisScene(world.map, dayFor(seed0));
       ambRef.current = makeAmbient(pace0);
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
       logSigRef.current = logSig(snapRef.current.log);
@@ -537,7 +559,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         seed: s,
         pace: paceRef.current,
         world: w,
-        scene: buildGenesisScene(w.map),
+        scene: buildGenesisScene(w.map, dayFor(s)),
       };
       return pending;
     };
@@ -551,7 +573,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pending = null;
       world = loadWorld(s, p);
       worldRef.current = world;
-      scene = buildGenesisScene(world.map);
+      scene = buildGenesisScene(world.map, dayFor(s));
       sceneRef.current = scene;
       setAmbientPace(amb, p);
       snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);

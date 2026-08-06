@@ -88,6 +88,16 @@ import {
   type StructureSprite,
 } from '../vale/art';
 import {
+  PLAIN_DAY,
+  auroraAt,
+  eclipseAt,
+  mistAt,
+  stormAt,
+  workPace,
+  type DayInfo,
+  type Season,
+} from './daytype.ts';
+import {
   TH,
   TW,
   isoX,
@@ -109,9 +119,13 @@ function pool<T>(n: number, make: (i: number) => T): T[] {
 }
 
 /** The scenery sprite pools, one entry per prop/tree kind. Exported so the
- * catalog page can enumerate every kind the simulation can draw. */
-export function makePools(): Record<string, Sprite[]> {
-  return {
+ * catalog page can enumerate every kind the simulation can draw.
+ *
+ * `season` repaints the deciduous pools once, at bake, on the finished pixels —
+ * see `seasonCanvas`. Omitted, the pools are the summer art they have always
+ * been, which is what the catalog draws. */
+export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
+  const pools: Record<string, Sprite[]> = {
     oak: pool(6, (i) => buildTree(0, 11 + i * 37)),
     pine: pool(6, (i) => buildTree(1, 23 + i * 41)),
     blossom: pool(4, (i) => buildTree(2, 31 + i * 43)),
@@ -138,6 +152,10 @@ export function makePools(): Record<string, Sprite[]> {
     sheep: pool(3, (i) => buildSheep(103 + i * 23)),
     campfire: pool(1, () => buildCampfire()),
   };
+  if (season !== 'summer') {
+    for (const k of DECIDUOUS) for (const sp of pools[k]) seasonCanvas(sp.c, season);
+  }
+  return pools;
 }
 
 const TREE_POOL: Record<string, string> = {
@@ -296,6 +314,15 @@ export interface GenesisScene {
   lit: boolean;
   /** How many structures may be re-baked for a lit/unlit flip this frame. */
   relight: number;
+  /**
+   * What kind of day this is and what time of year, decided by the caller that
+   * knows where the seed came from. Constant for the life of the bake, which is
+   * exactly one day — so the season is baked into the ground and the leaves,
+   * and only the weather is a per-frame overlay.
+   */
+  day: DayInfo;
+  /** Flat colour under the woodland pattern, seasoned to match it. */
+  beyond: string;
 }
 
 export interface GView {
@@ -437,7 +464,13 @@ export function paintRoad(
 
 /* ---------------------------------- bake --------------------------------- */
 
-export function buildGenesisScene(map: GenesisMap): GenesisScene {
+/**
+ * @param day What kind of day, and what time of year. The season reaches the
+ *   ground tint and the leaf pools from here and nowhere else; the day type is
+ *   kept on the scene for the overlays and the sky. Defaults to an ordinary
+ *   summer day, which is the world exactly as it was before rare days existed.
+ */
+export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): GenesisScene {
   const B = map.bounds;
   const x0 = B.u0 * (TW / 2);
   const x1 = B.u1 * (TW / 2);
@@ -498,6 +531,8 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
   };
 
   const grng = mulberry32(1337);
+  const grassEdge = seasonGround(PAL.grassEdge, day.season);
+  const tuft = seasonGround(PAL.leafDark, day.season);
   for (let v = Math.floor(B.v0) - OVER_V; v <= Math.ceil(B.v1) + OVER_V; v++) {
     for (let u = Math.floor(B.u0) - OVER_U; u <= Math.ceil(B.u1) + OVER_U; u++) {
       if ((u + v) & 1) continue;
@@ -512,7 +547,7 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
         Math.sin((gx + gy) * 0.21 + 1.7) * 0.2;
       const h = (Math.imul(u | 0, 374761393) ^ Math.imul(v | 0, 668265263)) >>> 0;
       const jitter = [0.0, -0.035, 0.04, -0.015][h % 4];
-      let col = shade(rgbHex(tintAt(u, v)), jitter + n * 0.05);
+      let col = shade(seasonGround(rgbHex(tintAt(u, v)), day.season), jitter + n * 0.05);
 
       const glade = gladeAt(gx, gy);
       if (glade > 0) col = mix(col, PAL.dirtPale, glade * 0.3);
@@ -521,10 +556,10 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
 
       const r = grng();
       if (glade < 0.4 && r < 0.09) {
-        rect(ctx, sx - 4, sy + 1, 2, 1, PAL.grassEdge);
-        rect(ctx, sx + 2, sy - 2, 2, 1, PAL.grassEdge);
+        rect(ctx, sx - 4, sy + 1, 2, 1, grassEdge);
+        rect(ctx, sx + 2, sy - 2, 2, 1, grassEdge);
       } else if (glade < 0.4 && r < 0.12) {
-        rect(ctx, sx, sy - 1, 1, 2, PAL.leafDark);
+        rect(ctx, sx, sy - 1, 1, 2, tuft);
         rect(ctx, sx, sy - 3, 1, 1, PAL.flower[h % PAL.flower.length]);
       } else if (glade > 0.5 && r < 0.06) {
         rect(ctx, sx - 2, sy, 3, 1, PAL.dirtEdge);
@@ -565,15 +600,20 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
   const siteProps = new Map<string, { p: PropSpec; accent: string }>();
   for (const s of map.sites) for (const p of s.props) siteProps.set(p.id, { p, accent: s.accent });
 
+  // The endless woodland beyond the map is mostly conifer, so it only half
+  // turns — but it has to turn, or the map sits in a summer frame all winter.
+  const surround = buildForestPattern();
+  seasonCanvas(surround, day.season, 0.6);
+
   const scene: GenesisScene = {
     map,
     layer,
     lx,
     ly,
     veg: null as unknown as VegLayer,
-    surround: buildForestPattern(),
+    surround,
     frame: document.createElement('canvas'),
-    pools: makePools(),
+    pools: makePools(day.season),
     extra: new Map(),
     structs: new Map(),
     roadGeo,
@@ -587,6 +627,8 @@ export function buildGenesisScene(map: GenesisMap): GenesisScene {
     glow: null,
     lit: false,
     relight: 0,
+    day,
+    beyond: seasonGround('#3f7f66', day.season),
   };
   scene.veg = buildVeg(scene, W, H);
   return scene;
@@ -1133,8 +1175,11 @@ export function stepAmbient(
   scene: GenesisScene,
   amb: Ambient,
   snap: WorldSnapshot,
-  dt: number
+  dtIn: number
 ): void {
+  // The crews shelter while it rains, which is the same thing the timeline
+  // does to the work itself — the valley slows down and then hurries.
+  const dt = dtIn * workPace(scene.day, snap.t);
   const rng = amb.rng;
   const rate = paceRate(amb);
 
@@ -1303,7 +1348,289 @@ export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnaps
 /** Settle the crowd so a paused or reduced-motion visitor gets a lived-in world. */
 export function settleAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
   syncAmbient(scene, amb, snap);
-  for (let i = 0; i < 120; i++) stepAmbient(scene, amb, snap, 1 / 12);
+  // Settling is measured in world seconds, not weather ones: a crowd dropped
+  // into the middle of a storm still has to finish walking to where it lives.
+  const k = 1 / Math.max(0.05, workPace(scene.day, snap.t));
+  for (let i = 0; i < 120; i++) stepAmbient(scene, amb, snap, k / 12);
+}
+
+/* ====================== rare days, and the turning year ==================== *
+ * Everything in this block is presentation. `gen.ts` never hears about it: a
+ * seed's terrain bytes are the same in January as in July, and the season is a
+ * parameter carried into the *bake* and the *overlays* only.
+ * -------------------------------------------------------------------------- */
+
+/** Hue-rotate/desaturate helpers. Pixel art, so this only ever runs at bake. */
+function rgbHSL(r: number, g: number, b: number): [number, number, number] {
+  const R = r / 255;
+  const G = g / 255;
+  const B = b / 255;
+  const mx = Math.max(R, G, B);
+  const mn = Math.min(R, G, B);
+  const l = (mx + mn) / 2;
+  if (mx === mn) return [0, 0, l];
+  const d = mx - mn;
+  const s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+  let h: number;
+  if (mx === R) h = ((G - B) / d + (G < B ? 6 : 0)) * 60;
+  else if (mx === G) h = ((B - R) / d + 2) * 60;
+  else h = ((R - G) / d + 4) * 60;
+  return [h, s, l];
+}
+
+function hslRGB(h: number, s: number, l: number): [number, number, number] {
+  const H = ((h % 360) + 360) % 360;
+  const S = s < 0 ? 0 : s > 1 ? 1 : s;
+  const L = l < 0 ? 0 : l > 1 ? 1 : l;
+  if (S === 0) {
+    const v = Math.round(L * 255);
+    return [v, v, v];
+  }
+  const q = L < 0.5 ? L * (1 + S) : L + S - L * S;
+  const p = 2 * L - q;
+  const ch = (tc: number) => {
+    let t = tc;
+    if (t < 0) t += 1;
+    if (t > 1) t -= 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [
+    Math.round(ch(H / 360 + 1 / 3) * 255),
+    Math.round(ch(H / 360) * 255),
+    Math.round(ch(H / 360 - 1 / 3) * 255),
+  ];
+}
+
+/**
+ * One leaf pixel, moved into another season.
+ *
+ * Autumn walks green hues into the amber band and leaves an already-warm
+ * hedgerow more or less alone; winter takes the colour out and the light up;
+ * spring pulls everything towards new yellow-green and brightens it. Summer is
+ * the art as drawn, so it never gets here at all.
+ */
+function seasonLeaf(season: Season, r: number, g: number, b: number): [number, number, number] {
+  const [h, s, l] = rgbHSL(r, g, b);
+  const green = h >= 60 && h <= 205;
+  switch (season) {
+    case 'autumn':
+      return hslRGB(
+        green ? 22 + ((h - 60) / 145) * 30 : h >= 285 ? 34 : h,
+        Math.min(0.8, s * 1.02 + 0.14),
+        Math.min(0.74, l * 0.99)
+      );
+    case 'winter':
+      return hslRGB(h + (168 - h) * 0.22, s * 0.34, Math.min(0.9, l * 1.0 + 0.09));
+    case 'spring':
+      return hslRGB(
+        green ? h + (98 - h) * 0.45 : h,
+        Math.min(0.82, s * 1.04 + 0.05),
+        Math.min(0.88, l * 1.04 + 0.05)
+      );
+    default:
+      return [r, g, b];
+  }
+}
+
+/** Trunks, bark and birch chalk: flat palette colours that stay where they are. */
+const BARK = new Set(
+  [PAL.wood, PAL.woodDark, PAL.woodLight, PAL.ink, '#efe9dc', '#cbc2b0', '#e2dbcb'].map(
+    (hex) => parseInt(hex.slice(1), 16) & 0xffffff
+  )
+);
+
+/**
+ * Repaint one already-baked canvas into a season, in place.
+ *
+ * Doing it on the finished pixels rather than inside the sprite factories is
+ * what keeps `art.ts` out of this entirely: the Vale shares that module and its
+ * palette, and neither is touched. Everything opaque that is not on the bark
+ * list is foliage; the soft shadow diamond under each tree is part-transparent
+ * and is skipped by the same test.
+ *
+ * `blend` < 1 leaves the canvas partway between the two seasons, which is what
+ * the deep-woodland surround wants: it is mostly conifer and only half turns.
+ */
+function seasonCanvas(c: HTMLCanvasElement, season: Season, blend = 1): void {
+  if (season === 'summer' || c.width < 1 || c.height < 1) return;
+  const g = c.getContext('2d');
+  if (!g) return;
+  const img = g.getImageData(0, 0, c.width, c.height);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] < 250) continue;
+    if (BARK.has((d[i] << 16) | (d[i + 1] << 8) | d[i + 2])) continue;
+    const [nr, ng, nb] = seasonLeaf(season, d[i], d[i + 1], d[i + 2]);
+    d[i] = d[i] + (nr - d[i]) * blend;
+    d[i + 1] = d[i + 1] + (ng - d[i + 1]) * blend;
+    d[i + 2] = d[i + 2] + (nb - d[i + 2]) * blend;
+  }
+  g.putImageData(img, 0, 0);
+}
+
+/** The pools with leaves that turn. Pine and fir are evergreen and stay put. */
+const DECIDUOUS = ['oak', 'blossom', 'hedgerow', 'birch', 'willow', 'bush'];
+
+/** The ground, one season on. Frost-pale, fresh, as-drawn, or dry and warm. */
+function seasonGround(hex: string, season: Season): string {
+  switch (season) {
+    case 'winter':
+      return mix(hex, '#c6d4d1', 0.46);
+    case 'spring':
+      return mix(hex, '#b8e28c', 0.24);
+    case 'autumn':
+      return mix(hex, '#d6ba74', 0.36);
+    default:
+      return hex;
+  }
+}
+
+/* ------------------------------ the overlays ----------------------------- */
+
+/**
+ * Mist. A flat wash that is heaviest at the far edge and again at the near one,
+ * with three slow banks drifting through the middle of it. Screen-space, in
+ * device pixels, and gone by half past nine.
+ */
+function paintMist(ctx: Ctx, m: number, dw: number, dh: number, clock: number): void {
+  const wash = ctx.createLinearGradient(0, 0, 0, dh);
+  wash.addColorStop(0, `rgba(228,238,242,${0.66 * m})`);
+  wash.addColorStop(0.46, `rgba(222,233,239,${0.3 * m})`);
+  wash.addColorStop(1, `rgba(212,226,235,${0.52 * m})`);
+  ctx.fillStyle = wash;
+  ctx.fillRect(0, 0, dw, dh);
+  for (let i = 0; i < 3; i++) {
+    const h = dh * 0.15;
+    const y = dh * (0.3 + i * 0.24) + Math.sin(clock * 0.05 + i * 2.1) * dh * 0.035;
+    const band = ctx.createLinearGradient(0, y - h, 0, y + h);
+    band.addColorStop(0, 'rgba(238,246,248,0)');
+    band.addColorStop(0.5, `rgba(238,246,248,${0.2 * m})`);
+    band.addColorStop(1, 'rgba(238,246,248,0)');
+    ctx.fillStyle = band;
+    ctx.fillRect(0, y - h, dw, h * 2);
+  }
+}
+
+/**
+ * Rain. Two parallax sheets of diagonal streaks, seeded so each streak keeps
+ * its column frame to frame and only falls; `clock` stands still for a visitor
+ * who asked for reduced motion, which leaves a calm still of wet air.
+ */
+function paintRain(
+  ctx: Ctx,
+  s: number,
+  dw: number,
+  dh: number,
+  clock: number,
+  dpr: number,
+  seed: number
+): void {
+  ctx.save();
+  ctx.fillStyle = `rgba(126,142,164,${0.14 * s})`;
+  ctx.fillRect(0, 0, dw, dh);
+  const slant = 0.3;
+  for (let L = 0; L < 2; L++) {
+    const n = L === 0 ? 90 : 130;
+    const len = (L === 0 ? 26 : 15) * dpr;
+    const fall = (L === 0 ? 1500 : 950) * dpr;
+    const rng = mulberry32(((seed >>> 0) ^ (L === 0 ? 0x9e37 : 0x7f4a)) >>> 0);
+    ctx.strokeStyle = `rgba(224,236,246,${(L === 0 ? 0.42 : 0.24) * s})`;
+    ctx.lineWidth = dpr;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const col = rng() * (dw + dh * slant);
+      const ph = rng();
+      const y = ((ph * (dh + len) + clock * fall) % (dh + len)) - len;
+      const x = col - y * slant;
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + len * slant, y + len);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/**
+ * One aurora curtain, baked once: a soft vertical band, raked into rays, then
+ * masked so it hangs off the top of the frame and fades out before the middle.
+ * Two of them (green and violet) serve every aurora night there will ever be.
+ */
+function curtainSprite(rgb: string, seed: number): HTMLCanvasElement {
+  const W = 192;
+  const H = 256;
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const g = c.getContext('2d')!;
+  const across = g.createLinearGradient(0, 0, W, 0);
+  across.addColorStop(0, `rgba(${rgb},0)`);
+  across.addColorStop(0.5, `rgba(${rgb},1)`);
+  across.addColorStop(1, `rgba(${rgb},0)`);
+  g.fillStyle = across;
+  g.fillRect(0, 0, W, H);
+  // Rays: an aurora is a curtain seen edge-on, so it is striped, not smooth.
+  const rng = mulberry32(seed);
+  g.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < 26; i++) {
+    g.fillStyle = `rgba(0,0,0,${0.14 + rng() * 0.42})`;
+    g.fillRect(rng() * W, 0, 1 + rng() * 4, H);
+  }
+  g.globalCompositeOperation = 'destination-in';
+  const down = g.createLinearGradient(0, 0, 0, H);
+  down.addColorStop(0, 'rgba(0,0,0,1)');
+  down.addColorStop(0.3, 'rgba(0,0,0,0.8)');
+  down.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = down;
+  g.fillRect(0, 0, W, H);
+  return c;
+}
+
+let CURTAINS: HTMLCanvasElement[] | null = null;
+
+/**
+ * Aurora. Three curtains across the top of the frame, added rather than laid
+ * over, so they can only ever brighten a sky that is already dark. The sway is
+ * slow enough to read as standing still, and stops dead for a visitor who asked
+ * for reduced motion — `clock` is the animation loop's, and that loop does not
+ * run for them.
+ */
+function paintAurora(ctx: Ctx, a: number, dw: number, dh: number, clock: number): void {
+  if (!CURTAINS) CURTAINS = [curtainSprite('92,238,172', 4711), curtainSprite('152,112,250', 911)];
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = true;
+  for (let b = 0; b < 3; b++) {
+    const sp = CURTAINS[b === 1 ? 1 : 0];
+    const w = dw * (0.46 + b * 0.06);
+    const h = dh * (0.58 - b * 0.05);
+    const x = dw * (0.16 + b * 0.3) + Math.sin(clock * 0.11 + b * 2.2) * dw * 0.05 - w / 2;
+    ctx.globalAlpha = a * (b === 1 ? 0.32 : 0.38);
+    ctx.drawImage(sp, x, 0, w, h);
+  }
+  ctx.restore();
+}
+
+/** Whatever weather the day has, over the finished frame. */
+function paintWeather(
+  ctx: Ctx,
+  scene: GenesisScene,
+  t: number,
+  clock: number,
+  dw: number,
+  dh: number,
+  dpr: number
+): void {
+  const day = scene.day;
+  if (day.type === 'normal') return;
+  const m = mistAt(day, t);
+  if (m > 0.004) paintMist(ctx, m, dw, dh, clock);
+  const r = stormAt(day, t);
+  if (r > 0.004) paintRain(ctx, r, dw, dh, clock, dpr, scene.map.seed);
+  const a = auroraAt(day, t);
+  if (a > 0.004) paintAurora(ctx, a, dw, dh, clock);
 }
 
 /* ---------------------------------- sky ---------------------------------- */
@@ -1355,7 +1682,18 @@ export interface Sky {
   lamps: number;
 }
 
-export function skyAt(t: number): Sky {
+/**
+ * Two rare days bend this curve rather than sitting on top of it, because both
+ * of them are *the light changing* and not something in front of it.
+ *
+ * An eclipse blends the whole keyframe towards a dusk-dark one and back over
+ * about forty minutes. Everything downstream follows for free: `night` crosses
+ * its threshold, so windows light and lamps get their halos at two in the
+ * afternoon, which is the entire charm of it. A storm blends towards a flat
+ * grey instead, and deliberately stops just short of that threshold — a wet
+ * afternoon is dim, not dark, and nobody lights a lamp for it.
+ */
+export function skyAt(t: number, day: DayInfo = PLAIN_DAY): Sky {
   const h = t <= 0 ? 0 : t >= 24 ? 24 : t;
   let i = 1;
   while (i < SKY.length - 1 && SKY[i][0] < h) i++;
@@ -1365,14 +1703,44 @@ export function skyAt(t: number): Sky {
   let f = (h - a[0]) / span;
   f = f * f * (3 - 2 * f); // smoothstep: no visible kink at a keyframe
   const mix4 = (k: number) => a[k] + (b[k] - a[k]) * f;
-  const alpha = mix4(4);
-  const night = Math.max(0, Math.min(1, (alpha - 0.16) / 0.42));
+  let cr = mix4(1);
+  let cg = mix4(2);
+  let cb = mix4(3);
+  let alpha = mix4(4);
+  let lift = mix4(5);
+  /**
+   * What the *lamps* think the hour is. Normally the same number as `alpha`,
+   * but a storm is allowed to darken the valley a good deal further than it is
+   * allowed to convince anybody it is evening.
+   */
+  let dark = alpha;
+
+  /* ---- the two days that darken the sky itself ------------------------- */
+  const dip = (k: number, tr: number, tg: number, tb: number, ta: number, tl: number) => {
+    cr += (tr - cr) * k;
+    cg += (tg - cg) * k;
+    cb += (tb - cb) * k;
+    alpha += (ta - alpha) * k;
+    lift += (tl - lift) * k;
+  };
+  const ec = eclipseAt(day, h);
+  if (ec > 0) {
+    dip(ec * 0.95, 30, 34, 80, 0.68, 0.05);
+    dark = alpha;
+  }
+  const st = stormAt(day, h);
+  if (st > 0) {
+    dip(st * 0.85, 74, 86, 112, 0.5, 0);
+    dark += (0.3 - dark) * st * 0.8;
+  }
+
+  const night = Math.max(0, Math.min(1, (dark - 0.16) / 0.42));
   // Last lamp out just before midnight; first hearth lit a few minutes after.
   const gate = h > 23.9 ? Math.max(0, (24 - h) / 0.1) : h < 0.25 ? Math.min(1, h / 0.25) : 1;
   return {
-    css: `rgb(${Math.round(mix4(1))},${Math.round(mix4(2))},${Math.round(mix4(3))})`,
+    css: `rgb(${Math.round(cr)},${Math.round(cg)},${Math.round(cb)})`,
     a: alpha,
-    lift: mix4(5),
+    lift,
     night,
     lamps: night * gate,
   };
@@ -1451,7 +1819,7 @@ export function renderGenesis(
   g.setTransform(1, 0, 0, 1, 0, 0);
   g.imageSmoothingEnabled = false;
 
-  const sky = skyAt(snap.t);
+  const sky = skyAt(snap.t, scene.day);
   scene.lit = sky.night > 0.5;
   scene.relight = 4;
   syncVeg(scene, snap);
@@ -1465,7 +1833,7 @@ export function renderGenesis(
   const cy = Math.round(view.cy);
 
   /* ---- beyond the map: endless woodland -------------------------------- */
-  g.fillStyle = '#3f7f66';
+  g.fillStyle = scene.beyond;
   g.fillRect(0, 0, bw, bh);
   const pat = g.createPattern(scene.surround, 'repeat');
   if (pat) {
@@ -1836,6 +2204,9 @@ export function renderGenesis(
     }
     ctx.restore();
   }
+
+  /* ---- and whatever weather this rare day has, last of all ------------- */
+  paintWeather(ctx, scene, snap.t, clock, dw, dh, dpr);
 }
 
 /** A bridge at one of its three build stages. Exported for the catalog. */

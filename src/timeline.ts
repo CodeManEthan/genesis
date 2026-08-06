@@ -35,6 +35,7 @@ import type {
   WorldSnapshot,
 } from './types.ts';
 import { mulberry32 } from './types.ts';
+import { dayTypeOf, stormWarp, type DayType } from './daytype.ts';
 
 /* -------------------------------------------------------------------------- */
 /* small helpers                                                              */
@@ -615,7 +616,10 @@ const POOL_NIGHT_EARLY = [
 ];
 
 const POOL_DAWN = [
-  'Mist sits low in {valley} until the sun gets under it.',
+  // (The mist line that used to sit here now belongs to WEATHER_LOG below: it
+  // is only drawn on a day that actually has mist in it, and on those days it
+  // is a report rather than a turn of phrase.)
+  'Dew off the grass by seven, and the shadows still long at {town}.',
   'First smoke of the day from {town}.',
   'They eat standing up at {town} and start early.',
   'The sun comes over the ridge and {valley} goes the colour of hay.',
@@ -889,6 +893,76 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* rare days                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What the ledger says about a day that is not an ordinary day. One line per
+ * phenomenon, two where the thing has an end worth reporting, and written the
+ * same way as everything else: dry, and about people rather than weather.
+ */
+const WEATHER_LOG: Record<Exclude<DayType, 'normal'>, string[]> = {
+  mist: ['Mist sits low in {valley} until the sun gets under it.'],
+  eclipse: [
+    'Something gets in front of the sun. Lamps lit at two in the afternoon, and the birds fooled.',
+    'The light comes back over {valley}. Nobody says much about it, and the work goes on.',
+  ],
+  storm: [
+    'Rain comes over the ridge and {valley} puts its tools down.',
+    'The rain moves off. Wet timber, and an afternoon to make up before dark.',
+  ],
+  aurora: ['Green light standing over the north ridge. Nobody at {town} goes in.'],
+};
+
+/**
+ * The weather, applied to a finished timeline.
+ *
+ * Two things happen here and nowhere else. A storm *stops the valley*: every
+ * event inside the rain is pushed through `stormWarp`, which is a monotone map
+ * that is the identity outside the afternoon, so the last roof stays exactly
+ * where the pacing solver put it and only the middle of the day is rearranged
+ * into a quiet stretch and a hurried one. And every rare day gets its line or
+ * two in the ledger, placed at the hour the thing is actually visible.
+ *
+ * Deliberately *after* the pace scaling: the weather is a fact about the
+ * afternoon, not about how hard anybody is working.
+ */
+function weather(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
+  const day = dayTypeOf(map.seed);
+  if (day.type === 'normal') return events;
+
+  const out =
+    day.type === 'storm'
+      ? events.map((e) => {
+          const c = { ...e } as GenesisEvent;
+          c.t = stormWarp(day, e.t);
+          return c;
+        })
+      : events.slice();
+
+  // When each line lands: the mist once the light is up and it is a fact rather
+  // than a forecast, the aurora once it is properly out, and the two-line
+  // phenomena on their own edges.
+  const at =
+    day.type === 'mist'
+      ? [day.from + 1.6]
+      : day.type === 'aurora'
+        ? [day.from + 0.5]
+        : [day.from + 0.22, day.to + 0.18];
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x5c0d1e77) >>> 0);
+  const valley = map.valleyName;
+  const town = map.sites.length ? map.sites[Math.floor(rng() * map.sites.length)].name : valley;
+  WEATHER_LOG[day.type].forEach((tpl, i) => {
+    if (i >= at.length) return;
+    out.push({ t: clamp(at[i], 0.01, 23.97), type: 'log', text: fill(tpl, { valley, town }) });
+  });
+
+  for (const e of out) e.t = clamp(e.t, 0.01, 23.97);
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
 /* public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -918,7 +992,7 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
   const events = narrate(map, pl);
 
   const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
-  if (k === 1) return { events };
+  if (k === 1) return { events: weather(map, events) };
 
   // work rate k => everything happens 1/k as far into the day. Events pushed
   // past midnight simply never happen; the array is sorted, so the tail just
@@ -932,7 +1006,7 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
     c.t = t;
     scaled.push(c);
   }
-  return { events: scaled };
+  return { events: weather(map, scaled) };
 }
 
 /** WorldSnapshot is structural; we hang a private cursor off it so that
