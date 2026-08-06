@@ -5308,6 +5308,8 @@ interface WCache {
   /** Is this valley's one night a fox night, and what hour does it start? */
   foxNight: boolean;
   foxAt: number;
+  /** …and if the day happens to be an eclipse, does one come out for that too? */
+  foxDip: boolean;
 }
 
 interface Wildlife {
@@ -5348,6 +5350,17 @@ interface Wildlife {
   /** The hour it appears, and whether tonight's has already been and gone. */
   foxAt: number;
   foxDone: boolean;
+  /**
+   * How dark the eclipse is right now, 0..1, and 0 all day on the other
+   * ninety-seven days in a hundred. Set once a frame in `tickWildlife` — which
+   * runs whether or not the clock is moving, so a frozen tableau in the middle
+   * of a dip is as hunkered-down as a running one.
+   */
+  dip: number;
+  /** Is the fox that is out right now the eclipse's, rather than the night's? */
+  dipFox: boolean;
+  /** Has this eclipse already had its fox? */
+  dipDone: boolean;
   /**
    * True only inside `resetWildlife`'s settle loop. The settle exists so that a
    * paused or reduced-motion arrival opens on a lived-in valley — but a fox is
@@ -5398,6 +5411,29 @@ const FOX_FROM = 22.0;
 const FOX_TO = 23.5;
 /** …and only on one night in three. */
 const FOX_CHANCE = 1 / 3;
+
+/* ---------------------- the eclipse, as the animals read it ----------------
+ * ADDITIVE BLOCK. Every branch it guards is reached through `wl.dip`, which is
+ * `eclipseAt(scene.day, t)` — and that function returns a hard 0 on every day
+ * whose type is not `eclipse`. So in an ordinary valley none of this runs: the
+ * wildlife stream takes the same draws in the same order it always did, and
+ * the animals do the same things in the same frames. Three days in a hundred
+ * it is live, and for about half an hour of one of those the valley behaves as
+ * if somebody had turned the evening on by mistake.
+ *
+ * The thresholds are on the *intensity*, not the clock, so they follow the
+ * window wherever `dayTypeOf` put it and however long it made it.
+ */
+/** How far into the dark before the valley stops believing in the afternoon. */
+const DIP_ON = 0.45;
+/** …and how far before a firefly is fooled into coming up. */
+const DIP_DEEP = 0.72;
+/** The span of dip over which they come up, and go straight back down. */
+const DIP_FADE = 0.16;
+/** How often a false dusk is enough to bring the fox out in daylight. */
+const FOX_DIP_CHANCE = 0.7;
+/** Tiles from the middle of the ground they hold, once they have drawn in. */
+const DIP_HUDDLE = 0.75;
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
@@ -5651,6 +5687,11 @@ function wildCache(scene: GenesisScene): WCache {
    * three" means one seed in three, which is what a visitor actually sees. */
   const foxNight = rr() < FOX_CHANCE;
   const foxAt = FOX_FROM + rr() * 0.8;
+  // APPENDED, and it has to stay appended: `rr` is walked in order, so a draw
+  // taken here changes nothing above it and there is nothing below it that
+  // reads the stream. Every valley that ever had a fox on a given night still
+  // has one, at the same hour.
+  const foxDip = rr() < FOX_DIP_CHANCE;
 
   /* ---- and the biggest piece of standing water, for the ducks ------------ */
   let lake: LakeSpec | null = null;
@@ -5671,6 +5712,7 @@ function wildCache(scene: GenesisScene): WCache {
     lake,
     foxNight,
     foxAt,
+    foxDip,
   };
 }
 
@@ -5753,6 +5795,9 @@ function ensureWild(scene: GenesisScene): Wildlife {
     foxNight: false,
     foxAt: FOX_FROM,
     foxDone: false,
+    dip: 0,
+    dipFox: false,
+    dipDone: false,
     settling: false,
   };
   WILD.set(scene, wl);
@@ -5788,6 +5833,12 @@ export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   wl.foxAt = wl.cache.foxAt;
   wl.foxDone = false;
   wl.fox = null;
+  // How dark it is, before a single settle step runs — otherwise the tableau a
+  // scrub into an eclipse opens on is settled as if it were an ordinary
+  // afternoon and only notices the dark on the frame after.
+  wl.dip = eclipseAt(scene.day, snap.t);
+  wl.dipFox = false;
+  wl.dipDone = false;
   // Whatever the axe has already got to is history, not an event: only a tree
   // that goes under it while we are watching is worth a bird.
   wl.seen.clear();
@@ -5906,6 +5957,17 @@ function tickWildlife(
   // Visible even while frozen: fireflies are lit at 21:30 whether or not the
   // player is running, and deer are standing at the treeline at half six.
   wl.vis = clamp01((sky.night - 0.5) / 0.22) * (snap.t > 23.2 ? clamp01((23.7 - snap.t) / 0.5) : 1);
+  /* ---- and how much of an eclipse there is, if any --------------------- */
+  // 0 on every ordinary day, which is what makes every branch downstream free.
+  wl.dip = eclipseAt(scene.day, snap.t);
+  if (wl.dip > 0) {
+    // An eclipse takes the sky past the fireflies' own threshold on its way
+    // down — `night` reaches 1 at totality — so they would otherwise come up
+    // for the whole of the dark half of it and read as evening. Hold them to
+    // the very bottom instead: a minute or two of confused marsh, out the
+    // moment the light is on its way back.
+    wl.vis = Math.min(wl.vis, clamp01((wl.dip - DIP_DEEP) / DIP_FADE));
+  }
   stepDeerSpawn(wl, snap, dt);
   if (dt > 0) stepWildlife(scene, amb, snap, sky, wl, dt);
   return wl;
@@ -5955,6 +6017,10 @@ function stepBursts(scene: GenesisScene, wl: Wildlife, snap: WorldSnapshot): voi
   });
   // More than a handful at once is a scrub or a fast-forward, not a moment.
   if (!fresh.length || fresh.length > 5) return;
+  // Nothing comes out of the canopy in the dark of an eclipse. The tree still
+  // goes down and the crew still swings — there is simply nothing up there to
+  // startle, because it went to roost twenty minutes ago.
+  if (wl.dip >= DIP_ON) return;
   for (let i = 0; i < Math.min(2, fresh.length); i++) burst(scene, wl, fresh[i]);
 }
 
@@ -6020,7 +6086,10 @@ function inDeerWindow(t: number): boolean {
 /** Spawning is clock-free, so a frozen world still has deer standing in it. */
 function stepDeerSpawn(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
   wl.deerCool -= dt;
-  if (!inDeerWindow(snap.t)) {
+  // A dip counts as a window of its own: the treeline reads the light and not
+  // the clock, and for half an hour the light says it is dusk. They come out
+  // into it, and they melt back into the wood the moment it is over.
+  if (!inDeerWindow(snap.t) && wl.dip < DIP_ON) {
     if (wl.deer.length) wl.deer.length = 0;
     return;
   }
@@ -6028,10 +6097,11 @@ function stepDeerSpawn(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
   const rng = wl.rng;
   const spot = wl.cache.spots[Math.floor(rng() * wl.cache.spots.length)];
   const n = rng() < 0.55 ? 2 : 1;
+  const up = wl.dip >= DIP_ON;
   for (let i = 0; i < n; i++) {
     const gx = spot.gx + (rng() - 0.5) * 2.4;
     const gy = spot.gy + (rng() - 0.5) * 2.4;
-    wl.deer.push({
+    const d: WDeer = {
       gx,
       gy,
       tx: gx,
@@ -6044,15 +6114,34 @@ function stepDeerSpawn(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
       vx: spot.ix,
       vy: spot.iy,
       seed: 900 + Math.floor(rng() * 900),
-    });
+    };
+    // Every draw above is taken whatever the day is; the eclipse overrides the
+    // *answer* and never the stream. Nothing that came out into a dip has its
+    // head down — it came out to look at the sky.
+    if (up) d.head = 0;
+    wl.deer.push(d);
   }
 }
 
 function stepDeer(scene: GenesisScene, amb: Ambient, wl: Wildlife, dt: number): void {
   if (!wl.deer.length) return;
   const rng = wl.rng;
+  const dip = wl.dip >= DIP_ON;
   for (let i = wl.deer.length - 1; i >= 0; i--) {
     const d = wl.deer[i];
+
+    /* ---- the eclipse: nothing runs, everything looks up ------------------ *
+     * A deer bolts from a person, not from the dark, and a valley that has
+     * just lost the sun is the one place a deer has no idea which way to run.
+     * So the spook test, the grazing and the ambling all stop, and what is
+     * left is four animals standing perfectly still in the open with their
+     * heads up — which is the single most eclipse-looking thing in the wood. */
+    if (dip) {
+      d.st = 0;
+      d.head = 0;
+      d.headT = 1;
+      continue;
+    }
 
     if (d.st !== 2) {
       /* ---- is anyone coming? -------------------------------------------- */
@@ -6238,11 +6327,30 @@ function stepHorses(wl: Wildlife, dt: number): void {
   const pad = wl.cache.paddock;
   if (!pad || !wl.horses.length) return;
   const rng = wl.rng;
+  const dip = wl.dip >= DIP_ON;
   for (const h of wl.horses) {
-    h.headT -= dt;
-    if (h.headT <= 0) {
-      h.head = h.head ? 0 : 1;
-      h.headT = (h.head ? 4 + rng() * 6 : 2 + rng() * 4) * 1;
+    if (dip) {
+      // Stock draw together when the light goes wrong. The point each animal
+      // holds is a function of its own seed, so the group closes up and then
+      // *stays* closed rather than milling round the middle of the paddock.
+      const a = (h.seed % 360) * (Math.PI / 180);
+      h.tx = pad.gx + Math.cos(a) * DIP_HUDDLE;
+      h.ty = pad.gy + Math.sin(a) * DIP_HUDDLE;
+      h.head = 0; // up, and it stays up
+      h.headT = 1;
+      // A settle is eight world-seconds and a horse walks a third of a tile in
+      // one, so a frozen tableau would otherwise open on a herd still on its
+      // way in. Put them where they are going.
+      if (wl.settling) {
+        h.gx = h.tx;
+        h.gy = h.ty;
+      }
+    } else {
+      h.headT -= dt;
+      if (h.headT <= 0) {
+        h.head = h.head ? 0 : 1;
+        h.headT = (h.head ? 4 + rng() * 6 : 2 + rng() * 4) * 1;
+      }
     }
     const dx = h.tx - h.gx;
     const dy = h.ty - h.gy;
@@ -6257,6 +6365,8 @@ function stepHorses(wl: Wildlife, dt: number): void {
       h.headT = Math.max(h.headT, 0.8);
       continue;
     }
+    // Arrived and staying: no errand of its own while the sky is wrong.
+    if (dip) continue;
     h.timer -= dt;
     if (h.timer > 0) continue;
     if (rng() < 0.5) {
@@ -6300,8 +6410,22 @@ function stepCows(wl: Wildlife, dt: number): void {
   const at = wl.cache.pasture;
   if (!at || !wl.cows.length) return;
   const rng = wl.rng;
+  const dip = wl.dip >= DIP_ON;
   for (const c of wl.cows) {
-    c.timer -= dt;
+    if (dip) {
+      // Cattle bunch tighter than horses and stop eating to do it; heads come
+      // up, and the herd is a herd until the sun is back.
+      const a = (c.seed % 360) * (Math.PI / 180);
+      c.tx = at[0] + Math.cos(a) * DIP_HUDDLE;
+      c.ty = at[1] + Math.sin(a) * DIP_HUDDLE;
+      c.graze = false;
+      if (wl.settling) {
+        c.gx = c.tx;
+        c.gy = c.ty;
+      }
+    } else {
+      c.timer -= dt;
+    }
     const dx = c.tx - c.gx;
     const dy = c.ty - c.gy;
     const dist = Math.hypot(dx, dy);
@@ -6312,7 +6436,7 @@ function stepCows(wl: Wildlife, dt: number): void {
       const sdx = dx - dy;
       if (Math.abs(sdx) > 0.01) c.face = sdx > 0;
     }
-    if (c.timer > 0) continue;
+    if (dip || c.timer > 0) continue;
     c.graze = !c.graze;
     c.timer = c.graze ? 6 + rng() * 8 : 3 + rng() * 5;
     if (!c.graze) {
@@ -6330,19 +6454,39 @@ function stepCows(wl: Wildlife, dt: number): void {
  * One animal, one beat, one night in three — and never during a settle, so a
  * frozen valley has no fox in it at all. That is the whole design: it has to be
  * something a visitor catches, not something they can go and look at.
+ *
+ * An eclipse opens a *second* window on the same beat, in the middle of the
+ * afternoon, on seven eclipses in ten. It is deliberately the same animal and
+ * the same code: a fox that comes out for the false dusk is doing exactly what
+ * a fox does at dusk, and the point is that it is the valley's own fox rather
+ * than a special effect. It does not spend the night's: a dip fox that has been
+ * and gone sets `dipDone` and leaves `foxDone` alone, so ten at night is still
+ * whatever ten at night was going to be.
  */
 function stepFox(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
   const edge = wl.cache.edge;
   if (!edge) return;
-  const out = snap.t < FOX_FROM || snap.t >= FOX_TO;
+  // `dip` is 0 on every day that is not an eclipse, so `dipOpen` is false and
+  // `out` is the expression it has always been.
+  const dipOpen = wl.dip >= DIP_ON && wl.cache.foxDip;
+  const out = dipOpen ? false : snap.t < FOX_FROM || snap.t >= FOX_TO;
   if (out) {
-    // A new evening rearms it; anything outside the window puts it away.
-    if (wl.fox) wl.fox = null;
+    // A new evening rearms it; anything outside the window puts it away — and
+    // the light coming back is the one thing that sends the afternoon's in.
+    if (wl.fox) {
+      if (wl.dipFox) {
+        wl.dipFox = false;
+        wl.dipDone = true;
+      }
+      wl.fox = null;
+    }
     if (snap.t < FOX_FROM) wl.foxDone = false;
     return;
   }
   if (!wl.fox) {
-    if (wl.settling || wl.foxDone || !wl.foxNight || snap.t < wl.foxAt) return;
+    if (dipOpen) {
+      if (wl.settling || wl.dipDone) return;
+    } else if (wl.settling || wl.foxDone || !wl.foxNight || snap.t < wl.foxAt) return;
     const rng = wl.rng;
     // Which end it comes in at. `sp` carries the sign, so the step below needs
     // no second field to remember which way round the beat is being walked.
@@ -6364,6 +6508,7 @@ function stepFox(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
       phase: 0,
       pose: 0,
     };
+    wl.dipFox = dipOpen;
     return;
   }
 
@@ -6379,7 +6524,15 @@ function stepFox(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
     f.pose = Math.floor(f.phase * 6) % 2 === 0 ? 0 : 1;
     if (f.k >= 1) {
       wl.fox = null;
-      wl.foxDone = true;
+      // The afternoon's fox spends the *eclipse's* one sighting, never the
+      // night's: the valley can have both, and on the one day in a hundred
+      // where it does, it should.
+      if (wl.dipFox) {
+        wl.dipFox = false;
+        wl.dipDone = true;
+      } else {
+        wl.foxDone = true;
+      }
       return;
     }
     if (f.timer <= 0) {
@@ -6580,11 +6733,16 @@ function stepPerch(
   const rng = wl.rng;
   const roofs = wl.cache.roofs;
   const daylight = snap.t >= PERCH_FROM && snap.t < PERCH_TO;
+  const hunker = wl.dip >= DIP_ON;
 
   /* ---- landing ---------------------------------------------------------- */
   wl.perchT -= dt;
   if (wl.perchT <= 0) {
-    wl.perchT = 6 + rng() * 14;
+    // The same draw either way, so an ordinary day's stream is untouched: the
+    // eclipse only shortens the wait. Roofs fill in a couple of minutes rather
+    // than a quarter of an hour, which is what going to roost looks like from
+    // the ground.
+    wl.perchT = hunker ? 2 + rng() * 4 : 6 + rng() * 14;
     if (daylight && wl.perch.length < PERCH_MAX && roofs.length) {
       for (let a = 0; a < 6; a++) {
         const rf = roofs[Math.floor(rng() * roofs.length)];
@@ -6603,6 +6761,13 @@ function stepPerch(
     }
   }
   if (!wl.perch.length) return;
+
+  /* ---- sitting the eclipse out ------------------------------------------ */
+  // A hunkered bird does nothing at all: it does not hop, it does not mind the
+  // cart going by under the eaves, and the minute it had left on the ridge
+  // does not run down. It is drawn differently too — head into the shoulders,
+  // feet under it — and comes back to itself when the light does.
+  if (hunker) return;
 
   /* ---- anybody coming? --------------------------------------------------- */
   // On a coarse cadence: three birds against a pace-4 crowd every frame would
@@ -6934,10 +7099,16 @@ function pushWildlife(
    * so the bird lands on top of its own roof with nothing to tie-break, and any
    * trunk genuinely nearer than the house still sorts in front and is repaired
    * back over it by the pass below. */
+  // The dark of an eclipse is the one thing that changes how one is *drawn*:
+  // the key keeps its old spelling exactly when there is no eclipse, so an
+  // ordinary day asks the sprite cache for the same two entries it always did.
+  const hunk = wl.dip >= DIP_ON;
   for (const p of wl.perch) {
     const at = perchAt(p);
     if (!seen(at[0], at[1])) continue;
-    const sp = cached(scene, `wp:${p.face ? 1 : 0}`, () => buildPerchedBird(p.face));
+    const sp = cached(scene, `wp:${p.face ? 1 : 0}${hunk ? ':h' : ''}`, () =>
+      buildPerchedBird(p.face, hunk)
+    );
     const bx = Math.round(at[0] - sp.ox);
     const by = Math.round(at[1] - sp.oy);
     items.push({
