@@ -119,6 +119,61 @@ import {
   type WorldSnapshot,
 } from './types';
 
+/* ---------------------------- perf breakdown ----------------------------- */
+
+/**
+ * Where `?perf=2` puts its stopwatch readings.
+ *
+ * Milliseconds accumulate across a reporting window and are divided by
+ * `frames` by whoever prints them; the three counters are sums too, so they
+ * average the same way. Nothing here is allocated, touched or even branched on
+ * unless a caller has installed a sink, which only `?perf=2` does — every
+ * timing call below is behind `if (P)`, so an ordinary frame pays one null
+ * check per phase and nothing else.
+ */
+export interface PerfPhases {
+  /** Frame buffer resize, context reset, `skyAt`. */
+  setup: number;
+  /** `syncVeg` plus the standing-wood blit. */
+  veg: number;
+  /** Beyond-woodland pattern fill and the baked terrain blit. */
+  bg: number;
+  /** Roads, clipped to their built fraction, and bridges — repainted per frame. */
+  roads: number;
+  /** Building the dynamic item list: trees, chests, props, buildings, crowd. */
+  build: number;
+  /** Occlusion repair query. */
+  occl: number;
+  /** Depth sort and item draw. */
+  draw: number;
+  /** Hammer sparks and chimney smoke — particles, and evening's are thickest. */
+  fx: number;
+  /** World buffer → viewport. */
+  blit: number;
+  /** Sky multiply, horizon gradient, lamp halos, weather. */
+  post: number;
+  /** Wildlife: step, ground push, air draw, fireflies. */
+  wild: number;
+  frames: number;
+  items: number;
+  halos: number;
+  repairs: number;
+}
+
+export function emptyPhases(): PerfPhases {
+  return {
+    setup: 0, veg: 0, bg: 0, roads: 0, build: 0, occl: 0, draw: 0, fx: 0,
+    blit: 0, post: 0, wild: 0, frames: 0, items: 0, halos: 0, repairs: 0,
+  };
+}
+
+let perfSink: PerfPhases | null = null;
+
+/** Install (or, with `null`, remove) the `?perf=2` breakdown sink. */
+export function setPerfSink(sink: PerfPhases | null): void {
+  perfSink = sink;
+}
+
 /* ------------------------------ sprite pools ----------------------------- */
 
 function pool<T>(n: number, make: (i: number) => T): T[] {
@@ -2110,6 +2165,17 @@ export function renderGenesis(
   clock: number
 ): void {
   const { zoom, vw, vh } = view;
+  // `?perf=2` only: a stopwatch that is lapped at each phase boundary below.
+  // Off, `P` is null and every call site is a single null check.
+  const P = perfSink;
+  let pLast = P ? performance.now() : 0;
+  const lap = (
+    k: 'setup' | 'veg' | 'bg' | 'roads' | 'build' | 'occl' | 'draw' | 'fx' | 'blit' | 'post' | 'wild'
+  ) => {
+    const now = performance.now();
+    P![k] += now - pLast;
+    pLast = now;
+  };
   /**
    * Two coordinate systems meet here. The world buffer is in *world* pixels —
    * one unit is one pixel of art. Everything the viewport does, from the blit
@@ -2139,8 +2205,11 @@ export function renderGenesis(
   const sky = skyAt(snap.t, scene.day);
   scene.lit = sky.night > 0.5;
   scene.relight = 4;
+  if (P) lap('setup');
   syncVeg(scene, snap);
+  if (P) lap('veg');
   const wild = tickWildlife(scene, amb, snap, sky, clock); // WILDLIFE
+  if (P) lap('wild');
 
   // Whole world pixels, always: the buffer is drawn at 1 unit = 1 art pixel, so
   // a fractional camera would land sprites and spans off the buffer's own grid
@@ -2166,6 +2235,7 @@ export function renderGenesis(
 
   g.drawImage(scene.layer, scene.lx - cx, scene.ly - cy);
   g.translate(-cx, -cy);
+  if (P) lap('bg');
 
   const wx0 = cx - 72;
   // Generous at the top: a mill's sails or a tower's flag can stand 150px above
@@ -2207,9 +2277,11 @@ export function renderGenesis(
     if (!stage) continue;
     drawBridge(g, scene.map.river, br.gx, br.gy, br.span, stage);
   }
+  if (P) lap('roads');
 
   /* ---- the standing wood, straight off its own layer -------------------- */
   g.drawImage(scene.veg.c, scene.lx, scene.ly);
+  if (P) lap('veg');
 
   /* ---- one depth-sorted pass over everything that is changing ---------- */
   const items: Item[] = [];
@@ -2468,8 +2540,11 @@ export function renderGenesis(
     });
   }
 
+  if (P) lap('build');
+
   // WILDLIFE — ground-dwellers, inside the repair pass with the rest of the crowd.
   pushWildlife(scene, wild, items, wx0, wy0, wx1, wy1);
+  if (P) lap('wild');
 
   /* ---- occlusion repair ------------------------------------------------
    * Everything above was drawn *after* the whole standing wood, so a mover
@@ -2524,14 +2599,25 @@ export function renderGenesis(
         draw: (c) => paintVeg(c, s),
       });
     });
+    if (P) P.repairs += need.size;
   }
+  if (P) lap('occl');
 
+  if (P) {
+    P.frames += 1;
+    P.items += items.length;
+    P.halos += halos.length;
+  }
   items.sort((a, b) => a.depth - b.depth);
   for (const it of items) it.draw(g);
+  if (P) lap('draw');
 
   drawSparks(g, amb.sparks, wx0, wy0, wx1, wy1);
+  if (P) lap('fx');
   drawWildlifeAir(g, scene, wild, wx0, wy0, wx1, wy1); // WILDLIFE — above the canopy, over the sparks
+  if (P) lap('wild');
   drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1, sky.night);
+  if (P) lap('fx');
 
   /* ---- blit the world buffer to the viewport --------------------------- */
   // From here down the viewport is measured in device pixels; no transform is
@@ -2540,6 +2626,7 @@ export function renderGenesis(
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, dw, dh);
   ctx.drawImage(f, 0, 0, bw, bh, 0, 0, bw * scale, bh * scale);
+  if (P) lap('blit');
 
   /* ---- the sky, over the finished frame -------------------------------- */
   // Deliberately *not* in the world buffer: this is one screen-sized fill
@@ -2584,13 +2671,17 @@ export function renderGenesis(
     ctx.restore();
   }
 
+  if (P) lap('post');
+
   // WILDLIFE — after the sky, so the night fill cannot put the fireflies out.
   drawFireflies(ctx, wild, cx, cy, scale, dw, dh);
+  if (P) lap('wild');
 
   /* ---- and whatever weather this rare day has, last of all -------------
      (after the fireflies: rain and mist may veil them, the aurora hangs
      above them) */
   paintWeather(ctx, scene, snap.t, clock, dw, dh, dpr);
+  if (P) lap('post');
 }
 
 /** A bridge at one of its three build stages. Exported for the catalog. */

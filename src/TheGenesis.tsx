@@ -24,10 +24,12 @@ import { TH, TW, hashSeed, type GenesisMap, type Timeline, type WorldSnapshot } 
 import { dayInfo } from './daytype.ts';
 import {
   buildGenesisScene,
+  emptyPhases,
   makeAmbient,
   renderGenesis,
   resetAmbient,
   setAmbientPace,
+  setPerfSink,
   settleAmbient,
   stepAmbient,
   syncAmbient,
@@ -682,13 +684,29 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       },
     };
 
-    /* ---- optional frame-time readout (`?perf=1`) ------------------------ */
+    /* ---- optional frame-time readout (`?perf=1`, `?perf=2`) ------------- */
     // console.error so the headless screenshot harness, which only relays
     // errors, picks it up.
-    const perf = new URLSearchParams(window.location.search).get('perf') === '1';
+    //
+    // `perf=1` is the whole-frame number and nothing else. `perf=2` adds a
+    // second line: the same window broken down by render phase, plus the two
+    // per-tick costs that live outside the render (advancing the snapshot and
+    // stepping the ambient crowd). Both are strictly additive — with no `perf`
+    // in the query string not one stopwatch is read and no sink is installed,
+    // so the ordinary visitor pays a single boolean per frame.
+    const perfParam = new URLSearchParams(window.location.search).get('perf');
+    const perf = perfParam === '1' || perfParam === '2';
+    const perf2 = perfParam === '2';
     let pN = 0;
     let pSum = 0;
     let pMax = 0;
+    // Tick-level costs, counted per *tick* rather than per painted frame: a
+    // held world advances its clock without repainting.
+    const phases = perf2 ? emptyPhases() : null;
+    let pTicks = 0;
+    let pSnapMs = 0;
+    let pAmbMs = 0;
+    setPerfSink(phases);
 
     function paintOnce() {
       const cam = camRef.current!;
@@ -706,6 +724,32 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
             `dpr ${dpr} devscale ${(camRef.current!.zoom * dpr).toFixed(3)} ` +
             `t=${tRef.current.toFixed(2)} trees=${scene.map.trees.length}`
         );
+        if (phases) {
+          const n = Math.max(1, phases.frames);
+          const k = Math.max(1, pTicks);
+          const p = (v: number) => (v / n).toFixed(3);
+          const sum =
+            phases.setup + phases.veg + phases.bg + phases.roads + phases.build + phases.occl +
+            phases.draw + phases.fx + phases.blit + phases.post + phases.wild;
+          console.error(
+            `PERF2 avg ${(pSum / pN).toFixed(3)} max ${pMax.toFixed(3)} | ` +
+              `setup ${p(phases.setup)} bg ${p(phases.bg)} roads ${p(phases.roads)} veg ${p(phases.veg)} ` +
+              `build ${p(phases.build)} occl ${p(phases.occl)} draw ${p(phases.draw)} ` +
+              `fx ${p(phases.fx)} blit ${p(phases.blit)} post ${p(phases.post)} wild ${p(phases.wild)} ` +
+              `other ${Math.max(0, pSum / pN - sum / n).toFixed(3)} | ` +
+              `amb ${(pAmbMs / k).toFixed(3)} snap ${(pSnapMs / k).toFixed(3)} | ` +
+              `items ${p(phases.items)} halos ${p(phases.halos)} repairs ${p(phases.repairs)} ` +
+              `bots ${amb.bots.length + amb.walkers.length + amb.diggers.length} ` +
+              `smoke ${amb.smoke.length} sparks ${amb.sparks.length} ` +
+              `trees ${scene.map.trees.length} sites ${scene.map.sites.length} | ` +
+              `zoom ${camRef.current!.zoom.toFixed(4)} dpr ${dpr} vw ${vw} vh ${vh} ` +
+              `t ${tRef.current.toFixed(3)} pace ${paceRef.current} seed ${seedRef.current}`
+          );
+          Object.assign(phases, emptyPhases());
+          pTicks = 0;
+          pSnapMs = 0;
+          pAmbMs = 0;
+        }
         pN = 0;
         pSum = 0;
         pMax = 0;
@@ -719,6 +763,8 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     let uiAccum = 0;
     const tick = (dt: number) => {
       const running = modeRef.current === 'live' || playingRef.current;
+      if (perf2) pTicks++;
+      const tSnap0 = perf2 ? performance.now() : 0;
       if (modeRef.current === 'live') {
         const wall = wallClockHours();
         // The wall clock only ever runs forward, so a large step *backwards* is
@@ -733,14 +779,17 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       // A pre-built world is only worth its ~35MB of baked canvases while
       // midnight is actually coming. Scrub or pause back into the day and it is
       // dropped again; the next approach to 23:30 rebuilds it.
+      if (perf2) pSnapMs += performance.now() - tSnap0;
       if (tRef.current < PREGEN_AT) pending = null;
       else if (running) ensurePending(comingSeed());
+      const tAmb0 = perf2 ? performance.now() : 0;
       syncAmbient(scene, amb, snapRef.current!);
       if (running && !reducedRef.current) {
         clock += dt;
         stepAmbient(scene, amb, snapRef.current!, dt);
         dirtyRef.current = true;
       }
+      if (perf2) pAmbMs += performance.now() - tAmb0;
       uiAccum += dt;
       if (uiAccum > 0.12) {
         uiAccum = 0;
@@ -773,6 +822,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     return () => {
       if (raf) cancelAnimationFrame(raf);
       if (timer) window.clearInterval(timer);
+      if (phases) setPerfSink(null);
     };
   }, [size]);
 
