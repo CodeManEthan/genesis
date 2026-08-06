@@ -48,6 +48,10 @@ import {
   type PropSpec,
   type RoadSpec,
   type RoofStyle,
+  /* ---- ruins (additive) ---- */
+  type RuinKind,
+  type RuinSpec,
+  /* ---- end ruins (additive) ---- */
   type SiteSpec,
   type StructureRole,
   type TreeKind,
@@ -1448,6 +1452,167 @@ function buryChests(
 }
 
 /* ========================================================================== */
+/*  ruins (additive)                                                          */
+/* ========================================================================== */
+
+/**
+ * Somebody was here before.
+ *
+ * Nought, one or two sets of overgrown remains, out in the wood, on the moor or
+ * in the open meadow — never on a road, never in a green, never in the water or
+ * on bare rock, and never on top of a buried chest. They are the one thing in
+ * the valley the day does not touch: no crew builds them, no crew pulls them
+ * down, and the only line the ledger has about one is that the new lane went
+ * past it.
+ *
+ * ── THE SCALE RULE ────────────────────────────────────────────────────────
+ * Ruins are TERRAIN, exactly as chests and lakes are: every field is a pure
+ * function of the seed and is byte-identical at 0.25x and at 4x. Nothing below
+ * reads `scale`, and every draw comes off a derived substream rather than the
+ * main sequence, so adding them moved nothing that was already there.
+ *
+ * They are sited against the FULL road network and the FULL town roster for
+ * the same reason the field fences are: those are what a smaller day is a
+ * prefix of, so testing against them is scale-free.
+ */
+const RUIN_ROAD_CLEAR = 2.2;
+const RUIN_RIVER_CLEAR = 2.6;
+const RUIN_SITE_CLEAR = 3.5;
+const RUIN_LAKE_CLEAR = 1.6;
+const RUIN_ROCK_CLEAR = 1.2;
+/** A ruin and a chest are two different stories; keep them out of one frame. */
+const RUIN_CHEST_CLEAR = 7;
+const RUIN_APART = 16;
+
+/** Ledger-ready name for the ground a ruin is standing in. */
+function ruinWhere(seed: number, biome: Biome): string {
+  if (biome === 'meadow') return 'the open meadow';
+  return chestWhere(seed, biome);
+}
+
+interface RuinSite {
+  u: number;
+  v: number;
+  r: number;
+}
+
+function raiseRuins(
+  seed: number,
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[],
+  chunks: Chunk[],
+  sites: RuinSite[],
+  roadLines: Pt[][],
+  chests: ChestSpec[],
+  offLake: (p: Pt, margin: number) => boolean,
+  offRock: (p: Pt, margin: number) => boolean
+): RuinSpec[] {
+  const ruins: RuinSpec[] = [];
+  // A derived substream: never the main stream, never the scale. 'RUIN'.
+  const rrng = mulberry32((seed ^ 0x5255494e) >>> 0);
+
+  const biomeAt = (p: Pt): Biome => {
+    for (const c of chunks) {
+      if (p[0] >= c.u0 && p[0] < c.u1 && p[1] >= c.v0 && p[1] < c.v1) return c.biome;
+    }
+    return 'meadow';
+  };
+
+  // Plenty of seeds get nothing at all: a valley with a ruin in it every single
+  // day is a valley with no ruins in it.
+  const roll = rrng();
+  const n = roll < 0.34 ? 0 : roll < 0.78 ? 1 : 2;
+
+  const placedUV: Pt[] = [];
+  for (let k = 0; k < n; k++) {
+    /* ---- somewhere nobody has been for a very long time ------------------ */
+    let at: Pt | null = null;
+    for (let t = 0; t < 4000 && !at; t++) {
+      const p: Pt = [
+        lerp(content.u0 + 3, content.u1 - 3, rrng()),
+        lerp(content.v0 + 3, content.v1 - 3, rrng()),
+      ];
+      const biome = biomeAt(p);
+      if (biome !== 'forest' && biome !== 'moor' && biome !== 'meadow') continue;
+      if (polyDist(p, river) < RUIN_RIVER_CLEAR) continue;
+      if (offLake(p, RUIN_LAKE_CLEAR)) continue;
+      if (offRock(p, RUIN_ROCK_CLEAR)) continue;
+      let clear = true;
+      for (const s of sites) {
+        if (dist(p, [s.u, s.v]) < s.r + RUIN_SITE_CLEAR) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      for (const line of roadLines) {
+        if (polyDist(p, line) < RUIN_ROAD_CLEAR) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      for (const c of chests) {
+        if (dist(p, [c.gx - c.gy, c.gx + c.gy]) < RUIN_CHEST_CLEAR) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      for (const q of placedUV) {
+        if (dist(p, q) < RUIN_APART) {
+          clear = false;
+          break;
+        }
+      }
+      if (!clear) continue;
+      at = p;
+    }
+    if (!at) continue;
+    placedUV.push(at);
+
+    /* ---- what is left of it ---------------------------------------------- */
+    // Three draws, always, whatever the answers turn out to be.
+    const kindRoll = rrng();
+    const wRoll = rrng();
+    const floorRoll = rrng();
+
+    const kind: RuinKind = kindRoll < 0.46 ? 'corner' : kindRoll < 0.72 ? 'tower' : 'rubble';
+    const w =
+      kind === 'tower'
+        ? 28 + Math.floor(wRoll * 3) * 4 // 28 | 32 | 36
+        : 28 + Math.floor(wRoll * 5) * 4; // 28 .. 44
+    const floors: 1 | 2 | 3 = kind === 'tower' ? 3 : floorRoll < 0.45 ? 2 : 1;
+
+    const biome = biomeAt(at);
+    const [gx, gy] = uv(at[0], at[1]);
+    ruins.push({
+      id: `ru${ruins.length}`,
+      gx,
+      gy,
+      seed: (seed + ruins.length * 6551 + 907) >>> 0,
+      kind,
+      w,
+      floors,
+      biome,
+      where: ruinWhere(seed, biome),
+    });
+  }
+
+  return ruins;
+}
+
+/* ---- geometry the ghost module reuses, so it cannot drift from this one -- */
+/** Distance between two u/v points. */
+export const uvDist = dist;
+/** Distance from a u/v point to a u/v polyline. */
+export const uvPolyDist = polyDist;
+
+/* ========================================================================== */
+/*  end ruins (additive)                                                      */
+/* ========================================================================== */
+
+/* ========================================================================== */
 /*  the generator                                                             */
 /* ========================================================================== */
 
@@ -1962,6 +2127,24 @@ function buildMap(seed: number, scale: number): GenesisMap {
     nBase,
     roadLines
   );
+
+  /* ---- ruins (additive) -------------------------------------------------- */
+  // Terrain, on its own substream — see raiseRuins above for the scale rule.
+  // It runs here, after the chunks, the FULL road network and the chests it has
+  // to keep clear of, and before the trees, because the wood grows up to a wall
+  // and not through it (the clearance pass sits with the chests' one below).
+  const ruins = raiseRuins(
+    seed,
+    content,
+    river,
+    chunks,
+    sites,
+    roadLines,
+    chests,
+    offLake,
+    offRock
+  );
+  /* ---- end ruins (additive) ---------------------------------------------- */
 
   /* ---- buildings -------------------------------------------------------- */
   const GOLDEN = 2.399963;
@@ -2884,6 +3067,23 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
+  /* ---- ruins (additive) -------------------------------------------------- */
+  // The wood grows up to a wall and not through it. Same rule as the chests
+  // above: only unclaimed undergrowth gives way, so nobody's felling
+  // appointment is cancelled — and ruin positions are scale-free, so the tree
+  // list stays byte-identical at every pace.
+  for (const ruin of ruins) {
+    const ru = ruin.gx - ruin.gy;
+    const rv = ruin.gx + ruin.gy;
+    const clearR = fpR(ruin.w) + 0.5;
+    for (const i of treesNear(ru, rv, clearR)) {
+      const t = trees[i];
+      if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) continue;
+      if (dist(treeUV[i], [ru, rv]) < clearR) dead.add(t.id);
+    }
+  }
+  /* ---- end ruins (additive) ---------------------------------------------- */
+
   const liveTrees = trees.filter((t) => !dead.has(t.id));
 
   /* ---- assemble --------------------------------------------------------- */
@@ -2940,6 +3140,9 @@ function buildMap(seed: number, scale: number): GenesisMap {
     trees: liveTrees,
     scatter,
     chests,
+    /* ---- ruins (additive) ---- */
+    ruins,
+    /* ---- end ruins (additive) ---- */
     valleyName: valley,
   };
 }

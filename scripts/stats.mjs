@@ -309,6 +309,25 @@ function report(seed) {
     );
   }
 
+  /* ---- ruins (additive) ------------------------------------------------- */
+  const ruins = map.ruins ?? [];
+  say(`\nRUINS (${ruins.length})`);
+  for (const r of ruins) {
+    const p = uvOf(r);
+    let road = Infinity;
+    for (const rd of map.roads) road = Math.min(road, polyDist(p, roadUV.get(rd.id)));
+    let site = Infinity;
+    for (const s of map.sites) site = Math.min(site, d2(p, uvOf(s)) - s.radius);
+    say(
+      `  ${r.id} ${r.kind.padEnd(7)} u,v ${f1(p[0]).padStart(6)},${f1(p[1]).padStart(6)}  ` +
+        `${r.biome.padEnd(6)} ${('“' + r.where + '”').padEnd(18)} ` +
+        `w ${String(r.w).padStart(2)} floors ${r.floors}  ` +
+        `road ${f1(road).padStart(5)}  town ${f1(site).padStart(5)}  ` +
+        `river ${f1(polyDist(p, river)).padStart(5)}`
+    );
+  }
+  /* ---- end ruins (additive) --------------------------------------------- */
+
   say(`\nforest character: ${woodCharacter(seed)}`);
   say(`tree kinds: ${hist(map.trees, (t) => t.kind)}`);
   say(`scatter kinds: ${hist(map.scatter, (p) => p.kind)}`);
@@ -693,6 +712,57 @@ function checks(seed, map, scale = 1) {
     );
   }
 
+  /* (z1) ruins (additive): nought to two, in cover, off every road, every
+     green, every shore and every boulder field, and never on top of a chest.
+     Ruins are TERRAIN — the scale-identity half of that is in subsetChecks. */
+  {
+    const ruins = map.ruins ?? [];
+    // Its own copy of the lake outlines: the shared `rings` below is declared
+    // after this block, and a ruin has to keep its feet dry too.
+    const wet = (map.lakes ?? []).map((lk) => lakeRingUV(lk));
+    const bad = [];
+    const ids = new Set();
+    let minRoad = Infinity;
+    let minRiver = Infinity;
+    let minSite = Infinity;
+    for (const r of ruins) {
+      if (ids.has(r.id)) bad.push(`duplicate id ${r.id}`);
+      ids.add(r.id);
+      const p = uvOf(r);
+      const chunk = map.chunks.find(
+        (k) => p[0] >= k.u0 && p[0] < k.u1 && p[1] >= k.v0 && p[1] < k.v1
+      );
+      if (!chunk) bad.push(`${r.id} sits outside every chunk`);
+      else if (!['forest', 'moor', 'meadow'].includes(chunk.biome))
+        bad.push(`${r.id} stands in ${chunk.biome}`);
+      else if (chunk.biome !== r.biome)
+        bad.push(`${r.id} says ${r.biome}, ground says ${chunk.biome}`);
+      if (!r.where) bad.push(`${r.id} has nowhere to be`);
+      if (!['corner', 'tower', 'rubble'].includes(r.kind)) bad.push(`${r.id} kind ${r.kind}`);
+      if (r.w % 4 !== 0 || r.w < 16) bad.push(`${r.id} footprint ${r.w}`);
+      for (const rd of map.roads) minRoad = Math.min(minRoad, polyDist(p, roadUV.get(rd.id)));
+      minRiver = Math.min(minRiver, polyDist(p, river));
+      for (const s of map.sites) minSite = Math.min(minSite, d2(p, uvOf(s)) - s.radius);
+      for (const o of ruins) if (o !== r && d2(p, uvOf(o)) < 16 - 1e-9) bad.push(`${r.id} crowds ${o.id}`);
+      for (const c of map.chests ?? [])
+        if (d2(p, uvOf(c)) < 7 - 1e-9) bad.push(`${r.id} stands on ${c.id}`);
+      if (wet.length && lakesShoreDist(p, wet) < 1.6 - 1e-9) bad.push(`${r.id} stands in a lake`);
+      for (const o of map.outcrops ?? [])
+        if (d2(p, uvOf(o)) < o.radius + 1.2 - 1e-9) bad.push(`${r.id} stands on ${o.id}`);
+    }
+    check(
+      'z1 ruins overgrown and off the road',
+      ruins.length <= 2 &&
+        bad.length === 0 &&
+        (!ruins.length || (minRoad >= 2 && minRiver >= 2.5 && minSite >= 3.4)),
+      `${ruins.length} ruin(s)` +
+        (ruins.length
+          ? `, nearest road ${f1(minRoad)}, river ${f1(minRiver)}, town rim ${f1(minSite)}`
+          : '') +
+        (bad.length ? ` — ${bad.join('; ')}` : '')
+    );
+  }
+
   /* (s) no two towns wear the same accent */
   {
     const acc = map.sites.map((s) => s.accent);
@@ -919,7 +989,12 @@ function subsetChecks(seed) {
   // pure function of the seed. Only the REWARD is allowed to notice the pace,
   // and it does that through the ordinary site/building prefix below.
   // `lakes` and `outcrops` are terrain for the same reason.
-  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'bounds', 'content', 'valleyName']) {
+  // `ruins` joins them for exactly the same reason: overgrown walls were there
+  // before the first house and the day neither raises them nor pulls them down,
+  // so where they are and what shape they are in is a pure function of the seed.
+  // (The GHOST is not map data at all — it is a function of two seeds and lives
+  // in ghost.ts, outside `GenesisMap`, so it is not checked here.)
+  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'ruins', 'bounds', 'content', 'valleyName']) {
     const ok = maps.every((m) => same(m[field], maps[0][field]));
     check(`terrain: ${field} identical`, ok);
   }

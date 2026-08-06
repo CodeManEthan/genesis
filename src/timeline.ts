@@ -905,6 +905,124 @@ function chestPass(
   return lines;
 }
 
+/* -------------------------------------------------------------------------- */
+/* ruins (additive) — what the ledger has to say about somebody else's walls   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Ruins are the one thing in the valley the day does not touch. Nobody builds
+ * them, nobody pulls them down, and the only reason they ever reach the ledger
+ * is that a road went past one — which is the only moment anybody in the valley
+ * would have looked at it.
+ *
+ * One line each, two in a day at the very most, and dry: the settlers are busy,
+ * and a wall that has been down for two hundred years is not news.
+ *
+ * ── ON THE TEMPO ──────────────────────────────────────────────────────────
+ * `plan()` is bisected about forty-one times to solve for the tempo `p`; this
+ * runs once, from `narrate`, and its draw count depends only on the MAP — how
+ * many ruins there are and how close the roads pass — and never on `p`. The
+ * only thing `p` may change is the hour a line lands at, which is exactly the
+ * hour the road crew got there.
+ */
+const RUIN_LOG = [
+  'The new lane runs past four courses of dressed stone out in {where}. Nobody built it and nobody pulled it down.',
+  'There is a corner of a wall standing in {where}. The road is set to go round it, and goes round it.',
+  'Cut stone under the moss in {where}, squared and laid by somebody. {town} does not claim it.',
+  'The lane out of {town} passes an old footing in {where}. Two of them walk over to look. The rest do not.',
+  'Whatever stood in {where} stood a long time and came down a long time ago. The road notes it and carries on.',
+  'A sapling is growing out of the top of a wall in {where}. It has been there longer than {town} has.',
+];
+
+/** How close a road has to pass, in TILE units, before anybody remarks on it.
+ * At 8 tiles the walls are a thing you can see from the carriageway, and about
+ * one day in five has a lane that goes near enough to say so. */
+const RUIN_NOTICE = 8;
+/** Two is plenty. A ledger that is mostly archaeology is the wrong ledger. */
+const RUIN_LINES_MAX = 2;
+
+/** Distance and arclength fraction of the point on `pts` nearest (gx, gy). */
+function nearestOn(pts: Vec2[], gx: number, gy: number): { d: number; frac: number } {
+  const { cum, total } = polyMetrics(pts);
+  if (pts.length < 2 || !(total > 0)) {
+    return { d: pts.length ? Math.hypot(pts[0][0] - gx, pts[0][1] - gy) : Infinity, frac: 0 };
+  }
+  let best = Infinity;
+  let frac = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const ax = pts[i - 1][0];
+    const ay = pts[i - 1][1];
+    const dx = pts[i][0] - ax;
+    const dy = pts[i][1] - ay;
+    const l2 = dx * dx + dy * dy;
+    const u = clamp(l2 > 0 ? ((gx - ax) * dx + (gy - ay) * dy) / l2 : 0, 0, 1);
+    const d = Math.hypot(ax + dx * u - gx, ay + dy * u - gy);
+    if (d < best) {
+      best = d;
+      frac = (cum[i - 1] + u * Math.sqrt(l2)) / total;
+    }
+  }
+  return { d: best, frac: clamp(frac, 0, 1) };
+}
+
+function ruinPass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId?: string }[] {
+  const ruins = map.ruins ?? [];
+  if (!ruins.length || !map.roads.length) return [];
+
+  /** Every ruin a road passes, nearest first, with an explicit id tie-break. */
+  const near: { ruin: (typeof ruins)[number]; road: RoadSpec; d: number; frac: number }[] = [];
+  for (const ruin of ruins) {
+    let bestRoad: RoadSpec | null = null;
+    let bestD = Infinity;
+    let bestFrac = 0;
+    for (const road of map.roads) {
+      const { d, frac } = nearestOn(road.pts, ruin.gx, ruin.gy);
+      if (d < bestD || (d === bestD && bestRoad && road.id < bestRoad.id)) {
+        bestRoad = road;
+        bestD = d;
+        bestFrac = frac;
+      }
+    }
+    if (bestRoad && bestD <= RUIN_NOTICE) {
+      near.push({ ruin, road: bestRoad, d: bestD, frac: bestFrac });
+    }
+  }
+  if (!near.length) return [];
+  near.sort((a, b) => a.d - b.d || (a.ruin.id < b.ruin.id ? -1 : 1));
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x7275494e) >>> 0); // 'ruIN'
+  const draw = makeDrawer(rng);
+  const valley = map.valleyName;
+  const lines: { t: number; text: string; siteId?: string }[] = [];
+
+  for (const n of near.slice(0, RUIN_LINES_MAX)) {
+    // When the crew actually got there: the first road event past the ruin.
+    let t: number | null = null;
+    for (const e of pl.events) {
+      if (e.type !== 'road' || e.roadId !== n.road.id) continue;
+      if (e.frac + 1e-9 < n.frac) continue;
+      if (t === null || e.t < t) t = e.t;
+    }
+    const run = pl.runs.get(n.road.to) ?? pl.runs.get(n.road.from);
+    const jitter = rng() * 0.3;
+    const line: { t: number; text: string; siteId?: string } = {
+      t: clamp((t ?? 11 + jitter * 20) + jitter, 0.4, 23.4),
+      text: fill(draw(RUIN_LOG), {
+        valley,
+        town: run ? run.site.name : valley,
+        where: n.ruin.where,
+      }),
+    };
+    if (run) line.siteId = run.site.id;
+    lines.push(line);
+  }
+  return lines;
+}
+
+/* -------------------------------------------------------------------------- */
+/* end ruins (additive)                                                       */
+/* -------------------------------------------------------------------------- */
+
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
   const range = (a: number, b: number) => a + rng() * (b - a);
@@ -986,6 +1104,12 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
     for (const e of out) if (e.type === 'survey') surveyT.set(e.buildingId, e.t);
     for (const l of chestPass(map, pl, surveyT)) key.push(l);
   }
+
+  /* --- ruins (additive): the road goes past somebody else's walls --------- */
+  // Folded into `key` for the same reason the chests are: the flavour filler
+  // below shortens itself by however many lines this just cost.
+  for (const l of ruinPass(map, pl)) key.push(l);
+  /* --- end ruins (additive) ---------------------------------------------- */
 
   for (const sid of pl.order) {
     const run = pl.runs.get(sid)!;
