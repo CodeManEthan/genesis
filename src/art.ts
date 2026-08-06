@@ -3744,3 +3744,203 @@ export function buildStoneLamp(): Sprite {
 }
 
 /* ------------------------ end stone past the walls ----------------------- */
+
+/* ========================================================================== *
+ * THE PROSPECTOR, and gold laid over a finished roof (additive, Genesis-only) *
+ * -------------------------------------------------------------------------- *
+ * Both routines below are new exports. Nothing above them is touched, nothing
+ * calls into them unless it asks, and the Vale never does.
+ * ========================================================================== */
+
+/** The three golds. The same three the gildhall's charter roof is painted in,
+ * so a gilt town and a charter hall read as the same money. */
+const GILT = '#f2cc63';
+const GILT_D = '#c1912f';
+const GILT_L = '#ffeaa8';
+
+/**
+ * A man with a pan, in the shallows.
+ *
+ * A dedicated routine rather than a new `BotAction`, because the pose is not a
+ * villager's: he is DOWN — knees in the gravel, both hands out over the water,
+ * a silhouette half the height of everybody else in the valley, which at zoom 1
+ * is the only thing that tells you what he is doing. `work` 1 kneels him;
+ * `work` 0 stands him up and walks him on with the ordinary bot, pan in hand,
+ * so the two states share a head, a coat and a stride.
+ *
+ * `rich` is the one thing the day can change about him: after the strike there
+ * are two pixels of colour in the bottom of the pan.
+ */
+export function drawPanner(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  color: string,
+  faceRight: boolean,
+  work: 0 | 1,
+  phase: number,
+  rich: boolean
+): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const s = faceRight ? 1 : -1;
+  const dark = shade(color, -0.28);
+  const light = shade(color, 0.24);
+
+  if (!work) {
+    // Wading to the next bar: the ordinary walk, with the pan carried flat at
+    // his hip so the silhouette still says prospector between the gravel bars.
+    drawBot(ctx, px, py, color, faceRight, 'walk', phase);
+    const hx = px + s * 5;
+    const hy = py - 7;
+    ctx.fillStyle = PAL.stoneDark;
+    ctx.fillRect(hx - 3, hy, 7, 1);
+    ctx.fillStyle = PAL.stone;
+    ctx.fillRect(hx - 2, hy - 1, 5, 1);
+    return;
+  }
+
+  // The swirl. One slow rotation of the wrists, a second and a bit round, which
+  // is what a pan actually does; everything else about him is still.
+  const sw = Math.sin(phase * 4.4);
+  const tilt = Math.round(sw * 1.4);
+  const lean = sw > 0.55 ? 1 : 0;
+
+  ctx.fillStyle = PAL.shadow;
+  ctx.fillRect(px - 5, py - 1, 10, 2);
+  ctx.fillRect(px - 6, py, 12, 1);
+
+  // Boots and shins, mostly under the water line, so the darker band below the
+  // knee reads as a man standing IN the river rather than beside it.
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px - 3, py - 3, 3, 3);
+  ctx.fillRect(px + s * 2 - (faceRight ? 0 : 2), py - 2, 3, 2);
+
+  // Crouched body: three storeys shorter than a standing bot.
+  const top = py - 3 + lean;
+  ctx.fillStyle = color;
+  ctx.fillRect(px - 3, top - 6, 6, 6);
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + (faceRight ? 2 : -3), top - 6, 1, 6);
+  ctx.fillStyle = light;
+  ctx.fillRect(px - 3 + (faceRight ? 0 : 5), top - 6, 1, 3);
+
+  // Both arms out in front and down, following the swirl.
+  ctx.fillStyle = shade(color, -0.14);
+  ctx.fillRect(px + s * 3 - (faceRight ? 0 : 1), top - 5 + tilt, 1, 3);
+  ctx.fillRect(px + s * 2 - (faceRight ? 0 : 1), top - 4 + tilt, 1, 3);
+
+  // Head, bent over the work: no eyes, because he is not looking at you.
+  ctx.fillStyle = '#f7e2c8';
+  ctx.fillRect(px - 2, top - 11, 5, 5);
+  ctx.fillStyle = '#e8cba9';
+  ctx.fillRect(px + (faceRight ? 2 : -2), top - 11, 1, 5);
+  // A brim, because everybody who ever knelt in a river wore one.
+  ctx.fillStyle = shade(PAL.wood, -0.2);
+  ctx.fillRect(px - 5, top - 13, 11, 2);
+  ctx.fillStyle = PAL.wood;
+  ctx.fillRect(px - 3, top - 15, 7, 2);
+
+  // The pan itself: an ellipse two pixels deep, rocking with the swirl.
+  const cxp = px + s * 6;
+  const cyp = top - 2 + tilt;
+  ctx.fillStyle = PAL.stoneDark;
+  ctx.fillRect(cxp - 4, cyp, 9, 2);
+  ctx.fillRect(cxp - 3, cyp + 2, 7, 1);
+  ctx.fillStyle = PAL.stone;
+  ctx.fillRect(cxp - 3, cyp - 1, 7, 1);
+  ctx.fillStyle = shade(PAL.water, -0.1);
+  ctx.fillRect(cxp - 2, cyp, 5, 1);
+  if (rich) {
+    ctx.fillStyle = GILT_L;
+    ctx.fillRect(cxp - 1 + (sw > 0 ? 1 : 0), cyp, 2, 1);
+    ctx.fillStyle = GILT;
+    ctx.fillRect(cxp + 1, cyp + 1, 1, 1);
+  }
+}
+
+/**
+ * Gold laid over a building that is already finished.
+ *
+ * Additive in the strictest sense: it takes a sprite `buildStructure` has
+ * already returned and paints a few dozen pixels onto its canvas, in the
+ * sprite's own local space, without touching the sprite's box or its anchor —
+ * so the caller's draw offsets, occlusion rectangles and depth are all exactly
+ * what they were before the town got rich.
+ *
+ * What goes on: a gilt cap along the ridge, gilt along the two near eaves, a
+ * weathervane at the ridge end and a glint in the glass. Nothing structural,
+ * nothing that changes the silhouette by more than the vane — a gilt town has
+ * to read as the SAME town, on a day something happened to it.
+ */
+export function giltStructure(sp: Sprite, spec: StructureSpec): void {
+  // A charter hall is gilt already, and gilding the gilding reads as a bug.
+  if (spec.role === 'gildhall') return;
+  const ctx = sp.c.getContext('2d')!;
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+  // `getContext` hands back the SAME context `makeSprite` drew through, and
+  // that one is still carrying its translate to the ground anchor. Reset before
+  // re-establishing it, or every gold pixel lands at twice the offset and off
+  // the bottom-right corner of the canvas.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.translate(sp.ox, sp.oy);
+
+  const W = Math.max(16, Math.round(spec.w / 4) * 4);
+  const wallH = spec.floors * STORY;
+  const ry = -wallH;
+  const RW = W + 8;
+  const rng = mulberry32((spec.seed ^ 0x901d) >>> 0);
+
+  if (spec.roof === 'flat') {
+    // A parapet, so a flat roof gets its money's worth too.
+    poly(ctx, diamond(0, ry - 5, W), GILT_D);
+    poly(ctx, diamond(0, ry - 6, W - 4), GILT);
+    poly(ctx, diamond(0, ry - 7, W - 10), GILT_L);
+    ctx.restore();
+    return;
+  }
+
+  const roofH = Math.round(W * (spec.roof === 'thatch' ? 0.34 : 0.3));
+  const Ec: Pt = [RW / 2, ry];
+  const Sc: Pt = [0, ry + RW / 4];
+  const Wc: Pt = [-RW / 2, ry];
+
+  // The two eaves that face the camera.
+  poly(ctx, [Wc, Sc, [Sc[0], Sc[1] + 2.2], [Wc[0], Wc[1] + 2.2]], GILT);
+  poly(ctx, [Sc, Ec, [Ec[0], Ec[1] + 2.2], [Sc[0], Sc[1] + 2.2]], GILT_D);
+
+  const hip = spec.roof === 'hip';
+  const r1: Pt = hip ? [0, ry - roofH] : [-RW / 4, ry - RW / 8 - roofH];
+  const r2: Pt = hip ? [0, ry - roofH] : [RW / 4, ry + RW / 8 - roofH];
+  if (hip) {
+    poly(ctx, [[r1[0] - 4, r1[1] + 2], [r1[0] + 4, r1[1] + 2], [r1[0], r1[1] - 1]], GILT);
+  } else {
+    poly(ctx, [r1, r2, [r2[0], r2[1] + 2.2], [r1[0], r1[1] + 2.2]], GILT_D);
+    poly(ctx, [r1, r2, [r2[0], r2[1] + 1], [r1[0], r1[1] + 1]], GILT_L);
+  }
+
+  // Weathervane, on the up-screen end of the ridge and clear of the chimney,
+  // which stands at the other one. A mast, a cardinal cross and a cockerel.
+  const vx = Math.round(r1[0]);
+  const vy = Math.round(r1[1]);
+  rect(ctx, vx, vy - 9, 1, 9, GILT_D);
+  rect(ctx, vx - 3, vy - 6, 7, 1, GILT);
+  rect(ctx, vx, vy - 8, 1, 1, GILT_L);
+  const swing = rng() < 0.5 ? 1 : -1;
+  rect(ctx, vx + (swing > 0 ? 1 : -3), vy - 11, 3, 2, GILT);
+  rect(ctx, vx + (swing > 0 ? 3 : -3), vy - 12, 1, 1, GILT_L);
+
+  // …and two glints on the near slope, where the sun would actually catch it.
+  for (let i = 0; i < 2; i++) {
+    const f = 0.28 + rng() * 0.44;
+    const gx = Math.round(Wc[0] + (Sc[0] - Wc[0]) * f + (r1[0] - Wc[0]) * (0.3 + rng() * 0.3));
+    const gy = Math.round(Wc[1] + (Sc[1] - Wc[1]) * f + (r1[1] - Wc[1]) * (0.3 + rng() * 0.3));
+    rect(ctx, gx, gy, 1, 1, GILT_L);
+    rect(ctx, gx + 1, gy + 1, 1, 1, GILT);
+  }
+
+  ctx.restore();
+}
+
+/* ---- end the prospector (additive) --------------------------------------- */

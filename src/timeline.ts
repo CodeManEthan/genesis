@@ -37,7 +37,15 @@ import type {
   WorldSnapshot,
 } from './types.ts';
 import { mulberry32 } from './types.ts';
-import { dayTypeOf, marketSite, stormWarp, type DayType } from './daytype.ts';
+import {
+  dayTypeOf,
+  marketSite,
+  stormWarp,
+  /* ---- the prospector (additive) ---- */
+  goldStrike,
+  /* ---- end the prospector (additive) ---- */
+  type DayType,
+} from './daytype.ts';
 
 /* -------------------------------------------------------------------------- */
 /* small helpers                                                              */
@@ -1290,6 +1298,98 @@ function stonePass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId
 /* end standing stones (additive)                                             */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* the prospector (additive) — three lines, on the days there are any          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The man with the pan is in the river every single day and the ledger says
+ * nothing about him, because a man doing the same thing he did yesterday is not
+ * news. About one seed in twenty he finds something, and then he gets three
+ * lines: a tease before dawn that reads as nothing at all until the afternoon
+ * makes sense of it, the strike itself, and one at dusk about what the nearest
+ * town did with the evening.
+ *
+ * ── WHY THIS IS NOT A `narrate` PASS ──────────────────────────────────────
+ * The chests and the ruins are narrated inside `narrate`, in PLAN time, because
+ * they are things the settlers do — a road crew reaches a wall when the pace
+ * control says it does, and a chest is dug when its town can afford to dig it.
+ * The prospector is not one of the settlers. He is in the river at the same
+ * hour whatever the crews are up to, and the gravel does not work faster on a
+ * fast day.
+ *
+ * So this runs where `weather`, `marketDay` and `festival` run: a sibling of
+ * `narrate` in `buildTimeline`, applied to the finished event list AFTER the
+ * tempo solve, after the pace division and after the storm warp. Three
+ * consequences, all of them wanted:
+ *
+ *   - `plan()` bisects about forty-one times and this is not inside any of
+ *     them. It runs once, full stop.
+ *   - The strike lands at the same wall-clock hour at pace 1 and at pace 4,
+ *     which is the only way `scene.ts` can gild the roofs at `strike.at` and
+ *     have the ledger agree with the rooftops.
+ *   - Every existing ledger line in every existing valley stays exactly where
+ *     it was: this appends, and `narrate`'s own stream never sees it.
+ *
+ * The draw count is three on a gold day and zero on every other, and all three
+ * hours come from the MAP alone.
+ */
+const GOLD_TEASE_LOG = [
+  'The prospector is up before the crows again. Nobody asks.',
+  'There is a man in the river below {town} before it is properly light. There usually is.',
+  'The prospector was on the water before anybody in {valley} was on their feet. Nobody asks.',
+  'Somebody is kneeling in the shallows in the half dark. {valley} has stopped noticing.',
+];
+const GOLD_STRIKE_LOG = [
+  'The prospector has been sitting back on his heels for a quarter of an hour without moving. {town} is about to have a very good evening.',
+  'Colour in the pan. Actual colour. The man is running for {town} with his hat in his hand.',
+  'Whatever came up out of the gravel this afternoon, it is going to {town}, and {town} does not know yet.',
+  'The pan came up gold on the bar below {town}. Three people saw it. By supper it will have been thirty.',
+];
+const GOLD_CLOSING_LOG = [
+  'They are gilding the ridge caps in {town} by lamplight. It will look ridiculous in the morning and nobody cares.',
+  'Every roof in {town} has gold on it tonight. The valley can see it from here.',
+  '{town} spent the whole find before the light went, and spent it on the rooftops.',
+  'There is gold leaf on the weathervanes in {town}. {valley} will be talking about this for a year.',
+];
+
+/** He is out before the crews, which is the whole joke of the first line. */
+const GOLD_TEASE_FROM = 5.15;
+const GOLD_TEASE_TO = 5.75;
+/** …and the town has had all afternoon to decide what to do about it. */
+const GOLD_CLOSE_FROM = 20.6;
+const GOLD_CLOSE_TO = 21.5;
+
+function gold(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
+  const strike = goldStrike(map);
+  if (!strike) return events;
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x901d1e46) >>> 0); // 'goldlEaF'
+  const draw = makeDrawer(rng);
+  const valley = map.valleyName;
+  const town = strike.site ? strike.site.name : valley;
+  const v = { town, valley };
+  const sid = strike.site ? strike.site.id : undefined;
+
+  const out = events.slice();
+  const say = (t: number, pool: string[]) => {
+    const text = fill(draw(pool), v);
+    const at = clamp(t, 0.01, 23.97);
+    out.push(sid ? { t: at, type: 'log', text, siteId: sid } : { t: at, type: 'log', text });
+  };
+
+  say(GOLD_TEASE_FROM + rng() * (GOLD_TEASE_TO - GOLD_TEASE_FROM), GOLD_TEASE_LOG);
+  say(strike.at, GOLD_STRIKE_LOG);
+  say(GOLD_CLOSE_FROM + rng() * (GOLD_CLOSE_TO - GOLD_CLOSE_FROM), GOLD_CLOSING_LOG);
+
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* end the prospector (additive)                                              */
+/* -------------------------------------------------------------------------- */
+
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
   const range = (a: number, b: number) => a + rng() * (b - a);
@@ -1759,8 +1859,11 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
   if (pl.lastBuildT > 0.25) scalePlan(pl, target / pl.lastBuildT);
   const events = narrate(map, pl);
 
-  /** The rare-day passes, in the order they are allowed to see each other. */
-  const rare = (evs: GenesisEvent[]) => festival(map, marketDay(map, weather(map, evs)));
+  /** The rare-day passes, in the order they are allowed to see each other.
+   * The prospector (additive) goes outermost: his three lines are wall-clock
+   * facts, so they must land after the storm warp and after the pace division
+   * rather than be carried through either of them. */
+  const rare = (evs: GenesisEvent[]) => gold(map, festival(map, marketDay(map, weather(map, evs))));
 
   const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
   if (k === 1) return { events: rare(events) };
