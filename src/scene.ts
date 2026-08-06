@@ -67,6 +67,13 @@ import {
   buildLog,
   buildSapling,
   /* ---- end living details (additive) ---- */
+  /* ---- living details II (additive) ---- */
+  buildHayHeap,
+  buildHayCock,
+  buildLumberLow,
+  buildLumberHigh,
+  drawLeaningTree,
+  /* ---- end living details II (additive) ---- */
   buildFence,
   buildFlowerPatch,
   buildForestPattern,
@@ -166,6 +173,24 @@ import {
   type Vec2,
   type WorldSnapshot,
 } from './types';
+/* ---- living details II (additive) --------------------------------------- *
+ * The arithmetic of the three new details lives in its own DOM-free module so
+ * the harness can check it without a canvas; this file draws what it says.
+ * Imported with the extension, like gen/timeline do, because Node's type
+ * stripping needs one and the bundler does not mind.
+ * ------------------------------------------------------------------------- */
+import {
+  doomedTrees,
+  hayFor,
+  hayStage,
+  leanDir,
+  leanOf,
+  leanPhase,
+  logOffset,
+  pileReach,
+  pileStage,
+} from './living.ts';
+/* ---- end living details II (additive) ----------------------------------- */
 
 /* ---------------------------- perf breakdown ----------------------------- */
 
@@ -297,6 +322,18 @@ export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
     /** Regrowth on the evening's cleared ground. */
     sapling: pool(4, (i) => buildSapling(157 + i * 11)),
     /* ---- end living details (additive) ---------------------------------- */
+    /* ---- living details II (additive) ----------------------------------- *
+     * Two more three-age families, built on exactly the crop pools' terms: the
+     * SAME seeds in the SAME order as the middle age they grow into, so pool
+     * index `i` is one rick, or one timber yard, at three ages — which is what
+     * lets `syncVeg` swap one for another without it changing colour, width or
+     * which of the pool it is.
+     * --------------------------------------------------------------------- */
+    'hay-heap': pool(4, (i) => buildHayHeap(79 + i * 5)),
+    'hay-cock': pool(4, (i) => buildHayCock(79 + i * 5)),
+    'lumber-low': pool(3, (i) => buildLumberLow(97 + i * 17)),
+    'lumber-high': pool(3, (i) => buildLumberHigh(97 + i * 17)),
+    /* ---- end living details II (additive) ------------------------------- */
   };
   if (season !== 'summer') {
     for (const k of DECIDUOUS) for (const sp of pools[k]) seasonCanvas(sp.c, season);
@@ -379,6 +416,11 @@ function logLive(snap: WorldSnapshot, id: string): boolean {
 
 /** The earliest a sapling breaks ground; each one jitters up from here. */
 const SAPLING_FROM = 18;
+
+/* ---- living details II (additive) ---- */
+/** Stand-in for a snapshot old enough not to have fell times at all. */
+const EMPTY_FELLED: Map<string, number> = new Map();
+/* ---- end living details II (additive) ---- */
 
 /* ---- end living details (additive) -------------------------------------- */
 
@@ -597,6 +639,28 @@ export interface VegLayer {
   /** Evening regrowth over the day's cleared ground. */
   saplings: Sapling[];
   /* ---- end living details (additive) ----------------------------------- */
+  /* ---- living details II (additive) ------------------------------------ *
+   * Both are slot lists on the same terms as the crops above, and both are
+   * reconciled STATELESSLY from (snapshot, t) — see the contract note on
+   * `syncVeg`. Neither needs a scrub path of its own.
+   * ---------------------------------------------------------------------- */
+  /** The afternoon's hay: three age slots each, at most one ever painted. */
+  hay: HaySlot[];
+  /** The valley's timber yards, likewise. */
+  piles: Pile[];
+  /**
+   * The fell count and the prop count, packed, at the last pile reconcile;
+   * -1 = never.
+   *
+   * A pile's height is a count of finished chops, so the ONLY thing that can
+   * move it is that count — the clock alone never does. Both counts are in the
+   * fingerprint because a yard that goes up in the evening, after the last axe
+   * has finished, still has to appear. Off it, the reach scan (a few hundred
+   * `Map.has` across the valley) runs the couple of hundred times a day
+   * something changed instead of sixty times a second.
+   */
+  pileFelled: number;
+  /* ---- end living details II (additive) -------------------------------- */
 }
 
 /* ---- living details (additive) ------------------------------------------ */
@@ -619,6 +683,30 @@ interface Sapling {
   /** The minute it breaks ground. */
   t: number;
 }
+
+/* ---- living details II (additive) --------------------------------------- */
+
+/** One haystack, with a slot for each of its three ages, and its clock. */
+interface HaySlot {
+  /** heap / cock / rick, in stage order. */
+  slot: [number, number, number];
+  /** The dressing that has to have been raised before there is a field here. */
+  propId: string;
+  /** The hour the first forkful goes down. */
+  at: number;
+}
+
+/** One timber yard: three age slots, and the wood whose felling fills it. */
+interface Pile {
+  /** low / the stack that has always been there / high. */
+  slot: [number, number, number];
+  /** The dressing prop id, so the timeline still says when the yard exists. */
+  propId: string;
+  /** Ids of every tree within reach that the day is ever going to take down. */
+  reach: string[];
+}
+
+/* ---- end living details II (additive) ----------------------------------- */
 
 /* ---- end living details (additive) -------------------------------------- */
 
@@ -751,6 +839,18 @@ export interface GenesisScene {
    */
   giltOn: boolean;
   /* ---- end the prospector (additive) ------------------------------------- */
+  /* ---- living details II (additive) -------------------------------------- *
+   * When every tree the day fells hits the ground — `chopDoneTimes(timeline)`,
+   * joined on by the caller that holds both a scene and a world, exactly as
+   * `fest` is and for exactly the same reason: the bake has never seen a
+   * timeline, and a tree's fall is a fact about the PLAN, not about the map.
+   *
+   * Empty is a legitimate value and means "no plan to hand" — the catalog page,
+   * a bake without a world — in which case nothing leans and every tree under
+   * the axe shivers the way it always did. One failed lookup, no branch.
+   * ------------------------------------------------------------------------- */
+  chopDone: Map<string, number>;
+  /* ---- end living details II (additive) ---------------------------------- */
 }
 
 /**
@@ -1426,6 +1526,11 @@ export function* buildGenesisSceneSteps(
     giltIds: new Set<string>(),
     giltOn: false,
     /* ---- end the prospector (additive) ---- */
+    /* ---- living details II (additive) ---- */
+    // Empty until a caller with a timeline in its hand says otherwise; see the
+    // field's note. A bake on its own knows the wood, never the felling.
+    chopDone: new Map<string, number>(),
+    /* ---- end living details II (additive) ---- */
   };
   /* ---- the prospector (additive) ----------------------------------------- *
    * Rolled here rather than in the object literal because the gilt set is
@@ -1517,11 +1622,9 @@ function* buildVeg(
    * slot, and the only set a sapling may anchor to. Everything else in a
    * valley of two thousand trees stays a two-slot tree and costs nothing.
    * --------------------------------------------------------------------- */
-  const doomed = new Set<string>();
-  for (const s of scene.map.sites) {
-    for (const b of s.buildings) for (const id of b.clears) doomed.add(id);
-  }
-  for (const r of scene.map.roads) for (const c of r.clears ?? []) doomed.add(c.tree);
+  // (living details II: the same set, lifted verbatim into `living.ts` so the
+  // timber yards below can be handed it too.)
+  const doomed = doomedTrees(scene.map);
   /* ---- end living details (additive) ----------------------------------- */
 
   const trees = scene.map.trees;
@@ -1542,9 +1645,10 @@ function* buildVeg(
     // The trunk, a stride or so off the stump on the tree's own bearing. Same
     // rank as the stump, so it sorts against everything else by depth alone.
     if (doomed.has(tr.id)) {
-      const lr = mulberry32((tr.seed ^ 0x10c17e5d) >>> 0);
-      const a = lr() * Math.PI * 2;
-      const d = 0.85 + lr() * 0.5;
+      // (living details II: the two draws moved to `logOffset`, byte for byte —
+      // the fall has to lean the way the trunk is going to lie, and one
+      // function is the only way to be sure of that.)
+      const { a, d } = logOffset(tr.seed);
       const lp = scene.pools.log;
       logs[k] = add(
         lp[TREE_LOG[tr.kind] ?? 0],
@@ -1577,6 +1681,40 @@ function* buildVeg(
     crops.push({ slot, propId, jitter: cropJitter(seed) });
   };
   /* ---- end living details (additive) ---- */
+  /* ---- living details II (additive) ------------------------------------ *
+   * Hay and timber are crop plots' twins: three slots, one painted, driven by
+   * the clock and by the snapshot rather than by a `prop` event alone. Both
+   * take exactly one `pi` per PropSpec like everything else in the dressing
+   * loop below, so the `ord` sequence the MARKET block continues is untouched.
+   * ---------------------------------------------------------------------- */
+  const hay: HaySlot[] = [];
+  const piles: Pile[] = [];
+  const reachById = pileReach(scene.map, doomed);
+  /** Every rick a piece of dressing is worth — its own, and the field's. */
+  const addHay = (site: SiteSpec, p: PropSpec, ord: number): void => {
+    for (const h of hayFor(site, p)) {
+      const idx = Math.abs(h.seed) % scene.pools.haystack.length;
+      const slot: [number, number, number] = [
+        add(scene.pools['hay-heap'][idx], h.gx, h.gy, R_PROP, ord),
+        add(scene.pools['hay-cock'][idx], h.gx, h.gy, R_PROP, ord),
+        add(scene.pools.haystack[idx], h.gx, h.gy, R_PROP, ord),
+      ];
+      on.push(false, false, false);
+      hay.push({ slot, propId: h.propId, at: h.at });
+    }
+  };
+  /** One timber yard, at its three heights. */
+  const addPile = (p: PropSpec, ord: number): void => {
+    const idx = Math.abs(p.seed) % scene.pools.lumber.length;
+    const slot: [number, number, number] = [
+      add(scene.pools['lumber-low'][idx], p.gx, p.gy, R_PROP, ord),
+      add(scene.pools.lumber[idx], p.gx, p.gy, R_PROP, ord),
+      add(scene.pools['lumber-high'][idx], p.gx, p.gy, R_PROP, ord),
+    ];
+    on.push(false, false, false);
+    piles.push({ slot, propId: p.id, reach: reachById.get(p.id) ?? [] });
+  };
+  /* ---- end living details II (additive) -------------------------------- */
   for (const p of scene.map.scatter) {
     /* ---- living details (additive) ---- */
     // A wild crop plot ripens like a farmed one, and exists from t=0.
@@ -1607,10 +1745,28 @@ function* buildVeg(
       // the MARKET block continues with `pi++` is unchanged.
       if (p.kind === 'crop') {
         addCrop(p.gx, p.gy, p.seed, p.id, pi);
+        /* living details II: a farming town's fields fill up with hay as the
+         * corn comes in — the ricks hang off the field, and off nothing else. */
+        addHay(site, p, pi);
         pi++;
         continue;
       }
       /* ---- end living details (additive) ---- */
+      /* ---- living details II (additive) ---- */
+      // Both of these are three-age families now, so the generic reconcile
+      // below must not touch them: `props[pi]` stays -1 exactly as a crop's
+      // does, and `syncVeg` drives the whole thing — appearance AND age.
+      if (p.kind === 'haystack') {
+        addHay(site, p, pi);
+        pi++;
+        continue;
+      }
+      if (p.kind === 'lumber') {
+        addPile(p, pi);
+        pi++;
+        continue;
+      }
+      /* ---- end living details II (additive) ---- */
       const sp = propSprite(scene, p.kind, p.seed, site.accent, p.dir, p.len);
       if (sp) {
         props[pi] = add(sp, p.gx, p.gy, R_PROP, pi);
@@ -1747,6 +1903,18 @@ function* buildVeg(
   for (let i = 0; i < logs.length; i++) if (logs[i] >= 0) logs[i] = pos[logs[i]];
   for (const sp of saplings) sp.slot = pos[sp.slot];
   /* ---- end living details (additive) ---- */
+  /* ---- living details II (additive) ---- */
+  for (const h of hay) {
+    h.slot[0] = pos[h.slot[0]];
+    h.slot[1] = pos[h.slot[1]];
+    h.slot[2] = pos[h.slot[2]];
+  }
+  for (const pl of piles) {
+    pl.slot[0] = pos[pl.slot[0]];
+    pl.slot[1] = pos[pl.slot[1]];
+    pl.slot[2] = pos[pl.slot[2]];
+  }
+  /* ---- end living details II (additive) ---- */
 
   yield;
   const grid = new Map<number, number[]>();
@@ -1784,6 +1952,11 @@ function* buildVeg(
     logOn: [],
     saplings,
     /* ---- end living details (additive) ---- */
+    /* ---- living details II (additive) ---- */
+    hay,
+    piles,
+    pileFelled: -1,
+    /* ---- end living details II (additive) ---- */
   };
   yield;
   bakeVeg(scene, veg);
@@ -1843,6 +2016,9 @@ function patchVeg(veg: VegLayer, r: VegItem): void {
 export function invalidateVeg(scene: GenesisScene): void {
   scene.veg.size = -1;
   scene.veg.propSize = -1;
+  /* living details II: the timber count runs backwards on a scrub like
+   * everything else, and its fingerprint has to be told so. */
+  scene.veg.pileFelled = -1;
 }
 
 /**
@@ -1987,6 +2163,40 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
     want(sp.slot, snap.t >= sp.t && snap.trees.get(sp.treeId) === 'stump');
   }
   /* ---- end living details (additive) ------------------------------------- */
+
+  /* ---- living details II (additive): the hay and the timber ---------------
+   * Hay is the crops' twin in every respect: stateless, three `want`s, gated
+   * on the timeline having raised the field it belongs to. A rick that has not
+   * been cut yet is three failed comparisons and no work at all, which is what
+   * it is for most of the day.
+   *
+   * Timber is the one thing here with a fingerprint, because it is the one
+   * thing whose stage does not move on the clock: a pile only ever changes
+   * when an axe finishes, and `snap.felled` grows by exactly one when that
+   * happens. Off that count, the reach scan runs a couple of hundred times a
+   * day instead of sixty times a second.
+   * ---------------------------------------------------------------------- */
+  for (const h of veg.hay) {
+    const stage = snap.props.has(h.propId) ? hayStage(snap.t, h.at) : -1;
+    want(h.slot[0], stage === 0);
+    want(h.slot[1], stage === 1);
+    want(h.slot[2], stage === 2);
+  }
+  // The fingerprint is BOTH counts, packed: a yard that goes up in the evening
+  // after the last axe has finished still has to appear, and on that frame the
+  // fell count has not moved. `props.size` cannot reach the multiplier.
+  const felled = snap.felled ?? EMPTY_FELLED;
+  const pilePrint = felled.size * 100003 + snap.props.size;
+  if (veg.piles.length && veg.pileFelled !== pilePrint) {
+    veg.pileFelled = pilePrint;
+    for (const pl of veg.piles) {
+      const stage = snap.props.has(pl.propId) ? pileStage(pl.reach, felled) : -1;
+      want(pl.slot[0], stage === 0);
+      want(pl.slot[1], stage === 1);
+      want(pl.slot[2], stage === 2);
+    }
+  }
+  /* ---- end living details II (additive) ---------------------------------- */
 
   if (!changed.length) return;
   for (const i of changed) veg.on[i] = !veg.on[i];
@@ -3662,6 +3872,42 @@ export function renderGenesis(
     const tr = scene.map.trees[k];
     const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
     const sp = p[Math.abs(tr.seed) % p.length];
+    /* ---- living details II (additive) ---------------------------------- *
+     * The last five minutes of a chop are the tree going over.
+     * The window comes off the plan's own `chop-done` and the phase off
+     * `snap.t` — NOT off `clock`, which is the ambient one and stops when the
+     * player pauses. So a paused frame at 09:14 draws the same tree at the
+     * same angle every time, which is what the A/B harness pins.
+     * -------------------------------------------------------------------- */
+    const ph = leanPhase(scene.chopDone.get(tr.id), snap.t);
+    if (ph >= 0) {
+      const { k: kk, squash } = leanOf(tr.kind, leanDir(tr.seed), ph);
+      const x = isoX(tr.gx, tr.gy);
+      const y = isoY(tr.gx, tr.gy);
+      if (!inView(x, y)) continue;
+      // Whole world pixels, and the sprite's own origin is already whole, so
+      // the foot of the trunk lands exactly where the standing sprite's did.
+      const fx = Math.round(x);
+      const fy = Math.round(y);
+      // The sheared box, so the occlusion repair knows the whole of what the
+      // fall covers — the crown reaches a good deal further than the sprite.
+      const lx0 = -sp.ox;
+      const lx1 = lx0 + sp.c.width;
+      const ly0 = -sp.oy;
+      const ly1 = ly0 + sp.c.height;
+      const x0 = Math.min(lx0 - kk * ly0, lx0 - kk * ly1);
+      const x1 = Math.max(lx1 - kk * ly0, lx1 - kk * ly1);
+      items.push({
+        depth: y,
+        bx: Math.floor(fx + x0),
+        by: Math.floor(fy + squash * ly0),
+        bw: Math.ceil(x1 - x0) + 2,
+        bh: Math.ceil(squash * (ly1 - ly0)) + 2,
+        draw: (c) => drawLeaningTree(c, sp, fx, fy, kk, squash),
+      });
+      continue;
+    }
+    /* ---- end living details II (additive) ------------------------------- */
     // A tree under the axe leans and shivers a couple of pixels — enough to
     // spot from across the valley, cheap enough to be a whole-pixel offset.
     const sway = Math.round(Math.sin(clock * 3.1 + tr.seed) * 2);

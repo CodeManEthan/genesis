@@ -742,19 +742,19 @@ const COVERAGE: { head: string; body: string }[] = [
       'seasonCanvas runs over the six DECIDUOUS pools and the ground tint. crop, haystack, reeds and flowers are summer art in every month, so a winter valley still has a green cornfield in it.',
   },
   {
-    head: 'A tree still falls in one nudge',
+    head: 'The fall is a transform, not a drawing',
     body:
-      'The ladder now runs standing → felling → stump → stump with its log → stump, and three to five saplings come up on cleared ground in the evening. The fall itself is still the standing sprite shoved ±2px: there is no half-fallen trunk, no lean, and nothing between “upright” and “gone”.',
+      'The ladder runs standing → felling → leaning → stump with its log → stump, and three to five saplings come up on cleared ground in the evening. But the lean is the standing sprite under a shear and a squash, per kind — a fir goes over stiff and late, a willow slumps early — and not art: the crown is the same crown, sheared. A drawn half-fallen trunk, with the hinge splintered and the crown crumpled into the ground, is still missing.',
   },
   {
-    head: 'Crops ripen; nothing else does',
+    head: 'Crops, hay and timber ripen; nothing else does',
     body:
-      'crop is three sprites now and moves through them on the clock. haystack, crates, barrels and cart are still one sprite for the whole day — a haystack never grows as it is built up, and a store’s crates never stack higher as the town around them does. Everything except the fields still expresses progress through buildings alone.',
+      'crop, haystack and lumber are three sprites each now and move through them on the clock (hay) or on the count of chops finished within reach (timber). crates, barrels and cart are still one sprite for the whole day — a store’s crates never stack higher as the town around them does. Everything except the fields, the hay and the yards still expresses progress through buildings alone.',
   },
   {
     head: 'The log is hauled by nobody',
     body:
-      'A felled trunk lies for 90 world-minutes and then stops existing. No carrier walks out to it, no cart takes it, and the lumber pile in the yard does not grow by one when it goes — the two halves of the valley’s timber economy are drawn, and never joined up.',
+      'A felled trunk lies for 90 world-minutes and then stops existing. No carrier walks out to it and no cart takes it. The yard it should have gone to does now grow — but on the fraction of the wood within reach that has come down, not on any particular log arriving, so the two halves of the timber economy still only rhyme.',
   },
 ];
 
@@ -957,6 +957,37 @@ export default function Catalog() {
   }, [pools]);
 
   /* ---- end living details (additive) ------------------------------------ */
+
+  /* ---- living details II (additive) -------------------------------------- */
+
+  /** Hay and timber, each at the three ages the afternoon walks them through.
+   * Pool index is shared with the middle age, exactly as the crops' is. */
+  const growthStages = useMemo(() => {
+    const out: Item[] = [];
+    const fam: [string, string, string][][] = [
+      [
+        ['hay-heap', 'haystack', 'cut · +0'],
+        ['hay-cock', 'haystack', 'cocked · +30 min'],
+        ['haystack', 'haystack', 'ricked · +60 min'],
+      ],
+      [
+        ['lumber-low', 'lumber', 'under half the wood down'],
+        ['lumber', 'lumber', 'half the wood down'],
+        ['lumber-high', 'lumber', 'nearly all of it down'],
+      ],
+    ];
+    for (const family of fam) {
+      for (let v = 0; v < 2; v++) {
+        for (const [kind, label, sub] of family) {
+          const p = pools[kind] ?? [];
+          if (p[v]) out.push(item(`gs-${kind}-${v}`, label, spriteCanvas(p[v]), { sub }));
+        }
+      }
+    }
+    return out;
+  }, [pools]);
+
+  /* ---- end living details II (additive) ---------------------------------- */
 
   const extras = useMemo(() => {
     const out: Item[] = [];
@@ -1326,7 +1357,7 @@ export default function Catalog() {
   const counts = {
     structures: structures.length + materials.length + stages.length + roofs.length,
     trees: trees.length + treeStates.length + treeAfter.length,
-    props: props.length + treasure.length + extras.length + cropStages.length,
+    props: props.length + treasure.length + extras.length + cropStages.length + growthStages.length,
     inhabitants: anims.length,
     wildlife: wildlife.length,
     infra: bridges.length + roads.length + grounds.length,
@@ -1419,6 +1450,13 @@ export default function Catalog() {
             items={cropStages}
           />
           {/* ---- end living details (additive) ---- */}
+          {/* ---- living details II (additive) ---- */}
+          <Row
+            title={`Growth stages (${growthStages.length})`}
+            note="Two more props that are not a single sprite. Hay is cut between 15:12 and 16:36 and takes an hour to go from a heap to a poled rick, and a farming town grows another one to three of them round each field through the afternoon on top. A timber yard's height is the FRACTION of the wood within ten tiles of it that has actually come down at t, so it fills as its own axes finish — no new event, no new snapshot state, just a count of the chop-dones the day already records. Both families share a pool index with the middle age, so a yard or a rick keeps its identity as it grows."
+            items={growthStages}
+          />
+          {/* ---- end living details II (additive) ---- */}
           <Row
             title={`Treasure (${TREASURE_POOLS.length} states)`}
             note="Pooled, but never a PropSpec: chests are their own list on the map. The timeline walks a found chest along all three — mound, prised open, emptied."

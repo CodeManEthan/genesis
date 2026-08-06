@@ -19,6 +19,23 @@ const { mulberry32, hashSeed } = await import(join(gdir, 'types.ts'));
 const { buildTimeline, emptySnapshot, snapshotAt, advance } = await import(
   join(gdir, 'timeline.ts')
 );
+/* ---- living details II (additive) ---------------------------------------- *
+ * The three new details are RENDER-side, but every one of them is a pure
+ * function of the plan and the clock, and living.ts is where that arithmetic
+ * lives precisely so this file can check it without a canvas. Nothing about
+ * the snapshot or the event stream changed for any of them — see (j3) and the
+ * living-details section near the bottom.
+ * -------------------------------------------------------------------------- */
+const {
+  LEAN_FOR,
+  chopDoneTimes,
+  doomedTrees,
+  hayFor,
+  hayStage,
+  leanPhase,
+  pileReach,
+  pileStage,
+} = await import(join(gdir, 'living.ts'));
 
 let generateMap = null;
 try {
@@ -97,13 +114,18 @@ function makeFixture(seed, opts) {
         clears,
       });
     }
+    // LIVING DETAILS II: `timber` and `hay` were `crates` and `sheep`. Both of
+    // those kinds took the generic branch in the prop scheduler and so do these
+    // two, with the same single rng draw, so the event stream is byte for byte
+    // what it was — and every fixture case now carries a timber yard and a rick
+    // for the growth checks near the bottom of this file to bite on.
     const props = [
       { id: `s${s}-well`, kind: 'well', gx: cx - 2, gy: cy, seed: 1 },
       { id: `s${s}-board`, kind: 'nameboard', gx: cx - 3, gy: cy + 1, seed: 2 },
-      { id: `s${s}-crates`, kind: 'crates', gx: cx + 1, gy: cy - 2, seed: 3 },
+      { id: `s${s}-timber`, kind: 'lumber', gx: cx + 1, gy: cy - 2, seed: 3 },
       { id: `s${s}-lamp0`, kind: 'lamp', gx: cx, gy: cy + 3, seed: 4 },
       { id: `s${s}-lamp1`, kind: 'lamp', gx: cx + 3, gy: cy + 3, seed: 5 },
-      { id: `s${s}-sheep`, kind: 'sheep', gx: cx + 5, gy: cy + 5, seed: 6 },
+      { id: `s${s}-hay`, kind: 'haystack', gx: cx + 5, gy: cy + 5, seed: 6 },
     ];
     sites.push({
       id: `s${s}`,
@@ -616,6 +638,67 @@ function run(label, map, pace = 1) {
     }
   }
 
+  /* (j3) living details II: the half-fallen tree.
+   *
+   * The lean is the last `LEAN_FOR` of a chop and nothing else — no new event,
+   * no new snapshot field, no ambient clock. Two things have to hold for that
+   * to be honest, and both are checkable here without ever drawing anything:
+   *
+   *   the window is INSIDE the chop   a tree may only be drawn leaning while
+   *                                   the snapshot says it is `felling`, so
+   *                                   the renderer's own gate is the invariant:
+   *                                   at every sampled moment, every tree with
+   *                                   a lean phase is a felling tree. A chop
+   *                                   shorter than LEAN_FOR clamps by itself.
+   *   it ENDS at the fall             phase 1 is `chop-done`, which is the
+   *                                   instant the stump and the log appear.
+   *
+   * Sampled at the two edges and the middle of every lean window in the day,
+   * which is where an off-by-one would live if there were one. */
+  {
+    const map0 = chopDoneTimes(tl);
+    if (map0.size !== chopDone.size) bad(`(j3) chopDoneTimes saw ${map0.size} of ${chopDone.size} falls`);
+    for (const [id, cd] of map0) {
+      if (chopDone.get(id) !== cd) bad(`(j3) chopDoneTimes[${id}] = ${cd}, event at ${chopDone.get(id)}`);
+      const cs = chopStart.get(id);
+      if (cs === undefined) bad(`(j3) ${id} falls at ${hhmm(cd)} with no chop-start`);
+      else if (!(cs < cd)) bad(`(j3) ${id}: chop-start ${hhmm(cs)} not before chop-done ${hhmm(cd)}`);
+      // the phase runs 0 -> 1 across the window, and is -1 on both sides of it
+      if (leanPhase(cd, cd - LEAN_FOR - 1e-9) !== -1) bad(`(j3) ${id} leaning before its window`);
+      if (leanPhase(cd, cd) !== -1) bad(`(j3) ${id} still leaning at chop-done`);
+      const p0 = leanPhase(cd, cd - LEAN_FOR + 1e-9);
+      const p1 = leanPhase(cd, cd - 1e-9);
+      if (!(p0 >= 0 && p0 < 0.01)) bad(`(j3) ${id} phase ${p0} at the top of the window`);
+      if (!(p1 > 0.99 && p1 <= 1)) bad(`(j3) ${id} phase ${p1} at the bottom of the window`);
+    }
+    // …and the gate itself: sampled inside every window, the tree is felling.
+    // One forward walk, not a snapshot each — the samples are sorted and
+    // `advance` is the same state the renderer would be looking at.
+    // A road crew working against the head's deadline can hurry a tree down in
+    // 24 SECONDS, which is a chop shorter than the lean — so the window a tree
+    // is actually seen leaning through is the lean window intersected with its
+    // own chop, and the probes are taken inside that. That intersection is not
+    // arithmetic anywhere in the renderer: it falls out of drawing a lean only
+    // for a tree the snapshot calls `felling`, which is what this checks.
+    const probes = [];
+    for (const [id, cd] of map0) {
+      const from = Math.max(chopStart.get(id) ?? cd, cd - LEAN_FOR);
+      for (const at of [(from + cd) / 2, cd - 1e-6]) {
+        if (at > from && at < 24 && leanPhase(cd, at) >= 0) probes.push([at, id]);
+      }
+    }
+    probes.sort((a, b) => a[0] - b[0]);
+    const walk = emptySnapshot(map);
+    let leaned = 0;
+    for (const [at, id] of probes) {
+      advance(walk, tl, at);
+      const st = walk.trees.get(id);
+      if (st !== 'felling') bad(`(j3) ${id} leaning at ${hhmm(at)} but the snapshot says ${st}`);
+      else leaned++;
+    }
+    if (full && chopDone.size && !leaned) bad(`(j3) not one tree ever went over`);
+  }
+
   /* (l) road felling: nothing is left standing on finished road surface */
   for (const r of map.roads) {
     const list = roadEv.get(r.id) ?? [];
@@ -1075,6 +1158,141 @@ total += shapes.length;
       prev = e;
     }
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* living details II — hay, timber, and same t + same seed = same world       */
+/* -------------------------------------------------------------------------- */
+/*
+ * The three details of this wave are drawn by scene.ts but DECIDED by
+ * living.ts, which is a pure function of the map, the plan and `t` — no new
+ * event type, no new snapshot field, nothing ambient. That is what is checked
+ * here, on the real generated worlds as well as the fixtures:
+ *
+ *   growth is MONOTONE      hay only ever gets taller, and so does a timber
+ *                           pile, because the count it is made of only ever
+ *                           grows. A detail that goes backwards as the day
+ *                           runs forwards is the whole failure mode.
+ *   placement REPLAYS       the same map gives the same ricks in the same
+ *                           places with the same clocks, every call.
+ *   the same t is the same world  the state at 17:00 reached by scrubbing and
+ *                           the state at 17:00 reached by playing are byte for
+ *                           byte the same string — which is the property the
+ *                           paused A/B screenshot harness rests on.
+ */
+{
+  console.log(`\n${'='.repeat(72)}`);
+  console.log('living details II — leaning trees, haystacks, lumber piles');
+
+  /** Everything the three details would draw at this snapshot, as one string. */
+  const livingAt = (tl, snap, hayPlans, reachById) => {
+    const parts = [];
+    for (const [id, cd] of chopDoneTimes(tl)) {
+      const ph = leanPhase(cd, snap.t);
+      // the renderer's own gate: only a tree the snapshot calls felling leans
+      if (ph >= 0 && snap.trees.get(id) === 'felling') parts.push(`L${id}:${ph.toFixed(9)}`);
+    }
+    hayPlans.forEach((h, i) => {
+      parts.push(`H${i}:${snap.props.has(h.propId) ? hayStage(snap.t, h.at) : -1}`);
+    });
+    for (const [id, reach] of reachById) {
+      parts.push(`P${id}:${snap.props.has(id) ? pileStage(reach, snap.felled ?? new Map()) : -1}`);
+    }
+    return parts.join('|');
+  };
+
+  let hayTotal = 0;
+  let pileTotal = 0;
+  for (const [label, map] of cases) {
+    const fails = [];
+    const bad = (m) => fails.push(m);
+    const tl = buildTimeline(map);
+    const doomed = doomedTrees(map);
+    const reachById = pileReach(map, doomed);
+    const propById = new Map();
+    for (const s of map.sites) for (const p of s.props) propById.set(p.id, p);
+
+    /* --- the hay ---------------------------------------------------------- */
+    const hayPlans = [];
+    for (const s of map.sites) {
+      for (const p of s.props) {
+        const plans = hayFor(s, p);
+        if (JSON.stringify(hayFor(s, p)) !== JSON.stringify(plans))
+          bad(`hayFor(${p.id}) is not a function of its arguments`);
+        let prev = -Infinity;
+        for (const h of plans) {
+          if (h.propId !== p.id) bad(`hay off ${p.id} gated on ${h.propId}`);
+          if (!(h.at >= 15 && h.at <= 21)) bad(`hay off ${p.id} cut at ${hhmm(h.at)} — not an afternoon`);
+          if (!(h.at > prev)) bad(`hay off ${p.id} out of order: ${hhmm(h.at)} after ${hhmm(prev)}`);
+          prev = h.at;
+          const d = Math.hypot(h.gx - p.gx, h.gy - p.gy);
+          if (d > 3) bad(`hay off ${p.id} stands ${d.toFixed(1)} tiles away — that is not its field`);
+          // three ages, in order, each of them arrived at once and never left
+          if (hayStage(h.at - 1e-9, h.at) !== -1) bad(`hay off ${p.id} exists before it is cut`);
+          if (hayStage(h.at, h.at) !== 0) bad(`hay off ${p.id} does not start as a heap`);
+          if (hayStage(24, h.at) !== 2) bad(`hay off ${p.id} is still not a rick at midnight`);
+          let last = -1;
+          for (let t = 0; t <= 24.0001; t += 0.02) {
+            const st = hayStage(t, h.at);
+            if (st < last) bad(`hay off ${p.id} shrank at ${hhmm(t)}`);
+            last = st;
+          }
+          hayPlans.push(h);
+        }
+        // only a field or a rick grows hay, and a field only in a farming town
+        if (plans.length && p.kind !== 'haystack' && p.kind !== 'crop')
+          bad(`${p.kind} ${p.id} grew hay`);
+        if (plans.length && p.kind === 'crop' && s.profession !== 'farming')
+          bad(`a ${s.profession ?? 'plain'} town's field at ${p.id} grew hay`);
+      }
+    }
+    hayTotal += hayPlans.length;
+
+    /* --- the timber ------------------------------------------------------- */
+    for (const [id, reach] of reachById) {
+      if (propById.get(id)?.kind !== 'lumber') bad(`${id} has a reach but is not a timber yard`);
+      for (const t of reach) if (!doomed.has(t)) bad(`${id} counts ${t}, which nobody fells`);
+      if (pileStage(reach, new Map()) !== (reach.length ? 0 : 1))
+        bad(`${id} does not start at the bottom`);
+    }
+    pileTotal += reachById.size;
+
+    /* --- monotone over the whole day, and the same t twice ---------------- */
+    const walk = emptySnapshot(map);
+    const seen = new Map();
+    let prevPile = new Map();
+    for (let t = 0; t <= 24.0001; t += 0.25) {
+      const at = Math.min(t, 24);
+      advance(walk, tl, at);
+      for (const [id, reach] of reachById) {
+        const st = pileStage(reach, walk.felled ?? new Map());
+        if (st < (prevPile.get(id) ?? 0)) bad(`${id}: the pile shrank at ${hhmm(at)}`);
+        prevPile.set(id, st);
+      }
+      if (Math.abs(at - Math.round(at)) < 1e-9) seen.set(at, livingAt(tl, walk, hayPlans, reachById));
+    }
+    // the same hour, arrived at from a standing start rather than walked to
+    for (const [at, want] of seen) {
+      const got = livingAt(tl, snapshotAt(map, tl, at), hayPlans, reachById);
+      if (got !== want) bad(`${hhmm(at)}: scrubbed world != played world`);
+    }
+    // …and every pile full by the end of a day that finishes its felling
+    for (const [id, reach] of reachById) {
+      if (reach.length >= 6 && pileStage(reach, walk.felled ?? new Map()) !== 2)
+        bad(`${id}: ${reach.length} trees came down within reach and the yard is not full`);
+    }
+
+    total++;
+    if (fails.length) failed++;
+    console.log(
+      `  ${fails.length ? 'FAIL' : 'ok  '} ${label.padEnd(58)} ` +
+        `hay ${String(hayPlans.length).padStart(3)}  yards ${String(reachById.size).padStart(2)}`
+    );
+    for (const m of fails) console.log(`    ! ${m}`);
+  }
+  if (!hayTotal) (console.log('  ! not one haystack in any world'), failed++);
+  if (!pileTotal) (console.log('  ! not one timber yard in any world'), failed++);
+  total += 2;
 }
 
 console.log(`\n${failed ? `${failed}/${total} CASES FAILED` : `all ${total} cases PASS`}`);
