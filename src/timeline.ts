@@ -602,6 +602,15 @@ const LANDMARK_LOG = [
   'Last rafter into {label} at {town}, and a hat thrown at it.',
 ];
 
+/** Only ever drawn for a town that quarries an outcrop and builds in stone. */
+const QUARRY_LOG = [
+  'Stone goes up faster than anyone argues it down at {town}.',
+  'They stop felling and start splitting at {town}: there is rock here, and it dresses well.',
+  'First course laid at {town}. Whatever else this town is, it will still be standing.',
+  'The blocks come down off the outcrop two at a time. {town} is building in stone.',
+  'No thatch at {town}. Slate off the same rock as the walls.',
+];
+
 const SITE_DONE_LOG = [
   '{town} is finished: {nb} buildings, {pop} settlers, one well.',
   'Last shingle at {town}. Nobody has anything left to build.',
@@ -928,6 +937,28 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
         siteId: sid,
         text: fill(draw(LANDMARK_LOG), { label: f.b.label, town: run.site.name }),
       });
+    }
+  }
+
+  // Quarry towns say so, once each, capped at two lines a day so a valley with
+  // four of them does not spend its ledger on masonry. The set of quarry towns
+  // is a property of the MAP (a town builds in stone or it does not), so the
+  // draw count here depends on the map and never on the tempo `p` that plan()
+  // bisects — the ledger reads the same at every tempo.
+  {
+    let said = 0;
+    for (const sid of pl.order) {
+      if (said >= 2) break;
+      const run = pl.runs.get(sid)!;
+      const first = run.site.buildings.find((b) => b.material === 'stone');
+      if (!first) continue;
+      const at = run.finishes.length ? run.finishes[0].t : run.doneT;
+      key.push({
+        t: clamp(at - 0.1, run.foundT + 0.2, 23.2),
+        siteId: sid,
+        text: fill(draw(QUARRY_LOG), { town: run.site.name, valley }),
+      });
+      said++;
     }
   }
 

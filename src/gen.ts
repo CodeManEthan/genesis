@@ -12,9 +12,10 @@
  * down — a smaller scale is a strict prefix of a larger one.
  *
  * GENERATION ORDER (each stage only reads the stages above it):
- *   bounds -> river -> town roster -> accents/names -> road network
- *   (append-only tree, A* routed) -> bridges -> chunks/biomes -> buildings ->
- *   trees -> clears -> wild scatter -> site dressing -> trim to scale.
+ *   bounds -> river -> lakes -> outcrops -> town roster -> accents/names ->
+ *   road network (append-only tree, A* routed) -> bridges -> chunks/biomes ->
+ *   buildings -> trees -> clears -> wild scatter -> shores and boulder fields
+ *   -> site dressing -> trim to scale.
  *
  * ── COORDINATE SPACE ──────────────────────────────────────────────────────
  * All planning happens in screen-aligned (u, v): u = gx - gy, v = gx + gy.
@@ -291,6 +292,321 @@ function relaxTurns(line: Pt[], maxDeg: number, passes: number): Pt[] {
 }
 
 /* ========================================================================== */
+/*  lakes and outcrops — geometry                                             */
+/* ========================================================================== */
+
+/**
+ * The working form of a lake inside the generator: the analytic shape, in u/v.
+ * `LakeSpec` in types.ts is this plus the resolved outline in tile space.
+ */
+interface Lake {
+  id: string;
+  u: number;
+  v: number;
+  rx: number;
+  ry: number;
+  rot: number;
+  /** low-order radial wobble, drawn from the lake's own substream */
+  w1: number;
+  w2: number;
+  p1: number;
+  p2: number;
+  seed: number;
+  fed: boolean;
+  /* --- derived once at construction; every field below is a pure function of
+     the ones above, cached because `lakeDist` sits under the tree loop. --- */
+  /** the outline never reaches past this radius from the centre */
+  maxR: number;
+  /** cos/sin of -rot, for the world -> lake-frame rotation */
+  cr: number;
+  sr: number;
+  /** mean semi-axis — the honest scale of the lake, for laying out its shore */
+  mean: number;
+  /**
+   * SMALLEST semi-axis, and what `lakeDist` scales its normalised residual by.
+   * Using the mean would make the reported distance too generous across the
+   * lake's narrow waist, which is the one direction where being generous puts
+   * a roof in the water. The smallest axis makes every answer a conservative
+   * under-estimate of the true distance, so a margin is always at least met.
+   */
+  unit: number;
+}
+
+/** Fill in a lake's derived fields. The one place `Lake` is constructed. */
+function makeLake(l: Omit<Lake, 'maxR' | 'cr' | 'sr' | 'mean' | 'unit'>): Lake {
+  return {
+    ...l,
+    maxR: Math.max(l.rx, l.ry) * (1 + Math.abs(l.w1) + Math.abs(l.w2)),
+    cr: Math.cos(-l.rot),
+    sr: Math.sin(-l.rot),
+    mean: (l.rx + l.ry) / 2,
+    unit: Math.min(l.rx, l.ry),
+  };
+}
+
+/** Shape radius (a multiple of the ellipse) at angle `a` in the lake's frame. */
+const lakeShape = (l: Lake, a: number) =>
+  1 + l.w1 * Math.sin(3 * a + l.p1) + l.w2 * Math.sin(5 * a + l.p2);
+
+/**
+ * Signed distance from `p` to the lake's shore, in u/v units: negative inside
+ * the water, positive on the land. Approximate — the normalised radial residual
+ * scaled back by the mean semi-axis — but monotonic and exact at the shore
+ * itself, which is all any of the clearance tests below need.
+ */
+function lakeDist(p: Pt, l: Lake): number {
+  const du = p[0] - l.u;
+  const dv = p[1] - l.v;
+  const x = (du * l.cr - dv * l.sr) / l.rx;
+  const y = (du * l.sr + dv * l.cr) / l.ry;
+  const r = Math.hypot(x, y);
+  if (r < 1e-9) return -l.unit;
+  return (r - lakeShape(l, Math.atan2(y, x))) * l.unit;
+}
+
+/** Nearest shore distance over every lake; +Infinity when there are none. */
+function lakesDist(p: Pt, lakes: Lake[]): number {
+  let best = Infinity;
+  for (const l of lakes) {
+    const d = lakeDist(p, l);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * "Is `p` within `margin` of any shore?" — the form every rejection test wants,
+ * and the one that gets called tens of thousands of times per world. The
+ * squared bounding-circle test in front is exact (nothing outside the circle
+ * can be inside the margin) and skips the trig for all but a handful of points.
+ */
+function lakesWithin(p: Pt, lakes: Lake[], margin: number): boolean {
+  for (const l of lakes) {
+    const du = p[0] - l.u;
+    const dv = p[1] - l.v;
+    const bound = margin + l.maxR;
+    if (du * du + dv * dv > bound * bound) continue;
+    if (lakeDist(p, l) < margin) return true;
+  }
+  return false;
+}
+
+/** The lake outline in u/v, at `k` times its nominal radius. */
+function lakeOutline(l: Lake, k: number, n = 28): Pt[] {
+  const c = Math.cos(l.rot);
+  const s = Math.sin(l.rot);
+  const out: Pt[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const rr = lakeShape(l, a) * k;
+    const x = Math.cos(a) * l.rx * rr;
+    const y = Math.sin(a) * l.ry * rr;
+    out.push([l.u + x * c - y * s, l.v + x * s + y * c]);
+  }
+  return out;
+}
+
+/**
+ * Nudge a polyline out of every lake it strays into.
+ *
+ * A* already routes around the water, but the smoothing that follows (simplify
+ * → chaikin → the bridge straightener) cuts corners, and the one corner a road
+ * skirting a lake has is the lake. Pushing the offenders back out along their
+ * own radial is a small, local, rng-free correction; the midpoint pass catches
+ * a straight chord sliced across a narrow neck between two outside vertices.
+ */
+function pushOutOfLakes(line: Pt[], lakes: Lake[], margin: number): Pt[] {
+  if (!lakes.length) return line;
+  const push = (p: Pt): Pt => {
+    for (const l of lakes) {
+      const d = lakeDist(p, l);
+      if (d >= margin) continue;
+      const du = p[0] - l.u;
+      const dv = p[1] - l.v;
+      const len = Math.hypot(du, dv) || 1;
+      const step = margin - d + 0.05;
+      p = [p[0] + (du / len) * step, p[1] + (dv / len) * step];
+    }
+    return p;
+  };
+  let cur = line.map(push);
+  for (let pass = 0; pass < 2; pass++) {
+    const out: Pt[] = [cur[0]];
+    let split = false;
+    for (let i = 1; i < cur.length; i++) {
+      const mid: Pt = [(cur[i - 1][0] + cur[i][0]) / 2, (cur[i - 1][1] + cur[i][1]) / 2];
+      if (lakesDist(mid, lakes) < margin) {
+        out.push(push(mid));
+        split = true;
+      }
+      out.push(cur[i]);
+    }
+    cur = out;
+    if (!split) break;
+  }
+  return cur;
+}
+
+/* ========================================================================== */
+/*  lakes and outcrops — placement                                            */
+/* ========================================================================== */
+
+/** The working form of an outcrop: u/v, plus the radius its boulders fill. */
+interface Outcrop {
+  id: string;
+  u: number;
+  v: number;
+  radius: number;
+  seed: number;
+}
+
+/**
+ * How many lakes the day gets. Roughly a third of valleys have none at all,
+ * which is the point — a lake in every valley is a checklist, not weather.
+ */
+const lakeCount = (r: number): number => (r < 0.32 ? 0 : r < 0.76 ? 1 : 2);
+
+/**
+ * Standing water, laid down straight after the river and before anything that
+ * could get in its way. Nothing here reads the pace scale, so lakes are
+ * byte-identical at every scale by construction.
+ *
+ * The ellipse and its position come off the MAIN stream (this is the one
+ * sanctioned reseed this feature performs — see buildMap); the shape wobble
+ * comes off a per-lake substream keyed on (seed, index), so the outline detail
+ * costs the main stream nothing and cannot drift if the wobble is ever retuned.
+ */
+function makeLakes(
+  rng: () => number,
+  seed: number,
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[]
+): Lake[] {
+  const n = lakeCount(rng());
+  const lakes: Lake[] = [];
+  for (let i = 0; i < n; i++) {
+    // Shape first, off the lake's own stream: the wobble decides the bounding
+    // radius, and the bounding radius is what every constraint below tests.
+    const srng = mulberry32((seed ^ 0x3d9f1b27 ^ Math.imul(i + 1, 0x9e3779b1)) >>> 0);
+    const w1 = 0.06 + srng() * 0.11;
+    const w2 = 0.03 + srng() * 0.07;
+    const p1 = srng() * Math.PI * 2;
+    const p2 = srng() * Math.PI * 2;
+    const wob = 1 + w1 + w2;
+
+    // One lake a day may be fed by the river; the rest stand on their own.
+    const wantFed = i === 0 && rng() < 0.42;
+    let placed = false;
+    for (let pass = 0; pass < 2 && !placed; pass++) {
+      const fed = wantFed && pass === 0;
+      for (let t = 0; t < 500 && !placed; t++) {
+        const rx = 2.2 + rng() * 2.1; // 4.4 .. 8.6 units across the long way
+        const ry = rx * (0.64 + rng() * 0.36); // and never thinner than 2/3 of it
+        const rot = rng() * Math.PI * 2;
+        const maxR = Math.max(rx, ry) * wob;
+        const margin = maxR + 3;
+        const u = lerp(content.u0 + margin, content.u1 - margin, rng());
+        const v = lerp(content.v0 + margin, content.v1 - margin, rng());
+        const c: Pt = [u, v];
+        // Leave the middle of the valley to the founding house.
+        if (Math.hypot(u, v) < 12) continue;
+        const dRiver = polyDist(c, river);
+        if (fed) {
+          // The water has to run into the rim, not across the middle.
+          const inner = Math.min(rx, ry) * wob;
+          if (dRiver < inner * 0.6 || dRiver > inner * 0.98) continue;
+        } else if (dRiver < maxR + 2.4) continue;
+        let clash = false;
+        for (const o of lakes) {
+          if (dist(c, [o.u, o.v]) < maxR + o.maxR + 3) {
+            clash = true;
+            break;
+          }
+        }
+        if (clash) continue;
+        lakes.push(
+          makeLake({
+            id: `lk${lakes.length}`,
+            u,
+            v,
+            rx,
+            ry,
+            rot,
+            w1,
+            w2,
+            p1,
+            p2,
+            seed: (seed + i * 26417 + 13) >>> 0,
+            fed,
+          })
+        );
+        placed = true;
+      }
+    }
+  }
+  return lakes;
+}
+
+/**
+ * Bare rock: 1-2 clusters, off the water and off the lakes, and never dead
+ * centre. A town that ends up within QUARRY_REACH of one builds in stone.
+ */
+function makeOutcrops(
+  rng: () => number,
+  seed: number,
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[],
+  lakes: Lake[]
+): Outcrop[] {
+  const n = rng() < 0.45 ? 1 : 2;
+  const out: Outcrop[] = [];
+  for (let i = 0; i < n; i++) {
+    let placed = false;
+    for (let t = 0; t < 500 && !placed; t++) {
+      const radius = 2.4 + rng() * 2.0;
+      const margin = radius + 5;
+      const u = lerp(content.u0 + margin, content.u1 - margin, rng());
+      const v = lerp(content.v0 + margin, content.v1 - margin, rng());
+      const c: Pt = [u, v];
+      if (Math.hypot(u, v) < 13) continue;
+      if (polyDist(c, river) < radius + 3.5) continue;
+      if (lakesDist(c, lakes) < radius + 3) continue;
+      let clash = false;
+      for (const o of out) {
+        if (dist(c, [o.u, o.v]) < radius + o.radius + 12) {
+          clash = true;
+          break;
+        }
+      }
+      if (clash) continue;
+      out.push({ id: `oc${out.length}`, u, v, radius, seed: (seed + i * 31337 + 71) >>> 0 });
+      placed = true;
+    }
+  }
+  return out;
+}
+
+/**
+ * How close a town's rim has to come to an outcrop before it quarries it.
+ * Measured centre-to-centre less both radii, so it means what it says however
+ * big the town and the rock happen to be.
+ */
+export const QUARRY_REACH = 6;
+
+const quarriesFrom = (u: number, v: number, r: number, outcrops: Outcrop[]): Outcrop | null => {
+  let best: Outcrop | null = null;
+  let bd = Infinity;
+  for (const o of outcrops) {
+    const d = dist([u, v], [o.u, o.v]) - o.radius - r;
+    if (d <= QUARRY_REACH && d < bd) {
+      bd = d;
+      best = o;
+    }
+  }
+  return best;
+};
+
+/* ========================================================================== */
 /*  palettes and tables                                                       */
 /* ========================================================================== */
 
@@ -561,9 +877,18 @@ interface RouteGrid {
   riverD: Float32Array;
   riverTu: Float32Array;
   riverTv: Float32Array;
+  /** Signed shore distance to the nearest lake; +LAKE_FAR where there is none. */
+  lakeD: Float32Array;
 }
 
-function buildRouteGrid(content: { u0: number; v0: number; u1: number; v1: number }, river: Pt[]): RouteGrid {
+/** Beyond this the lake cost is flat zero, so it need not be stored exactly. */
+const LAKE_FAR = 99;
+
+function buildRouteGrid(
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[],
+  lakes: Lake[]
+): RouteGrid {
   const u0 = Math.ceil(content.u0);
   const v0 = Math.ceil(content.v0);
   const w = Math.floor(content.u1) - u0 + 1;
@@ -571,6 +896,7 @@ function buildRouteGrid(content: { u0: number; v0: number; u1: number; v1: numbe
   const riverD = new Float32Array(w * h);
   const riverTu = new Float32Array(w * h);
   const riverTv = new Float32Array(w * h);
+  const lakeD = new Float32Array(w * h).fill(LAKE_FAR);
   for (let j = 0; j < h; j++) {
     for (let i = 0; i < w; i++) {
       const near = polyNear([u0 + i, v0 + j], river);
@@ -580,12 +906,46 @@ function buildRouteGrid(content: { u0: number; v0: number; u1: number; v1: numbe
       riverTv[k] = near.tv;
     }
   }
-  return { u0, v0, w, h, riverD, riverTu, riverTv };
+  // Only the cells the lake can actually reach are visited, so a valley with no
+  // lakes pays nothing at all for this and a valley with two pays for two
+  // little boxes rather than for the whole grid.
+  for (const l of lakes) {
+    const reach = l.maxR + LAKE_ZONE + 1;
+    const i0 = clamp(Math.floor(l.u - reach - u0), 0, w - 1);
+    const i1 = clamp(Math.ceil(l.u + reach - u0), 0, w - 1);
+    const j0 = clamp(Math.floor(l.v - reach - v0), 0, h - 1);
+    const j1 = clamp(Math.ceil(l.v + reach - v0), 0, h - 1);
+    for (let j = j0; j <= j1; j++) {
+      for (let i = i0; i <= i1; i++) {
+        const k = j * w + i;
+        const d = lakeDist([u0 + i, v0 + j], l);
+        if (d < lakeD[k]) lakeD[k] = d;
+      }
+    }
+  }
+  return { u0, v0, w, h, riverD, riverTu, riverTv, lakeD };
 }
 
 /** Cost of stepping into a river cell: cheap across, ruinous along. */
 const RIVER_ZONE = 2.3;
 const riverStepCost = (align: number) => 6 + 110 * align * align;
+
+/**
+ * The water itself is all but impassable — a road crossing a lake reads as a
+ * bug, where a road crossing a river reads as a bridge waiting to be built. The
+ * shoulder outside it is only mildly discouraged, and deliberately wide: it is
+ * what stops the smoothing passes from cutting the corner back into the water,
+ * and a lane that runs along a shore two units out is the whole point.
+ */
+const LAKE_ZONE = 2.4;
+const lakeStepCost = (d: number) => (d < 0 ? 900 : 22 * (1 - d / LAKE_ZONE));
+
+/**
+ * How far a finished road centreline must stay off a shore, in u/v. A road is
+ * ~1.2 u/v wide at the verge, so this puts the carriageway on the sand rim and
+ * the water just past it — which is the shot: a lane running along the water.
+ */
+const ROAD_LAKE_CLEAR = 1.7;
 
 /** Binary min-heap over (cost, node). */
 function makeHeap() {
@@ -706,6 +1066,7 @@ function routeRoad(grid: RouteGrid, start: Pt, goal: Pt, avoid: { u: number; v: 
         const align = Math.abs((du * grid.riverTu[nb] + dv * grid.riverTv[nb]) / step);
         c += riverStepCost(align) * step;
       }
+      if (grid.lakeD[nb] < LAKE_ZONE) c += lakeStepCost(grid.lakeD[nb]) * step;
       const tentative = gScore[cur] + c;
       if (tentative < gScore[nb]) {
         gScore[nb] = tentative;
@@ -1125,6 +1486,52 @@ function buildMap(seed: number, scale: number): GenesisMap {
   // has to keep its whole clearing off the water (radius + 1.2), otherwise a
   // road can start life already on the far bank and the crossing vanishes.
   const RIVER_CLEAR = 4.2;
+  // ---- what standing water and bare rock keep to themselves, in u/v -------
+  // One table, so "does this system know about lakes?" is a question with a
+  // written answer. Roads have their own (ROAD_LAKE_CLEAR, LAKE_ZONE) because
+  // they are enforced by the router rather than by rejection sampling.
+  /** A town green keeps this much dry land between its rim and a shore … */
+  const SITE_LAKE_CLEAR = 2.2;
+  /** … and this much soil between its rim and bare rock. Together with
+   * QUARRY_REACH that leaves a band a few units wide in which a town is close
+   * enough to an outcrop to quarry it without being built on top of it. */
+  const SITE_ROCK_CLEAR = 2.5;
+  /** A plot never sits on a shore or on a boulder field, at any stage. */
+  const PLOT_LAKE_CLEAR = 1.2;
+  const PLOT_ROCK_CLEAR = 1.0;
+  /** Wood grows to the shore but not into it, and not out of bare stone. */
+  const TREE_LAKE_CLEAR = 0.85;
+  const TREE_ROCK_CLEAR = 0.5;
+  /** Wells, lamps, fences, carts: dressing keeps its feet dry too. */
+  const PROP_LAKE_CLEAR = 1.1;
+  const PROP_ROCK_CLEAR = 0.8;
+
+  /* ---- lakes and outcrops ---------------------------------------------- */
+  // ┌── THE ONE SANCTIONED RESEED ────────────────────────────────────────┐
+  // │ These two calls are the only insertion this feature makes into the  │
+  // │ main rng stream, and they sit here — after the river, before the    │
+  // │ first town — because both of them are terrain the towns have to     │
+  // │ keep out of. Everything downstream shifts by their draws, so every  │
+  // │ world is a new world as of this commit. That is deliberate and it   │
+  // │ happens exactly once: nothing may ever be spliced in above, below   │
+  // │ or between these two lines again without the same ceremony.         │
+  // └─────────────────────────────────────────────────────────────────────┘
+  const lakes = makeLakes(rng, seed, content, river);
+  const outcrops = makeOutcrops(rng, seed, content, river, lakes);
+  /** Nearest lake shore, signed: negative in the water. */
+  const lakeD = (p: Pt) => lakesDist(p, lakes);
+  /** Standing water plus its margin is off limits to `what`. */
+  const offLake = (p: Pt, margin: number) => lakesWithin(p, lakes, margin);
+  /** Bare rock is no place for a roof, a hedge or a well either. */
+  const offRock = (p: Pt, margin: number): boolean => {
+    for (const o of outcrops) {
+      const du = p[0] - o.u;
+      const dv = p[1] - o.v;
+      const bound = o.radius + margin;
+      if (du * du + dv * dv < bound * bound) return true;
+    }
+    return false;
+  };
 
   /* ---- sites ----------------------------------------------------------- */
   interface Site {
@@ -1156,6 +1563,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
         const rad = Math.sqrt(rng()) * reach;
         const p: Pt = [Math.cos(a) * rad, Math.sin(a) * rad];
         if (polyDist(p, river) < Math.max(RIVER_CLEAR, rTry + 1.2)) continue;
+        if (offLake(p, rTry + SITE_LAKE_CLEAR)) continue;
+        if (offRock(p, rTry + SITE_ROCK_CLEAR)) continue;
         placed = p;
         r0 = rTry;
         break;
@@ -1168,15 +1577,28 @@ function buildMap(seed: number, scale: number): GenesisMap {
       let bestP: Pt = [0, 0];
       for (let u = -12; u <= 12; u += 1.5) {
         for (let v = -12; v <= 12; v += 1.5) {
-          const d = polyDist([u, v], river) - Math.hypot(u, v) * 0.2;
+          const p: Pt = [u, v];
+          let d = polyDist(p, river) - Math.hypot(u, v) * 0.2;
+          // Standing water and bare rock count against a spot exactly as the
+          // river does, so the insurance sweep never parks the first house on
+          // a shore it cannot build on.
+          d = Math.min(d, lakeD(p) - SITE_LAKE_CLEAR);
+          for (const o of outcrops) {
+            d = Math.min(d, dist(p, [o.u, o.v]) - o.radius - SITE_ROCK_CLEAR);
+          }
           if (d > best) {
             best = d;
-            bestP = [u, v];
+            bestP = p;
           }
         }
       }
       placed = bestP;
-      r0 = Math.max(7, Math.min(r0, polyDist(bestP, river) - 1.2));
+      let room = polyDist(bestP, river) - 1.2;
+      room = Math.min(room, lakeD(bestP) - SITE_LAKE_CLEAR);
+      for (const o of outcrops) {
+        room = Math.min(room, dist(bestP, [o.u, o.v]) - o.radius - SITE_ROCK_CLEAR);
+      }
+      r0 = Math.max(7, Math.min(r0, room));
     }
     sites.push({ id: 's0', name: '', u: placed[0], v: placed[1], r: r0, accent: ACCENTS[0] });
   }
@@ -1204,6 +1626,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
           const v = lerp(content.v0 + margin, content.v1 - margin, rng());
           const p: Pt = [u, v];
           if (polyDist(p, river) < Math.max(RIVER_CLEAR, r + 1.2)) continue;
+          if (offLake(p, r + SITE_LAKE_CLEAR)) continue;
+          if (offRock(p, r + SITE_ROCK_CLEAR)) continue;
           if (needFar && pass === 0 && bankOf(p) === homeBank) continue;
           let ok = true;
           for (const s of sites) {
@@ -1251,6 +1675,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
         const v = lerp(content.v0 + margin, content.v1 - margin, rng());
         const p: Pt = [u, v];
         if (polyDist(p, river) < Math.max(RIVER_CLEAR, r + 1.2)) continue;
+        if (offLake(p, r + SITE_LAKE_CLEAR)) continue;
+        if (offRock(p, r + SITE_ROCK_CLEAR)) continue;
         let ok = true;
         for (const s of sites) {
           if (dist(p, [s.u, s.v]) < Math.max(gap, s.r + r + 3)) {
@@ -1344,7 +1770,7 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
-  const grid = buildRouteGrid(content, river);
+  const grid = buildRouteGrid(content, river, lakes);
   const roads: RoadSpec[] = [];
   const bridges: BridgeSpec[] = [];
   const roadLines: Pt[][] = [];
@@ -1372,13 +1798,21 @@ function buildMap(seed: number, scale: number): GenesisMap {
     line[0] = start;
     line[line.length - 1] = goal;
 
-    line = densify(bridgeRoad(line, river), 3.0, 0.4);
+    // A* kept the route out of the water; the smoothing above and the bridge
+    // straightener below both cut corners, and the corner a lakeside road turns
+    // is the lake. Correct the polyline rather than the router: a graded cost
+    // high enough to survive Chaikin would push roads a silly distance out.
+    line = pushOutOfLakes(bridgeRoad(line, river), lakes, ROAD_LAKE_CLEAR);
+    line = densify(line, 3.0, 0.4);
     // Through-roads. s0 keeps a wider berth because its founding house sits on
     // the exact centre; elsewhere the green is empty and the street can run
     // right in. Bridges and arclength fracs are both derived below, from the
     // final polyline, so the extra length is accounted for automatically.
     line = extendIntoTown(line, pa, a === 0 ? 2.1 : 1.4, true);
     line = extendIntoTown(line, pb, b === 0 ? 2.1 : 1.4, false);
+    // The through-road Bezier can bulge off the radial on its way in; the town
+    // green itself is clear of the water, but the bulge is not guaranteed to be.
+    line = pushOutOfLakes(line, lakes, ROAD_LAKE_CLEAR);
 
     const kind: RoadSpec['kind'] = a === 0 || b === 0 ? 'highway' : depth[b] <= 2 ? 'lane' : 'track';
     const width = kind === 'highway' ? 0.62 : kind === 'lane' ? 0.5 : 0.4;
@@ -1434,9 +1868,16 @@ function buildMap(seed: number, scale: number): GenesisMap {
         nearSite = Math.min(nearSite, dist(c, [sites[k].u, sites[k].v]) - sites[k].r);
       }
       const nearRiver = polyDist(c, river);
+      // A lake wets the ground around it exactly as the river does, which is
+      // what puts willows and reeds on a shore without a single special case
+      // further down. Bare rock does the opposite: moor, whatever else it is.
+      const nearLake = lakeD(c);
+      let nearRock = Infinity;
+      for (const o of outcrops) nearRock = Math.min(nearRock, dist(c, [o.u, o.v]) - o.radius);
 
       let biome: Biome = 'meadow';
-      if (nearRiver < 5.5) biome = 'wetland';
+      if (nearRiver < 5.5 || nearLake < 4.5) biome = 'wetland';
+      else if (nearRock < 3.5) biome = 'moor';
       else if (nearSite < 6) biome = 'farm';
       else if (edge > 0.8) biome = 'forest';
       // Open moor: the dry high ground a long way from both the water and the
@@ -1482,8 +1923,15 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const siteBuiltBase: number[] = [];
   const siteBuiltMax: number[] = [];
 
+  /**
+   * The outcrop each town quarries, or null. Read off the FULL roster and the
+   * terrain alone, so a town is a quarry town at every pace or at none.
+   */
+  const siteQuarry = sites.map((s) => quarriesFrom(s.u, s.v, s.r, outcrops));
+
   sites.forEach((site, si) => {
     const brng = mulberry32((seed * 7919 + si * 104729 + 17) >>> 0);
+    const stone = siteQuarry[si] !== null;
     const list: BuildingSpec[] = [];
     // Tie the number of plots to how much green there is, so a 4.5-tile
     // hamlet does not have to squeeze seven roofs onto its rim. `count` is the
@@ -1561,6 +2009,10 @@ function buildMap(seed: number, scale: number): GenesisMap {
           const p: Pt = [site.u + Math.cos(a) * rr, site.v + Math.sin(a) * rr];
           if (!clearOfBuildings(p, r, st.gap)) continue;
           if (polyDist(p, river) < r + st.river) continue;
+          // Water and bare rock never relax across the stages: a plot on a
+          // shore or on a boulder field is not a tight plot, it is a wrong one.
+          if (offLake(p, r + PLOT_LAKE_CLEAR)) continue;
+          if (offRock(p, r + PLOT_ROCK_CLEAR)) continue;
           if (st.road > 0 && roadLines.some((l) => polyDist(p, l) < r + st.road)) continue;
           return p;
         }
@@ -1579,6 +2031,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
           const a = i * GOLDEN + t * 0.2749;
           const p: Pt = [site.u + Math.cos(a) * rr, site.v + Math.sin(a) * rr];
           if (!clearOfBuildings(p, r, 0.15)) continue;
+          if (offLake(p, r + PLOT_LAKE_CLEAR)) continue;
+          if (offRock(p, r + PLOT_ROCK_CLEAR)) continue;
           let road = Infinity;
           for (const l of roadLines) road = Math.min(road, polyDist(p, l));
           if (road >= need) return p;
@@ -1620,9 +2074,11 @@ function buildMap(seed: number, scale: number): GenesisMap {
       }
 
       const p = founding ? ([site.u, site.v] as Pt) : place(i, fpR(w));
+      // Thatch never goes on stone: a quarry town roofs in slate, and the
+      // `!stone` short-circuit means it never spends the thatch roll either.
       const roof: RoofStyle = founding
         ? 'gable'
-        : THATCH_ROLES.has(role) && brng() < 0.72
+        : !stone && THATCH_ROLES.has(role) && brng() < 0.72
           ? 'thatch'
           : brng() < 0.5
             ? 'hip'
@@ -1652,6 +2108,10 @@ function buildMap(seed: number, scale: number): GenesisMap {
         accent: site.accent,
         seed: (seed + si * 7717 + i * 613) >>> 0,
         clears: [],
+        // Set on the FULL roster, so it cannot appear or vanish with the pace.
+        // Left off entirely for a timber town: absent IS 'timber', and writing
+        // it out would only churn every existing world's JSON.
+        ...(stone ? { material: 'stone' as const } : null),
       });
     }
     // Name the buildings this chest paid for, so the timeline can tell at a
@@ -1701,8 +2161,9 @@ function buildMap(seed: number, scale: number): GenesisMap {
   let treeId = 0;
 
   // Trees may now stand ON a planned road — the crews fell them as they build
-  // (see the road `clears` pass below). Only the water still pushes them back.
-  const treeClear = (p: Pt): boolean => polyDist(p, river) >= 1.5;
+  // (see the road `clears` pass below). Only the water and the rock push back.
+  const treeClear = (p: Pt): boolean =>
+    polyDist(p, river) >= 1.5 && !offLake(p, TREE_LAKE_CLEAR) && !offRock(p, TREE_ROCK_CLEAR);
 
   // Spacing test over a 1-unit hash grid, so thickening the wood stays linear.
   const cells = new Map<number, number[]>();
@@ -1980,6 +2441,111 @@ function buildMap(seed: number, scale: number): GenesisMap {
     }
   }
 
+  /* ---- lake shores and outcrop boulders --------------------------------- */
+  // Both are TERRAIN dressed onto the wild scatter list: derived from the
+  // lakes/outcrops and a per-feature substream, never from the pace, so they
+  // stay byte-identical at every scale exactly as the rest of `scatter` does.
+  {
+    /**
+     * The road segments that could come within `pad` of a box around (u, v).
+     * Everything below works one feature at a time inside a small box, so the
+     * whole network is trimmed once per feature rather than walked per
+     * candidate — the same trick the site dressing plays with `segsNearBox`.
+     */
+    const roadSegsAround = (u: number, v: number, reach: number, pad: number): Pt[][] => {
+      const out: Pt[][] = [];
+      for (const line of roadLines) {
+        for (const s of segsNearBox(line, u - reach, v - reach, u + reach, v + reach, pad)) {
+          out.push(s);
+        }
+      }
+      return out;
+    };
+    /** Free ground for a wild prop: off the roads, out of the greens, spaced. */
+    const wildOk = (p: Pt, gap: number, roadSegs: Pt[][]): boolean => {
+      if (p[0] < bounds.u0 + 1 || p[0] > bounds.u1 - 1) return false;
+      if (p[1] < bounds.v0 + 1 || p[1] > bounds.v1 - 1) return false;
+      for (const s of sites) if (dist(p, [s.u, s.v]) < s.r + 1) return false;
+      if (anySegWithin(p, roadSegs, 1.1)) return false;
+      for (const q of scatterUV) if (dist(p, q) < gap) return false;
+      return true;
+    };
+    /**
+     * Undergrowth gives way, exactly as it does to a fence — but only wild
+     * undergrowth. A tree somebody is already coming to fell keeps its
+     * appointment and the prop goes somewhere else.
+     */
+    const takeGround = (p: Pt, r: number): boolean => {
+      const hits: number[] = [];
+      for (const i of treesNear(p[0], p[1], r)) {
+        if (dist(treeUV[i], p) >= r) continue;
+        if (protectedTrees.has(trees[i].id) || roadClaimed.has(trees[i].id)) return false;
+        hits.push(i);
+      }
+      for (const i of hits) dead.add(trees[i].id);
+      return true;
+    };
+    const addWild = (kind: string, p: Pt, s: number) => {
+      const [gx, gy] = uv(p[0], p[1]);
+      scatter.push({ id: `pr${scatter.length}`, kind, gx, gy, seed: s >>> 0 });
+      scatterUV.push(p);
+    };
+
+    // A reed-and-boulder collar just outside the water line. Reeds carry it —
+    // a shore that is all rock reads as a quarry, and the wetland biome the
+    // lake imposes has already put willows behind them.
+    const SHORE_KINDS: [string, number][] = [
+      ['reeds', 0.52], ['rock', 0.18], ['bush', 0.16], ['flowers', 0.14],
+    ];
+    for (const l of lakes) {
+      const lrng = mulberry32((l.seed ^ 0x51ac3e17) >>> 0);
+      const meanR = l.mean;
+      const nearRoads = roadSegsAround(l.u, l.v, l.maxR + 2.2, 1.1);
+      const perim = Math.PI * (l.rx + l.ry);
+      const target = Math.max(5, Math.round(perim * 0.6));
+      const a0 = lrng() * Math.PI * 2;
+      for (let i = 0; i < target; i++) {
+        const a = a0 + (i / target) * Math.PI * 2 + (lrng() - 0.5) * 0.22;
+        const off = 0.55 + lrng() * 1.15;
+        const k = 1 + off / meanR;
+        const rr = lakeShape(l, a) * k;
+        const x = Math.cos(a) * l.rx * rr;
+        const y = Math.sin(a) * l.ry * rr;
+        const c = Math.cos(l.rot);
+        const s = Math.sin(l.rot);
+        const p: Pt = [l.u + x * c - y * s, l.v + x * s + y * c];
+        const kind = rollKind(lrng(), SHORE_KINDS);
+        if (lakeD(p) < 0.35) continue; // the wobble undershot; that one is water
+        if (polyDist(p, river) < 1.2) continue;
+        if (!wildOk(p, 1.05, nearRoads)) continue;
+        if (!takeGround(p, 0.9)) continue;
+        addWild(kind, p, l.seed + i * 149);
+      }
+    }
+
+    // The rock itself: a boulder field, tighter than anything the wild scatter
+    // lays down, with a little scrub caught between the stones.
+    const ROCK_KINDS: [string, number][] = [
+      ['rock', 0.72], ['bush', 0.16], ['stump', 0.07], ['flowers', 0.05],
+    ];
+    for (const o of outcrops) {
+      const orng = mulberry32((o.seed ^ 0x2b7f4d91) >>> 0);
+      const nearRoads = roadSegsAround(o.u, o.v, o.radius + 1.2, 1.1);
+      const target = Math.round(Math.PI * o.radius * o.radius * 0.62);
+      let placed = 0;
+      for (let t = 0; t < target * 8 && placed < target; t++) {
+        const a = orng() * Math.PI * 2;
+        const rad = Math.sqrt(orng()) * o.radius;
+        const p: Pt = [o.u + Math.cos(a) * rad, o.v + Math.sin(a) * rad];
+        const kind = rollKind(orng(), ROCK_KINDS);
+        if (!wildOk(p, 0.62, nearRoads)) continue;
+        if (!takeGround(p, 0.55)) continue;
+        addWild(kind, p, o.seed + t * 211);
+        placed++;
+      }
+    }
+  }
+
   /* ---- field fences along the farm lanes -------------------------------- */
   // Farmland with a lane through it gets a run of picket fence set back from
   // the carriageway, so the road reads as running between fields instead of
@@ -2007,6 +2573,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
       if (p[1] < bounds.v0 + 1 || p[1] > bounds.v1 - 1) return false;
       if (biomeAt(p) !== 'farm') return false;
       if (polyDist(p, river) < 1.8) return false;
+      if (offLake(p, PROP_LAKE_CLEAR + 0.6)) return false;
+      if (offRock(p, PROP_ROCK_CLEAR)) return false;
       for (const s of sites) if (dist(p, [s.u, s.v]) < s.r + 0.8) return false;
       for (const l of roadLines) if (polyDist(p, l) < 1.35) return false;
       // Undergrowth gives way to the fence, exactly as it does to a well — but
@@ -2118,6 +2686,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
       if (dist(p, [site.u, site.v]) > reach) return false;
       if (anySegWithin(p, nearRiverSegs, 1.6)) return false;
       if (anySegWithin(p, nearRoadSegs, 1.3)) return false;
+      if (offLake(p, PROP_LAKE_CLEAR)) return false;
+      if (offRock(p, PROP_ROCK_CLEAR)) return false;
       for (const b of siteBuildings[si]) {
         const bu = b.gx - b.gy;
         const bv = b.gx + b.gy;
@@ -2147,6 +2717,8 @@ function buildMap(seed: number, scale: number): GenesisMap {
         const a = prefA + t * 0.401;
         const rr = site.r * clamp(0.2 + t * 0.006, 0.16, 0.95);
         const p: Pt = [site.u + Math.cos(a) * rr, site.v + Math.sin(a) * rr];
+        // Dressing may crowd a road; it may not stand in a lake or on a rock.
+        if (offLake(p, PROP_LAKE_CLEAR) || offRock(p, PROP_ROCK_CLEAR)) continue;
         let clash = false;
         for (const b of siteBuildings[si]) {
           if (dist(p, [b.gx - b.gy, b.gx + b.gy]) < fpR(b.w) + 0.6) {
@@ -2205,6 +2777,19 @@ function buildMap(seed: number, scale: number): GenesisMap {
         spot(0.66 + prng() * 0.12, prng() * Math.PI * 2),
         61 + i + si * 5
       );
+    }
+
+    // A quarry town keeps its stone yard on the side of the green that faces
+    // the rock: dressed blocks waiting to go up, a crane over them, and the
+    // rough stone they came out of. Part of the ESSENTIALS block, above the
+    // flavour tail, so it is there at every pace or at none.
+    const oc = siteQuarry[si];
+    if (oc) {
+      const yardA = Math.atan2(oc.v - site.v, oc.u - site.u);
+      add(`${site.id}-quarry0`, 'quarry-blocks', spot(0.74, yardA), 71 + si * 7);
+      add(`${site.id}-crane`, 'crane', spot(0.6, yardA + 0.5), 81 + si * 7);
+      add(`${site.id}-quarry1`, 'quarry-blocks', spot(0.66, yardA - 0.62), 91 + si * 7);
+      add(`${site.id}-rubble`, 'rock', spot(0.82, yardA + 1.1), 101 + si * 7);
     }
 
     /* ---- flavour tail: the only part the day's pace can shorten -------- */
@@ -2282,6 +2867,24 @@ function buildMap(seed: number, scale: number): GenesisMap {
     chunks,
     river: river.map((p) => uv(p[0], p[1]) as Vec2),
     riverWidth,
+    lakes: lakes.map((l) => {
+      const [gx, gy] = uv(l.u, l.v);
+      return {
+        id: l.id,
+        gx,
+        gy,
+        rx: l.rx,
+        ry: l.ry,
+        rot: l.rot,
+        seed: l.seed,
+        fed: l.fed,
+        pts: lakeOutline(l, 1).map((p) => uv(p[0], p[1]) as Vec2),
+      };
+    }),
+    outcrops: outcrops.map((o) => {
+      const [gx, gy] = uv(o.u, o.v);
+      return { id: o.id, gx, gy, radius: o.radius, seed: o.seed };
+    }),
     sites: siteSpecs,
     roads: activeRoads,
     bridges: activeBridges,

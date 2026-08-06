@@ -63,6 +63,7 @@ import {
   buildLamp,
   buildLumber,
   buildNameBoard,
+  buildQuarryBlocks,
   buildReeds,
   buildRock,
   buildSheep,
@@ -109,6 +110,7 @@ import {
   type ChestSpec,
   type ChestState,
   type GenesisMap,
+  type LakeSpec,
   type PropSpec,
   type RoadSpec,
   type SiteSpec,
@@ -162,6 +164,7 @@ export function makePools(season: Season = 'summer'): Record<string, Sprite[]> {
     'chest-buried': pool(3, (i) => buildChestMound(211 + i * 13)),
     'chest-closed': pool(2, (i) => buildChest(false, 223 + i * 17)),
     'chest-open': pool(2, (i) => buildChest(true, 227 + i * 19)),
+    'quarry-blocks': pool(3, (i) => buildQuarryBlocks(139 + i * 21)),
   };
   if (season !== 'summer') {
     for (const k of DECIDUOUS) for (const sp of pools[k]) seasonCanvas(sp.c, season);
@@ -491,6 +494,27 @@ export function strip(ctx: Ctx, pts: Vec2[], halfW: number, color: string): void
 }
 
 /**
+ * A lake's outline scaled about its own centre.
+ *
+ * `lk.pts` is the shore at k = 1, and the generator builds it as centre plus a
+ * radial offset — so scaling those offsets is exactly the same curve the
+ * generator would have produced at that radius, which is what lets the whole
+ * five-strip bake below come out of one stored polygon.
+ */
+export function lakeRing(lk: LakeSpec, k: number): Vec2[] {
+  return lk.pts.map(([gx, gy]) => [lk.gx + (gx - lk.gx) * k, lk.gy + (gy - lk.gy) * k] as Vec2);
+}
+
+/** Fill a closed tile-space polygon. The lake counterpart of `strip`. */
+export function waterBlob(ctx: Ctx, pts: Vec2[], color: string): void {
+  poly(
+    ctx,
+    pts.map(([gx, gy]) => [isoX(gx, gy), isoY(gx, gy)] as Pt),
+    color
+  );
+}
+
+/**
  * One road, painted along a tile-space polyline: verge, edge, carriageway, a
  * paler centre for a highway, then loose stones seeded from `stoneSeed` so the
  * ruts do not crawl frame to frame. Exported so the catalog can draw a sample
@@ -579,6 +603,22 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
     return ws > 0 ? [wr / ws, wg / ws, wb / ws] : [142, 208, 159];
   };
 
+  /* ---- bare stone showing through under every outcrop ------------------ */
+  // The boulders themselves are ordinary `rock` scatter; this is the ground
+  // they stand on, so an outcrop reads as a patch of exposed rock rather than
+  // as a suspiciously tidy pile of stones on a lawn.
+  const outcrops = map.outcrops ?? [];
+  const rockAt = (gx: number, gy: number): number => {
+    let best = 0;
+    for (const o of outcrops) {
+      const du = gx - gy - (o.gx - o.gy);
+      const dv = gx + gy - (o.gx + o.gy);
+      const d = Math.hypot(du, dv) / Math.max(1.5, o.radius);
+      if (d < 1.2) best = Math.max(best, Math.min(1, (1.2 - d) / 0.5));
+    }
+    return best;
+  };
+
   /* ---- a soft glade under every planned site --------------------------- */
   const gladeAt = (gx: number, gy: number): number => {
     let best = 0;
@@ -612,11 +652,16 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
 
       const glade = gladeAt(gx, gy);
       if (glade > 0) col = mix(col, PAL.dirtPale, glade * 0.3);
+      const rocky = rockAt(gx, gy);
+      if (rocky > 0) col = mix(col, PAL.stoneDark, rocky * 0.62);
 
       isoTile(ctx, sx, sy, col);
 
       const r = grng();
-      if (glade < 0.4 && r < 0.09) {
+      if (rocky > 0.5 && r < 0.16) {
+        rect(ctx, sx - 3, sy, 4, 1, shade(PAL.stone, -0.14));
+      } else if (glade < 0.4 && r < 0.09) {
+        // Seasonal grass-edge tufts (day-types branch) on non-rocky ground.
         rect(ctx, sx - 4, sy + 1, 2, 1, grassEdge);
         rect(ctx, sx + 2, sy - 2, 2, 1, grassEdge);
       } else if (glade < 0.4 && r < 0.12) {
@@ -625,6 +670,39 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
       } else if (glade > 0.5 && r < 0.06) {
         rect(ctx, sx - 2, sy, 3, 1, PAL.dirtEdge);
       }
+    }
+  }
+
+  /* ---- the lakes ------------------------------------------------------- */
+  // Drawn BEFORE the river, so a river-fed lake reads as the water widening
+  // out rather than as a pond laid on top of a channel that vanishes into it.
+  // Same five-strip family as the river below — sand, dark sand, shallow,
+  // water, deep — plus a darker heart, because a pond with a light middle
+  // reads as a puddle.
+  for (const lk of map.lakes ?? []) {
+    const ring = (k: number) => lakeRing(lk, k);
+    waterBlob(ctx, ring(1.15), PAL.sand);
+    waterBlob(ctx, ring(1.07), shade(PAL.sand, -0.12));
+    waterBlob(ctx, ring(1.0), PAL.waterLight);
+    waterBlob(ctx, ring(0.93), PAL.water);
+    waterBlob(ctx, ring(0.76), PAL.waterDeep);
+    waterBlob(ctx, ring(0.44), shade(PAL.waterDeep, -0.16));
+    // Foam where the water meets the sand, and a couple of flat glints out on
+    // the surface, both seeded off the lake so they never crawl.
+    const lrng = mulberry32((lk.seed ^ 0x606f0a11) >>> 0);
+    const shore = ring(1.0);
+    for (let i = 0; i < shore.length; i++) {
+      const a = shore[i];
+      const b = shore[(i + 1) % shore.length];
+      const t = lrng();
+      const gx = a[0] + (b[0] - a[0]) * t;
+      const gy = a[1] + (b[1] - a[1]) * t;
+      rect(ctx, isoX(gx, gy) - 2, isoY(gx, gy), 3 + lrng() * 4, 1, PAL.waterFoam);
+    }
+    const glint = ring(0.6);
+    for (let i = 0; i < glint.length; i += 5) {
+      const [gx, gy] = glint[i];
+      rect(ctx, isoX(gx, gy) - 3, isoY(gx, gy), 4 + lrng() * 5, 1, shade(PAL.waterLight, 0.18));
     }
   }
 
@@ -902,6 +980,7 @@ function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): Stru
     roof: b.roof,
     progress,
     condition: 1,
+    material: b.material,
     chimney: b.chimney,
     cupola: b.cupola,
     awning: b.awning,

@@ -92,7 +92,7 @@ export interface TreeSpec {
 /** Non-tree scenery. Kinds must be ones the vale's art.ts can draw:
  * bush | rock | flowers | reeds | stump | crop | haystack | fenceL | fenceR |
  * shed | cart | crates | lumber | barrels | well | lamp | signpost |
- * nameboard | stake | campfire | sheep | crane
+ * nameboard | stake | campfire | sheep | crane | quarry-blocks
  */
 export interface PropSpec {
   id: string; // "pr88" (site dressing gets site prefix, e.g. "s2-well")
@@ -124,6 +124,13 @@ export type StructureRole =
 
 export type RoofStyle = 'hip' | 'gable' | 'flat' | 'thatch';
 
+/**
+ * What a building is BUILT of. Absent means 'timber' — the original cream
+ * render-and-frame walls every town had before quarry towns existed, so an
+ * older fixture or a hand-written spec keeps drawing exactly what it drew.
+ */
+export type BuildMaterial = 'timber' | 'stone';
+
 export interface BuildingSpec {
   id: string; // "s0-b0"
   siteId: string;
@@ -143,6 +150,8 @@ export interface BuildingSpec {
   /** Tree ids standing on/near this plot that must be felled before the plot
    * can be surveyed. Empty for the founding house (sites[0].buildings[0]). */
   clears: string[];
+  /** Optional; absent === 'timber'. Every plot in a quarry town is 'stone'. */
+  material?: BuildMaterial;
 }
 
 export interface SiteSpec {
@@ -227,6 +236,50 @@ export interface ChestSpec {
   grantIds: string[];
 }
 
+/* --------------------------- standing water ------------------------------ */
+
+/**
+ * Standing water. A lake is an ellipse in screen-aligned u/v with a low-order
+ * radial wobble on it, so it reads as a blobby pond rather than as a drawn
+ * ellipse. Both descriptions are carried:
+ *
+ *   gx/gy/rx/ry/rot/seed  the analytic shape — cheap containment and margin
+ *                         tests, and what the outline was generated from.
+ *   pts                   the resolved closed outline in TILE space, which is
+ *                         what the renderer fills and what the harness tests
+ *                         road crossings against. First point is not repeated.
+ *
+ * Lakes are TERRAIN: generated before the town roster, from the seed alone, so
+ * they are byte-identical at every pace scale.
+ */
+export interface LakeSpec {
+  id: string; // "lk0"
+  gx: number; // centre, tile space
+  gy: number;
+  rx: number; // semi-axis along the lake's own major axis, in u/v units
+  ry: number; // semi-axis across it
+  rot: number; // rotation of the major axis in u/v space, radians
+  seed: number; // the wobble substream seed
+  /** True when the river runs into the lake's rim — a fed lake, not a pond. */
+  fed: boolean;
+  /** Closed outline, tile space, ~28 points. */
+  pts: Vec2[];
+}
+
+/**
+ * A bare rock outcrop: the reason a town builds in stone. The boulders
+ * themselves are ordinary `rock` entries in `scatter`; this is the field that
+ * says where the stone is, and it is what makes a nearby town a quarry town.
+ * Terrain, like lakes — never a function of the pace scale.
+ */
+export interface OutcropSpec {
+  id: string; // "oc0"
+  gx: number;
+  gy: number;
+  radius: number; // u/v units, ~2.4..4.4
+  seed: number;
+}
+
 export interface GenesisMap {
   version: 1;
   seed: number;
@@ -235,6 +288,10 @@ export interface GenesisMap {
   chunks: Chunk[];
   river: Vec2[]; // polyline
   riverWidth: number; // ~0.95
+  /** Standing water, 0..2 of them. Terrain: never a function of the scale. */
+  lakes: LakeSpec[];
+  /** Bare rock, 1..2 clusters. Terrain, and the reason quarry towns exist. */
+  outcrops: OutcropSpec[];
   /** sites[0] sits near the map centre and is where the day begins. */
   sites: SiteSpec[];
   /** The FULL planned road network. Roads are revealed over the day by the

@@ -14,10 +14,13 @@
  */
 
 import type {
+  BuildMaterial,
   BuildingSpec,
   Chunk,
   GenesisEvent,
   GenesisMap,
+  LakeSpec,
+  OutcropSpec,
   PropSpec,
   RoofStyle,
   SiteSpec,
@@ -84,7 +87,13 @@ interface B {
   clears?: string[];
 }
 
-function building(siteId: string, accent: string, b: B, seed: number): BuildingSpec {
+function building(
+  siteId: string,
+  accent: string,
+  b: B,
+  seed: number,
+  material?: BuildMaterial
+): BuildingSpec {
   const [gx, gy] = P(b.u, b.v);
   return {
     id: b.id,
@@ -95,7 +104,8 @@ function building(siteId: string, accent: string, b: B, seed: number): BuildingS
     label: b.label,
     w: b.w,
     floors: b.floors,
-    roof: b.roof,
+    // A stone town never thatches, exactly as in gen.ts.
+    roof: material === 'stone' && b.roof === 'thatch' ? 'gable' : b.roof,
     chimney: !!b.chimney,
     awning: !!b.awning,
     banner: !!b.banner,
@@ -103,6 +113,7 @@ function building(siteId: string, accent: string, b: B, seed: number): BuildingS
     accent,
     seed,
     clears: b.clears ?? [],
+    ...(material ? { material } : null),
   };
 }
 
@@ -289,9 +300,80 @@ const SCATTER: [string, string, number, number][] = [
   ['pr20', 'bush', -4, 38],
 ];
 
+/* ----------------------------- water and rock ---------------------------- */
+
+/**
+ * A hand-authored lake, built the same way gen.ts builds one: an ellipse in
+ * u/v with a low-order radial wobble on it, resolved to a closed outline. The
+ * renderer only ever reads `pts` (and scales it about gx/gy), so this is the
+ * whole contract — but the analytic fields are carried too, exactly as the
+ * generator carries them, so a test written against either one works here.
+ */
+function lake(
+  id: string,
+  u: number,
+  v: number,
+  rx: number,
+  ry: number,
+  rot: number,
+  fed: boolean,
+  seed: number
+): LakeSpec {
+  const w1 = 0.13;
+  const w2 = 0.06;
+  const p1 = 0.7;
+  const p2 = 2.3;
+  const pts: Vec2[] = [];
+  for (let i = 0; i < 28; i++) {
+    const a = (i / 28) * Math.PI * 2;
+    const k = 1 + w1 * Math.sin(3 * a + p1) + w2 * Math.sin(5 * a + p2);
+    const x = Math.cos(a) * rx * k;
+    const y = Math.sin(a) * ry * k;
+    pts.push(P(u + x * Math.cos(rot) - y * Math.sin(rot), v + x * Math.sin(rot) + y * Math.cos(rot)));
+  }
+  const [gx, gy] = P(u, v);
+  return { id, gx, gy, rx, ry, rot, seed, fed, pts };
+}
+
+function outcrop(id: string, u: number, v: number, radius: number, seed: number): OutcropSpec {
+  const [gx, gy] = P(u, v);
+  return { id, gx, gy, radius, seed };
+}
+
+/** Boulders for the outcrop, and reeds/rocks round the shore. */
+const LAKE_SHORE: [string, string, number, number][] = [
+  ['pr30', 'reeds', -32, 8.5],
+  ['pr31', 'reeds', -27.5, 6],
+  ['pr32', 'rock', -22.5, 9],
+  ['pr33', 'reeds', -24, 14.5],
+  ['pr34', 'bush', -29, 16],
+  ['pr35', 'reeds', -33.5, 13],
+  ['pr36', 'flowers', -34.5, 11],
+];
+const ROCK_FIELD: [string, string, number, number][] = [
+  ['pr40', 'rock', 30, 18],
+  ['pr41', 'rock', 32, 20.5],
+  ['pr42', 'rock', 28.5, 20],
+  ['pr43', 'rock', 31, 16],
+  ['pr44', 'bush', 33, 18.5],
+  ['pr45', 'rock', 29, 22.5],
+  ['pr46', 'stump', 33.5, 21.5],
+];
+
 /* ---------------------------------- map ---------------------------------- */
 
-export function fixtureMap(): GenesisMap {
+/**
+ * The fixture world.
+ *
+ * `lakes` and `quarry` are knobs rather than fixtures because the two features
+ * they turn on are precisely the ones with no hand-written world to fall back
+ * on: `fixtureMap({ lakes: false, quarry: false })` is the pre-lake valley, so
+ * a renderer bug can be bisected against it exactly the way `USE_GENERATED`
+ * bisects a generation bug against the whole file.
+ */
+export function fixtureMap(opts: { lakes?: boolean; quarry?: boolean } = {}): GenesisMap {
+  const withLakes = opts.lakes ?? true;
+  const withQuarry = opts.quarry ?? true;
   const s0: SiteSpec = {
     id: 's0',
     name: 'Hollowmere',
@@ -309,8 +391,13 @@ export function fixtureMap(): GenesisMap {
     gy: P(16, 22)[1],
     radius: 7,
     accent: ROSE,
-    buildings: S1_BUILDINGS.map((b, i) => building('s1', ROSE, b, 700 + i * 11)),
-    props: S1_PROPS,
+    // Brightwold quarries the outcrop on the east ridge, so it builds in stone.
+    buildings: S1_BUILDINGS.map((b, i) =>
+      building('s1', ROSE, b, 700 + i * 11, withQuarry ? 'stone' : undefined)
+    ),
+    props: withQuarry
+      ? [...S1_PROPS, prop('s1-quarry0', 'quarry-blocks', 24.5, 20, 27), prop('s1-crane', 'crane', 22, 18.5, 28)]
+      : S1_PROPS,
   };
 
   return {
@@ -321,6 +408,8 @@ export function fixtureMap(): GenesisMap {
     chunks: makeChunks(),
     river: [P(2, -4), P(0, 8), P(3, 20), P(1, 32), P(4, 46), P(2, 64)],
     riverWidth: 0.95,
+    lakes: withLakes ? [lake('lk0', -28.5, 11.5, 4.2, 2.8, 0.4, false, 4321)] : [],
+    outcrops: withQuarry ? [outcrop('oc0', 31, 19.5, 3.2, 8765)] : [],
     sites: [s0, s1],
     roads: [
       {
@@ -346,7 +435,11 @@ export function fixtureMap(): GenesisMap {
       const [gx, gy] = P(u, v);
       return { id, kind, gx, gy, seed: 5000 + i * 13 } as TreeSpec;
     }),
-    scatter: SCATTER.map(([id, kind, u, v], i) => prop(id, kind, u, v, 9000 + i * 17)),
+    scatter: [
+      ...SCATTER.map(([id, kind, u, v], i) => prop(id, kind, u, v, 9000 + i * 17)),
+      ...(withLakes ? LAKE_SHORE.map(([id, kind, u, v], i) => prop(id, kind, u, v, 9500 + i * 17)) : []),
+      ...(withQuarry ? ROCK_FIELD.map(([id, kind, u, v], i) => prop(id, kind, u, v, 9700 + i * 17)) : []),
+    ],
     valleyName: 'Amberdown',
   };
 }
@@ -354,7 +447,7 @@ export function fixtureMap(): GenesisMap {
 /* -------------------------------- timeline ------------------------------- */
 
 /** A hand-authored day: every event type, roughly one beat every 25 minutes. */
-export function fixtureTimeline(_map: GenesisMap): Timeline {
+export function fixtureTimeline(map: GenesisMap): Timeline {
   const e: GenesisEvent[] = [
     { t: 0.4, type: 'log', text: 'First light. One chimney, one kettle.', siteId: 's0' },
     { t: 0.9, type: 'chop-start', treeId: 'tr01' },
@@ -440,6 +533,22 @@ export function fixtureTimeline(_map: GenesisMap): Timeline {
     { t: 23.6, type: 'prop', propId: 's0-sheep', siteId: 's0' },
     { t: 23.8, type: 'log', text: 'Lamps lit in both towns. The day closes.' },
   ];
+  // Anything the map dresses a town with that the script above does not name —
+  // the quarry yard, for one — still has to appear, or it would sit in the map
+  // and never be drawn. They go up through the middle of the afternoon, in
+  // array order, which is the order the contract says dressing appears in.
+  {
+    const scheduled = new Set(e.filter((x) => x.type === 'prop').map((x) => x.propId));
+    const extra: { propId: string; siteId: string }[] = [];
+    for (const s of map.sites) {
+      for (const p of s.props) {
+        if (!scheduled.has(p.id)) extra.push({ propId: p.id, siteId: s.id });
+      }
+    }
+    extra.forEach((x, i) => {
+      e.push({ t: 12 + ((i + 1) / (extra.length + 1)) * 6, type: 'prop', ...x });
+    });
+  }
   e.sort((a, b) => a.t - b.t);
   return { events: e };
 }
