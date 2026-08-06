@@ -2739,3 +2739,185 @@ function ruinDrum(
 /* ========================================================================== */
 /*  end ruins (additive)                                                      */
 /* ========================================================================== */
+
+/* ====================== market day, and the festival ====================== *
+ * MARKET+FESTIVAL — additive block. Four sprite factories and one measurement,
+ * used by Genesis for the rare market day and for the evening a valley earns by
+ * finishing everything early. Nothing above this line knows they exist.
+ * -------------------------------------------------------------------------- */
+
+/** Bunting, pennants and goods: warm, and deliberately not any one town accent. */
+const FESTIVE = ['#ef7f93', '#f0c75e', '#6cc4d9', '#9b8fe8', '#63c9a8', '#f5a25d'];
+
+/**
+ * How high the ridge of a finished building stands above its ground point.
+ *
+ * The same three numbers `buildStructure` uses and nothing else — so a string
+ * of bunting tied between two roofs is tied to the roofs and not to a guess.
+ * Cheap enough to call per building per frame, which is the point: the caller
+ * gets the height without baking the house.
+ */
+export function roofPeak(w: number, floors: number, roof: RoofStyle): number {
+  const W = Math.max(16, Math.round(w / 4) * 4);
+  const roofH = roof === 'flat' ? 5 : Math.round(W * (roof === 'thatch' ? 0.34 : 0.3));
+  return floors * STORY + roofH;
+}
+
+/** One band of a quad, `t0..t1` of the way from edge A→B towards edge D→C. */
+function band(ctx: Ctx, A: Pt, B: Pt, D: Pt, C: Pt, t0: number, t1: number, col: string): void {
+  const lp = (a: Pt, b: Pt, t: number): Pt => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  poly(ctx, [lp(A, B, t0), lp(A, B, t1), lp(D, C, t1), lp(D, C, t0)], col);
+}
+
+/**
+ * A market stall: four posts, a plank counter with something on it, and a
+ * striped awning over the lot.
+ *
+ * The stripes are the whole job of the sprite — a plain awning at this size is
+ * a shed — so they run down the slope of each roof face rather than across it,
+ * which is the direction that survives the 2:1 isometric squash.
+ */
+export function buildMarketStall(seed: number, accent: string): Sprite {
+  const rng = mulberry32(seed >>> 0);
+  const pale = mix(accent, '#fdf3e2', 0.72);
+  const RW = 22;
+  const ry = -13;
+  const roofH = 5;
+  const goods = [FESTIVE[Math.floor(rng() * 6)], FESTIVE[Math.floor(rng() * 6)]];
+  return makeSprite(RW + 12, 40, (RW + 12) / 2, 30, (ctx) => {
+    poly(ctx, diamond(1, 1, RW - 2), PAL.shadow);
+
+    /* ---- posts and counter ------------------------------------------- */
+    const posts: Pt[] = [
+      [-9, -1],
+      [9, -1],
+      [-1, -5],
+      [1, 3],
+    ];
+    for (const p of posts) rect(ctx, p[0], p[1] - 13, 1, 13, PAL.woodDark);
+    // A trestle table across the near two posts, seen end-on.
+    poly(ctx, diamond(0, -6, 17), PAL.woodLight);
+    poly(ctx, [[-8.5, -6], [0, -1.8], [0, 0.2], [-8.5, -4]], PAL.wood);
+    poly(ctx, [[8.5, -6], [0, -1.8], [0, 0.2], [8.5, -4]], PAL.woodDark);
+    // …and something worth stopping for on top of it.
+    rect(ctx, -5, -9, 4, 3, goods[0]);
+    rect(ctx, 1, -10, 3, 4, goods[1]);
+    rect(ctx, -1, -8, 2, 2, PAL.crop[2]);
+
+    /* ---- the striped awning ------------------------------------------ */
+    const N: Pt = [0, ry - RW / 4];
+    const E: Pt = [RW / 2, ry];
+    const S: Pt = [0, ry + RW / 4];
+    const Wc: Pt = [-RW / 2, ry];
+    const R1: Pt = [-RW / 4, ry - RW / 8 - roofH];
+    const R2: Pt = [RW / 4, ry + RW / 8 - roofH];
+    const K = 5;
+    for (let i = 0; i < K; i++) {
+      const c = i % 2 ? accent : pale;
+      band(ctx, N, E, R1, R2, i / K, (i + 1) / K, shade(c, -0.42));
+      band(ctx, Wc, S, R1, R2, i / K, (i + 1) / K, c);
+    }
+    poly(ctx, [E, S, R2], shade(accent, -0.44));
+    // A scalloped valance along the near eave, so the awning reads as cloth.
+    for (let i = 0; i < 5; i++) {
+      const t = (i + 0.5) / 5;
+      const x = Wc[0] + (S[0] - Wc[0]) * t;
+      const y = Wc[1] + (S[1] - Wc[1]) * t;
+      rect(ctx, x, y, 2, 2, i % 2 ? shade(accent, -0.2) : shade(pale, -0.2));
+    }
+  });
+}
+
+/**
+ * One string of pennants, hung from (0, 0) to (dx, dy) in world pixels.
+ *
+ * Baked per span rather than per unit length because the sag is a property of
+ * the whole string: a short line between two cottages barely dips and a long
+ * one across a square hangs like a washing line. The caller anchors the sprite
+ * at one roof and it reaches the other.
+ */
+export function buildBunting(dx: number, dy: number, seed: number): Sprite {
+  const rng = mulberry32(seed >>> 0);
+  const len = Math.hypot(dx, dy);
+  const sag = Math.min(10, 2.5 + len * 0.07);
+  const PAD = 8;
+  const w = Math.abs(dx) + PAD * 2;
+  const h = Math.abs(dy) + sag + PAD * 2;
+  const ox = (dx < 0 ? -dx : 0) + PAD;
+  const oy = (dy < 0 ? -dy : 0) + PAD;
+  const n = Math.max(4, Math.round(len / 7));
+  const at = (t: number): Pt => [dx * t, dy * t + Math.sin(Math.PI * t) * sag];
+  return makeSprite(w, h, ox, oy, (ctx) => {
+    const steps = Math.max(8, Math.round(len));
+    for (let i = 0; i <= steps; i++) {
+      const p = at(i / steps);
+      rect(ctx, p[0], p[1], 1, 1, PAL.woodDark);
+    }
+    for (let i = 1; i < n; i++) {
+      const p = at(i / n);
+      const col = FESTIVE[(i + Math.floor(rng() * 6)) % FESTIVE.length];
+      poly(ctx, [[p[0] - 2, p[1] + 1], [p[0] + 2, p[1] + 1], [p[0], p[1] + 5]], col);
+      rect(ctx, p[0] - 2, p[1] + 1, 4, 1, shade(col, 0.28));
+    }
+  });
+}
+
+/**
+ * The bonfire, unlit: a ring of stones and a cone of stacked offcuts. The
+ * flames go on top of it every frame from `drawBonfire`, because a fire that
+ * does not move is a woodpile.
+ */
+export function buildBonfire(seed: number): Sprite {
+  const rng = mulberry32(seed >>> 0);
+  return makeSprite(34, 34, 17, 26, (ctx) => {
+    poly(ctx, diamond(1, 2, 26), PAL.shadow);
+    for (let i = 0; i < 10; i++) {
+      const a = (i / 10) * Math.PI * 2 + 0.2;
+      rect(
+        ctx,
+        Math.cos(a) * 11 - 1,
+        (Math.sin(a) * 11) / 2 - 1,
+        3,
+        2,
+        i % 2 ? PAL.stone : PAL.stoneDark
+      );
+    }
+    for (let i = 0; i < 7; i++) {
+      const a = (i / 7) * Math.PI * 2 + rng() * 0.3;
+      const bx = Math.cos(a) * 7;
+      const by = (Math.sin(a) * 7) / 2;
+      poly(ctx, [[bx, by], [bx + 1.6, by], [0.8, -12], [0, -12]], i % 2 ? PAL.wood : PAL.woodDark);
+    }
+    rect(ctx, -5, -2, 10, 2, '#7a4a2a');
+  });
+}
+
+/**
+ * The fire itself: three tongues on different beats and a few sparks off the
+ * top, all on whole pixels — a bonfire at this scale is a flicker, not a shape.
+ */
+export function drawBonfire(ctx: Ctx, x: number, y: number, t: number): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  for (let i = 0; i < 3; i++) {
+    const ph = t * (2.4 + i * 0.7) + i * 2.1;
+    const hgt = 13 + Math.sin(ph) * 4 + Math.sin(ph * 2.3) * 2;
+    const off = Math.round(Math.sin(ph * 1.7) * 2) + (i - 1) * 4;
+    poly(
+      ctx,
+      [[px + off - 4, py - 3], [px + off + 4, py - 3], [px + off, py - hgt]],
+      i === 1 ? '#ff9a4d' : '#f2762f'
+    );
+    poly(
+      ctx,
+      [[px + off - 2, py - 3], [px + off + 2, py - 3], [px + off, py - hgt * 0.62]],
+      '#ffd98a'
+    );
+  }
+  ctx.fillStyle = '#ffd98a';
+  for (let i = 0; i < 4; i++) {
+    const ph = (t * 0.9 + i * 0.25) % 1;
+    const sx = px + Math.round(Math.sin(t * 2 + i * 2.4) * 6);
+    ctx.fillRect(sx, Math.round(py - 12 - ph * 18), 1, 1);
+  }
+}

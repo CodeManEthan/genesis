@@ -37,7 +37,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const gdir = join(root, 'src/components/designs/genesis');
 const { dayTypeOf } = await import(join(gdir, 'daytype.ts'));
 const { generateMap } = await import(join(gdir, 'gen.ts'));
-const { buildTimeline } = await import(join(gdir, 'timeline.ts'));
+const { buildTimeline, festivalAt } = await import(join(gdir, 'timeline.ts'));
 const { TW, TH } = await import(join(gdir, 'types.ts'));
 
 /* --------------------------------- args ---------------------------------- */
@@ -95,6 +95,17 @@ function heaviestSeed(n = 50, pace = 4) {
 const storm = findDay('storm');
 const aurora = findDay('aurora');
 const heavy = heaviestSeed(50, 4);
+// MARKET+FESTIVAL — both add movers (extra road traffic to the market town, the
+// whole founding crew standing round a fire), so both get a scenario of their
+// own at the pace that builds the most valley.
+const market = findDay('market');
+const festival = (() => {
+  for (let s = 1; s < 500; s++) {
+    const map = generateMap(s, 4);
+    if (festivalAt(map, buildTimeline(map))) return s;
+  }
+  return 1;
+})();
 
 // A plain day for the ordinary scenarios: no weather to confound the baseline.
 const plain = (() => {
@@ -125,6 +136,21 @@ const SCENARIOS = [
     id: 'heavy-evening-p4',
     label: `heavy seed ${heavy.seed} · evening · pace 4`,
     seed: heavy.seed,
+    pace: 4,
+    t: 21.5,
+  },
+  // MARKET+FESTIVAL — the two scenarios that add movers.
+  {
+    id: 'market-p4',
+    label: `market ${fmtHour(13)} seed ${market.seed} · pace 4`,
+    seed: market.seed,
+    pace: 4,
+    t: 13.0,
+  },
+  {
+    id: 'festival-p4',
+    label: `festival 21:30 seed ${festival} · pace 4`,
+    seed: festival,
     pace: 4,
     t: 21.5,
   },
@@ -379,7 +405,8 @@ console.log(`genesis-perf — ${HEADED ? 'HEADED (real GPU)' : 'HEADLESS (swifts
 console.log(
   `seeds: plain ${plain} · storm ${storm.seed} (${fmtHour(storm.from)}-${fmtHour(storm.to)}) · ` +
     `aurora ${aurora.seed} (from ${fmtHour(aurora.from)}) · heavy ${heavy.seed} ` +
-    `(${heavy.trees} trees, ${heavy.lakes} lakes, ${heavy.stoneTowns} stone towns, ${heavy.sites} sites)`
+    `(${heavy.trees} trees, ${heavy.lakes} lakes, ${heavy.stoneTowns} stone towns, ${heavy.sites} sites)` +
+    ` · market ${market.seed} (${fmtHour(market.from)}-${fmtHour(market.to)}) · festival ${festival}`
 );
 
 /* one-off world-construction cost under bare node, for comparison only */
@@ -554,7 +581,7 @@ const dump = {
   chrome,
   base: BASE,
   reportsKept: REPORTS,
-  seeds: { plain, storm, aurora, heavy },
+  seeds: { plain, storm, aurora, heavy, market, festival },
   build,
   nodeOneOff,
   results,

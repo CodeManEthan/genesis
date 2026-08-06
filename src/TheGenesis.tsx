@@ -82,7 +82,7 @@ import { generateMap } from './gen';
 /* ---- ruins (additive) ---- */
 import { ghostFor } from './ghost';
 /* ---- end ruins (additive) ---- */
-import { advance, buildTimeline, emptySnapshot, snapshotAt } from './timeline';
+import { advance, buildTimeline, emptySnapshot, festivalAt, snapshotAt } from './timeline';
 
 const USE_GENERATED = true;
 
@@ -114,6 +114,19 @@ function worldFor(map: GenesisMap): World {
 }
 
 const loadWorld = (seed: number, pace = 1): World => worldFor(loadMap(seed, pace));
+
+/**
+ * FESTIVAL — the one thing about the day the bake cannot work out for itself.
+ *
+ * Whether the valley finished early enough to earn an evening is a fact about
+ * the *timeline*, and `buildGenesisScene` has never seen one. So it is joined on
+ * here, at the only three places that ever hold a matching scene and world:
+ * first load, a rebuild, and the world waiting on the far side of midnight.
+ */
+function withFestival(sc: GenesisScene, w: World): GenesisScene {
+  sc.fest = festivalAt(w.map, w.timeline);
+  return sc;
+}
 
 /* --------------------------------- helpers ------------------------------- */
 
@@ -439,10 +452,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       setTDisp(t0);
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
-      sceneRef.current = buildGenesisScene(
-        world.map,
-        dayFor(seed0),
-        ghostOf(world.map, seed0)
+      sceneRef.current = withFestival(
+        buildGenesisScene(world.map, dayFor(seed0), ghostOf(world.map, seed0)),
+        world
       );
       ambRef.current = makeAmbient(pace0);
       settleAmbient(sceneRef.current, ambRef.current, snapRef.current);
@@ -627,7 +639,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         pending.steps = buildGenesisSceneSteps(pending.map, dayFor(s), pending.ghost);
       else {
         const r = pending.steps.next();
-        if (r.done) pending.scene = r.value;
+        if (r.done) pending.scene = withFestival(r.value, pending.world!);
       }
     };
 
@@ -650,7 +662,10 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       pending = null;
       world = loadWorld(s, p);
       worldRef.current = world;
-      scene = buildGenesisScene(world.map, dayFor(s), ghostOf(world.map, s));
+      scene = withFestival(
+        buildGenesisScene(world.map, dayFor(s), ghostOf(world.map, s)),
+        world
+      );
       sceneRef.current = scene;
       setAmbientPace(amb, p);
       snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
