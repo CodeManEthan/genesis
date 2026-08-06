@@ -1343,6 +1343,7 @@ export function resetAmbient(scene: GenesisScene, amb: Ambient, snap: WorldSnaps
   amb.sig = '';
   amb.rng = mulberry32(4242);
   syncAmbient(scene, amb, snap);
+  resetWildlife(scene, amb, snap); // WILDLIFE — same call site, same reproducibility
 }
 
 /** Settle the crowd so a paused or reduced-motion visitor gets a lived-in world. */
@@ -1823,6 +1824,7 @@ export function renderGenesis(
   scene.lit = sky.night > 0.5;
   scene.relight = 4;
   syncVeg(scene, snap);
+  const wild = tickWildlife(scene, amb, snap, sky, clock); // WILDLIFE
 
   // Whole world pixels, always: the buffer is drawn at 1 unit = 1 art pixel, so
   // a fractional camera would land sprites and spans off the buffer's own grid
@@ -2094,6 +2096,9 @@ export function renderGenesis(
     });
   }
 
+  // WILDLIFE — ground-dwellers, inside the repair pass with the rest of the crowd.
+  pushWildlife(scene, wild, items, wx0, wy0, wx1, wy1);
+
   /* ---- occlusion repair ------------------------------------------------
    * Everything above was drawn *after* the whole standing wood, so a mover
    * that should be hidden behind a nearer trunk would walk over it. Redraw the
@@ -2152,6 +2157,7 @@ export function renderGenesis(
   items.sort((a, b) => a.depth - b.depth);
   for (const it of items) it.draw(g);
 
+  drawWildlifeAir(g, scene, wild, wx0, wy0, wx1, wy1); // WILDLIFE — above the canopy
   drawSmoke(g, amb.smoke, wx0, wy0, wx1, wy1, sky.night);
 
   /* ---- blit the world buffer to the viewport --------------------------- */
@@ -2205,7 +2211,12 @@ export function renderGenesis(
     ctx.restore();
   }
 
-  /* ---- and whatever weather this rare day has, last of all ------------- */
+  // WILDLIFE — after the sky, so the night fill cannot put the fireflies out.
+  drawFireflies(ctx, wild, cx, cy, scale, dw, dh);
+
+  /* ---- and whatever weather this rare day has, last of all -------------
+     (after the fireflies: rain and mist may veil them, the aurora hangs
+     above them) */
   paintWeather(ctx, scene, snap.t, clock, dw, dh, dpr);
 }
 
@@ -2329,4 +2340,995 @@ function drawSmoke(
     }
     ctx.globalAlpha = 1;
   }
+}
+
+/* ========================================================================== *
+ *                                  WILDLIFE                                  *
+ * -------------------------------------------------------------------------- *
+ * The half of the valley that nobody planned: birds out of a tree that is
+ * coming down, fireflies over the wetland after dark, deer at the treeline in
+ * the hour either side of the light, a flock that actually moves, fish in the
+ * river and a dog behind a cart.
+ *
+ * It is deliberately a *separate* system from the ambient crowd above:
+ *
+ *  - State hangs off a WeakMap keyed by the scene rather than off any of the
+ *    existing structures, so nothing in `GenesisScene`, `Ambient` or the
+ *    snapshot signature has to know it exists. A new world means a new scene
+ *    means new wildlife, and yesterday's is collected with it.
+ *  - It has no signature of its own to re-derive from. `tickWildlife` runs off
+ *    the snapshot and the sky every frame, and takes its `dt` from the
+ *    renderer's own clock — which only advances while the world is running, so
+ *    a paused or reduced-motion visitor gets a frozen tableau for free: deer
+ *    stopped mid-graze, fireflies lit but still, no bird ever startled.
+ *  - All randomness comes off one dedicated mulberry32 stream seeded 7777, and
+ *    `resetWildlife` re-seeds it from the same call site `resetAmbient` uses,
+ *    so a scrub backwards is as reproducible here as it is there.
+ *
+ * Drawing splits three ways. Ground-dwellers (deer, flock, shepherd, dog,
+ * fish, ripples) are pushed as ordinary depth-sorted `Item`s *after* the crowd,
+ * so they are inside the occlusion-repair pass and go behind the trunks they
+ * should. Birds skip repair entirely and are drawn straight over the finished
+ * item pass: they are above the canopy by the second frame of a burst, so
+ * there is nothing in the valley that can legitimately stand in front of one.
+ * Fireflies are drawn last of all, on the *viewport* after the sky multiply —
+ * a firefly that the night fill could dim would not be a firefly.
+ * ========================================================================== */
+
+// A local import block, so this section can be lifted or merged in one piece.
+import {
+  buildBird,
+  buildDeer,
+  buildDog,
+  buildGrazingSheep,
+  drawFishJump,
+  drawRipple,
+} from '../vale/art';
+
+interface WBird {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  age: number;
+  life: number;
+  ph: number;
+}
+interface WFly {
+  bx: number;
+  by: number;
+  x: number;
+  y: number;
+  r: number;
+  ph: number;
+  sp: number;
+  a: number;
+  b: number;
+  c: number;
+}
+interface WDeer {
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  /** 0 graze, 1 amble, 2 bolt. */
+  st: 0 | 1 | 2;
+  timer: number;
+  headT: number;
+  head: 0 | 1;
+  face: boolean;
+  vx: number;
+  vy: number;
+  seed: number;
+}
+interface WSheep {
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  timer: number;
+  graze: boolean;
+  face: boolean;
+  seed: number;
+}
+interface WHerder {
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  timer: number;
+  phase: number;
+  walking: boolean;
+  face: boolean;
+  color: string;
+}
+interface WDog {
+  w: Walker;
+  /** Tiles of road between the cart and the dog. */
+  back: number;
+  want: number;
+  timer: number;
+  gx: number;
+  gy: number;
+  face: boolean;
+  phase: number;
+  pose: 0 | 1;
+}
+interface WFish {
+  x: number;
+  y: number;
+  base: number;
+  vx: number;
+  vy: number;
+}
+interface WRing {
+  x: number;
+  y: number;
+  age: number;
+}
+
+/** A gap in the wood big enough for a deer to stand in, and the way home. */
+interface WSpot {
+  gx: number;
+  gy: number;
+  /** Unit vector pointing back into the trees. */
+  ix: number;
+  iy: number;
+}
+
+/** Everything derived from the *map*, which a scrub cannot change. Built once
+ * per scene and kept across every reset. */
+interface WCache {
+  wet: GenesisMap['chunks'];
+  spots: WSpot[];
+  flock: Vec2 | null;
+  rgeo: RoadGeo | null;
+}
+
+interface Wildlife {
+  ready: boolean;
+  rng: () => number;
+  /** The renderer's clock at the last tick; -1 until the first one. */
+  clock: number;
+  cache: WCache;
+  birds: WBird[];
+  flies: WFly[];
+  deer: WDeer[];
+  sheep: WSheep[];
+  herder: WHerder | null;
+  dogs: WDog[];
+  fish: WFish[];
+  rings: WRing[];
+  /** Tree ids already accounted for, so a *transition* into felling is news. */
+  seen: Set<string>;
+  treeSize: number;
+  /** How much of a firefly there is to see, 0..1. */
+  vis: number;
+  deerCool: number;
+  fishT: number;
+  dogT: number;
+}
+
+const WILD = new WeakMap<GenesisScene, Wildlife>();
+
+/** The wildlife stream. Seeded once here and nowhere else. */
+const WILD_SEED = 7777;
+const FLY_MIN = 8;
+const FLY_MAX = 15;
+/** Dawn and dusk, the two hours a deer will stand in the open. */
+const DEER_WINDOWS: [number, number][] = [
+  [5.4, 8.0],
+  [18.4, 20.6],
+];
+/** Tiles between a deer and a person before the deer decides otherwise. */
+const DEER_SPOOK = 3;
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/* ------------------------------ map cache -------------------------------- */
+
+/**
+ * The two things that need the whole map read: where the wetland is, and where
+ * the wood has an edge. Both are answered off a coarse tree-density grid, so
+ * finding a treeline costs a few hundred hash lookups instead of a few hundred
+ * thousand distance tests.
+ */
+function wildCache(scene: GenesisScene): WCache {
+  const map = scene.map;
+  const wet = map.chunks.filter((c) => c.biome === 'wetland');
+
+  const dens = new Map<number, number>();
+  const dkey = (cx: number, cy: number) => (cx + 1024) * 4096 + (cy + 1024);
+  const cellOf = (g: number) => Math.floor(g / 3);
+  for (const tr of map.trees) {
+    const k = dkey(cellOf(tr.gx), cellOf(tr.gy));
+    dens.set(k, (dens.get(k) ?? 0) + 1);
+  }
+  /** Trees in the (2*rad+1)² block of 3-tile cells around a point. */
+  const around = (gx: number, gy: number, rad: number) => {
+    const cx = cellOf(gx);
+    const cy = cellOf(gy);
+    let n = 0;
+    for (let dy = -rad; dy <= rad; dy++) {
+      for (let dx = -rad; dx <= rad; dx++) n += dens.get(dkey(cx + dx, cy + dy)) ?? 0;
+    }
+    return n;
+  };
+
+  const spots: WSpot[] = [];
+  const rr = mulberry32((map.seed ^ 0x5eed17) >>> 0);
+  const dirs: Vec2[] = [
+    [1, 1],
+    [1, -1],
+    [-1, 1],
+    [-1, -1],
+    [1, 0],
+    [0, 1],
+    [-1, 0],
+    [0, -1],
+  ];
+  const C = map.content;
+  for (let a = 0; a < 300 && spots.length < 4 && map.trees.length; a++) {
+    const tr = map.trees[Math.floor(rr() * map.trees.length)];
+    if (!tr || around(tr.gx, tr.gy, 1) < 9) continue; // must be properly in the wood
+    const d = dirs[Math.floor(rr() * dirs.length)];
+    const L = Math.hypot(d[0], d[1]) || 1;
+    const ox = d[0] / L;
+    const oy = d[1] / L;
+    const gx = tr.gx + ox * 5;
+    const gy = tr.gy + oy * 5;
+    if (around(gx, gy, 0) > 0) continue; // …and the far side properly open
+    if (around(gx + ox * 2, gy + oy * 2, 0) > 0) continue;
+    const u = gx - gy;
+    const v = gx + gy;
+    if (u < C.u0 + 5 || u > C.u1 - 5 || v < C.v0 + 5 || v > C.v1 - 5) continue;
+    let near = false;
+    for (const s of map.sites) {
+      if (Math.hypot(gx - s.gx, gy - s.gy) < s.radius + 6) near = true;
+    }
+    if (near) continue;
+    spots.push({ gx, gy, ix: -ox, iy: -oy });
+  }
+
+  /* ---- the biggest huddle of scattered sheep on the map ----------------- */
+  let flock: Vec2 | null = null;
+  const cells = new Map<number, { n: number; x: number; y: number }>();
+  for (const p of map.scatter) {
+    if (p.kind !== 'sheep') continue;
+    const k = dkey(Math.floor(p.gx / 5), Math.floor(p.gy / 5));
+    const e = cells.get(k);
+    if (e) {
+      e.n++;
+      e.x += p.gx;
+      e.y += p.gy;
+    } else cells.set(k, { n: 1, x: p.gx, y: p.gy });
+  }
+  let best: { n: number; x: number; y: number } | null = null;
+  cells.forEach((e) => {
+    if (!best || e.n > best.n) best = e;
+  });
+  const pick = best as { n: number; x: number; y: number } | null;
+  if (pick && pick.n >= 2) flock = [pick.x / pick.n, pick.y / pick.n];
+
+  return {
+    wet,
+    spots,
+    flock,
+    rgeo: map.river.length >= 2 ? cumulative(map.river) : null,
+  };
+}
+
+function ensureWild(scene: GenesisScene): Wildlife {
+  let wl = WILD.get(scene);
+  if (wl) return wl;
+  wl = {
+    ready: false,
+    rng: mulberry32(WILD_SEED),
+    clock: -1,
+    cache: wildCache(scene),
+    birds: [],
+    flies: [],
+    deer: [],
+    sheep: [],
+    herder: null,
+    dogs: [],
+    fish: [],
+    rings: [],
+    seen: new Set(),
+    treeSize: -1,
+    vis: 0,
+    deerCool: 0,
+    fishT: 6,
+    dogT: 0,
+  };
+  WILD.set(scene, wl);
+  return wl;
+}
+
+/**
+ * Throw the wildlife away and re-seed it, exactly as `resetAmbient` does for
+ * the crowd — and from the same call sites, so a scrub backwards puts the same
+ * fireflies over the same marsh every time.
+ */
+export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnapshot): void {
+  const wl = ensureWild(scene);
+  wl.rng = mulberry32(WILD_SEED);
+  wl.clock = -1;
+  wl.birds.length = 0;
+  wl.deer.length = 0;
+  wl.dogs.length = 0;
+  wl.fish.length = 0;
+  wl.rings.length = 0;
+  wl.deerCool = 0;
+  wl.fishT = 6 + wl.rng() * 18;
+  wl.dogT = 0;
+  // Whatever the axe has already got to is history, not an event: only a tree
+  // that goes under it while we are watching is worth a bird.
+  wl.seen.clear();
+  snap.trees.forEach((_v, id) => wl.seen.add(id));
+  wl.treeSize = snap.trees.size;
+  seedFlies(wl);
+  seedFlock(wl);
+  wl.ready = true;
+  // Settle, so a paused arrival or a deep link into an hour never opens on a
+  // flock standing to attention in a perfect ring.
+  const sky = skyAt(snap.t);
+  for (let i = 0; i < 40; i++) stepWildlife(scene, amb, snap, sky, wl, 0.2);
+}
+
+function seedFlies(wl: Wildlife): void {
+  wl.flies.length = 0;
+  const wet = wl.cache.wet;
+  if (!wet.length) return;
+  const rng = wl.rng;
+  const n = FLY_MIN + Math.floor(rng() * (FLY_MAX - FLY_MIN + 1));
+  // A dozen fireflies spread over every marsh on the map is one lonely
+  // firefly per marsh. Pick a few pieces of wetland and light those instead.
+  const pick = wet.slice();
+  for (let i = pick.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = pick[i];
+    pick[i] = pick[j];
+    pick[j] = t;
+  }
+  pick.length = Math.min(pick.length, 3);
+  for (let i = 0; i < n; i++) {
+    const ch = pick[Math.floor(rng() * pick.length)];
+    // Chunk bounds are screen-aligned, so this is already a world-pixel box.
+    const x = (ch.u0 + rng() * (ch.u1 - ch.u0)) * (TW / 2);
+    const y = (ch.v0 + rng() * (ch.v1 - ch.v0)) * (TH / 2);
+    wl.flies.push({
+      bx: x,
+      by: y,
+      x,
+      y,
+      r: 6 + rng() * 12,
+      ph: rng() * 12,
+      sp: 0.5 + rng() * 0.5,
+      a: rng() * 6.283,
+      b: rng() * 6.283,
+      c: rng() * 6.283,
+    });
+  }
+}
+
+function seedFlock(wl: Wildlife): void {
+  wl.sheep.length = 0;
+  wl.herder = null;
+  const at = wl.cache.flock;
+  if (!at) return;
+  const rng = wl.rng;
+  const n = 2 + Math.floor(rng() * 2);
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2;
+    const r = 1 + rng() * 2.2;
+    wl.sheep.push({
+      gx: at[0] + Math.cos(a) * r,
+      gy: at[1] + Math.sin(a) * r,
+      tx: at[0],
+      ty: at[1],
+      timer: rng() * 4,
+      graze: rng() < 0.6,
+      face: rng() < 0.5,
+      seed: 400 + Math.floor(rng() * 900),
+    });
+  }
+  const a = rng() * Math.PI * 2;
+  wl.herder = {
+    gx: at[0] + Math.cos(a) * 3.4,
+    gy: at[1] + Math.sin(a) * 3.4,
+    tx: at[0],
+    ty: at[1],
+    timer: 1 + rng() * 3,
+    phase: rng() * 8,
+    walking: false,
+    face: rng() < 0.5,
+    color: BOT_COLORS[Math.floor(rng() * BOT_COLORS.length)],
+  };
+}
+
+/* -------------------------------- the tick -------------------------------- */
+
+/**
+ * Advance the wildlife and hand it back to the renderer. `dt` is taken from the
+ * renderer's clock, which is the same clock the crowd's phases run on and which
+ * stops dead when the world is paused or the visitor asked for less motion.
+ */
+function tickWildlife(
+  scene: GenesisScene,
+  amb: Ambient,
+  snap: WorldSnapshot,
+  sky: Sky,
+  clock: number
+): Wildlife {
+  const wl = ensureWild(scene);
+  if (!wl.ready) resetWildlife(scene, amb, snap);
+  let dt = wl.clock < 0 ? 0 : clock - wl.clock;
+  wl.clock = clock;
+  // A speed change or a tab coming back from the background can hand us a
+  // second of clock in one frame; nothing here is worth catching up on.
+  if (!(dt > 0) || dt > 0.5) dt = 0;
+
+  // Visible even while frozen: fireflies are lit at 21:30 whether or not the
+  // player is running, and deer are standing at the treeline at half six.
+  wl.vis = clamp01((sky.night - 0.5) / 0.22) * (snap.t > 23.2 ? clamp01((23.7 - snap.t) / 0.5) : 1);
+  stepDeerSpawn(wl, snap, dt);
+  if (dt > 0) stepWildlife(scene, amb, snap, sky, wl, dt);
+  return wl;
+}
+
+function stepWildlife(
+  scene: GenesisScene,
+  amb: Ambient,
+  snap: WorldSnapshot,
+  sky: Sky,
+  wl: Wildlife,
+  dt: number
+): void {
+  stepBursts(scene, wl, snap);
+  stepBirds(wl, dt);
+  stepFlies(wl, dt);
+  stepDeer(scene, amb, wl, dt);
+  stepFlock(wl, dt);
+  stepDogs(scene, amb, wl, dt);
+  stepFish(scene, wl, dt, sky);
+}
+
+/* ------------------------- birds out of a felled tree --------------------- */
+
+/**
+ * The one piece of ambience that is synced to the day itself. `snap.trees` only
+ * ever gains entries, and only when the timeline puts a tree under the axe, so
+ * the entry count is a sufficient trigger: when it moves, the ids that are new
+ * to us and currently `felling` are the trees that just took their first blow.
+ */
+function stepBursts(scene: GenesisScene, wl: Wildlife, snap: WorldSnapshot): void {
+  if (snap.trees.size === wl.treeSize) return;
+  wl.treeSize = snap.trees.size;
+  const fresh: string[] = [];
+  snap.trees.forEach((state, id) => {
+    if (wl.seen.has(id)) return;
+    wl.seen.add(id);
+    if (state === 'felling') fresh.push(id);
+  });
+  // More than a handful at once is a scrub or a fast-forward, not a moment.
+  if (!fresh.length || fresh.length > 5) return;
+  for (let i = 0; i < Math.min(2, fresh.length); i++) burst(scene, wl, fresh[i]);
+}
+
+function burst(scene: GenesisScene, wl: Wildlife, treeId: string): void {
+  const tr = scene.treeById.get(treeId);
+  if (!tr) return;
+  const p = scene.pools[TREE_POOL[tr.kind] ?? 'oak'];
+  const sp = p[Math.abs(tr.seed) % p.length];
+  const x = isoX(tr.gx, tr.gy);
+  // Out of the canopy, not off the ground: roughly the upper third of the tree.
+  const y = isoY(tr.gx, tr.gy) - sp.oy * 0.72;
+  const rng = wl.rng;
+  const n = 2 + Math.floor(rng() * 3);
+  const away = rng() < 0.5 ? -1 : 1;
+  for (let i = 0; i < n; i++) {
+    const spread = (rng() - 0.5) * 0.7;
+    wl.birds.push({
+      x: x + (rng() - 0.5) * 12,
+      y: y + (rng() - 0.5) * 8,
+      vx: away * (30 + rng() * 34) + spread * 22,
+      vy: -(20 + rng() * 16),
+      age: 0,
+      life: 2.1 + rng() * 0.9,
+      ph: rng() * 6,
+    });
+  }
+}
+
+function stepBirds(wl: Wildlife, dt: number): void {
+  for (let i = wl.birds.length - 1; i >= 0; i--) {
+    const b = wl.birds[i];
+    b.age += dt;
+    if (b.age > b.life) {
+      wl.birds.splice(i, 1);
+      continue;
+    }
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    // The panic goes out of it: the climb flattens and the flap slows.
+    b.vy += 13 * dt;
+    b.ph += dt * (b.age < 0.8 ? 13 : 8);
+  }
+}
+
+/* ------------------------- fireflies over the marsh ----------------------- */
+
+function stepFlies(wl: Wildlife, dt: number): void {
+  if (wl.vis <= 0.01) return;
+  for (const f of wl.flies) {
+    f.ph += dt * f.sp;
+    f.x = f.bx + Math.sin(f.ph * 0.71 + f.a) * f.r;
+    f.y = f.by + Math.sin(f.ph * 0.53 + f.b) * f.r * 0.5;
+  }
+}
+
+/* --------------------------- deer at the treeline ------------------------- */
+
+function inDeerWindow(t: number): boolean {
+  for (const [a, b] of DEER_WINDOWS) if (t >= a && t < b) return true;
+  return false;
+}
+
+/** Spawning is clock-free, so a frozen world still has deer standing in it. */
+function stepDeerSpawn(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
+  wl.deerCool -= dt;
+  if (!inDeerWindow(snap.t)) {
+    if (wl.deer.length) wl.deer.length = 0;
+    return;
+  }
+  if (wl.deer.length || wl.deerCool > 0 || !wl.cache.spots.length) return;
+  const rng = wl.rng;
+  const spot = wl.cache.spots[Math.floor(rng() * wl.cache.spots.length)];
+  const n = rng() < 0.55 ? 2 : 1;
+  for (let i = 0; i < n; i++) {
+    const gx = spot.gx + (rng() - 0.5) * 2.4;
+    const gy = spot.gy + (rng() - 0.5) * 2.4;
+    wl.deer.push({
+      gx,
+      gy,
+      tx: gx,
+      ty: gy,
+      st: 0,
+      timer: 1 + rng() * 3,
+      headT: rng() * 2,
+      head: rng() < 0.6 ? 1 : 0,
+      face: spot.ix < 0,
+      vx: spot.ix,
+      vy: spot.iy,
+      seed: 900 + Math.floor(rng() * 900),
+    });
+  }
+}
+
+function stepDeer(scene: GenesisScene, amb: Ambient, wl: Wildlife, dt: number): void {
+  if (!wl.deer.length) return;
+  const rng = wl.rng;
+  for (let i = wl.deer.length - 1; i >= 0; i--) {
+    const d = wl.deer[i];
+
+    if (d.st !== 2) {
+      /* ---- is anyone coming? -------------------------------------------- */
+      let spook: Vec2 | null = null;
+      for (const b of amb.bots) {
+        if (Math.abs(b.gx - d.gx) > DEER_SPOOK || Math.abs(b.gy - d.gy) > DEER_SPOOK) continue;
+        if (Math.hypot(b.gx - d.gx, b.gy - d.gy) < DEER_SPOOK) {
+          spook = [b.gx, b.gy];
+          break;
+        }
+      }
+      if (!spook) {
+        for (const w of amb.walkers) {
+          if (Math.abs(w.gx - d.gx) > DEER_SPOOK || Math.abs(w.gy - d.gy) > DEER_SPOOK) continue;
+          if (Math.hypot(w.gx - d.gx, w.gy - d.gy) < DEER_SPOOK) {
+            spook = [w.gx, w.gy];
+            break;
+          }
+        }
+      }
+      if (spook) {
+        // Home is the wood, unless the wood is where the trouble is coming from.
+        let ax = d.gx - spook[0];
+        let ay = d.gy - spook[1];
+        const al = Math.hypot(ax, ay) || 1;
+        ax /= al;
+        ay /= al;
+        const toward = ax * d.vx + ay * d.vy;
+        if (toward < -0.2) {
+          d.vx = ax;
+          d.vy = ay;
+        }
+        d.st = 2;
+        d.timer = 2 + rng() * 0.9;
+        d.face = d.vx - d.vy > 0;
+        continue;
+      }
+    }
+
+    if (d.st === 2) {
+      const sp = 3.6;
+      d.gx += d.vx * sp * dt;
+      d.gy += d.vy * sp * dt;
+      d.timer -= dt;
+      if (d.timer <= 0) {
+        wl.deer.splice(i, 1);
+        // Once the wood has them they stay in it for a while.
+        wl.deerCool = 30 + rng() * 50;
+      }
+      continue;
+    }
+
+    d.headT -= dt;
+    if (d.headT <= 0) {
+      d.head = d.head ? 0 : 1;
+      d.headT = (d.head ? 2.2 : 1.4) + rng() * 2.2;
+    }
+
+    if (d.st === 1) {
+      const dx = d.tx - d.gx;
+      const dy = d.ty - d.gy;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 0.15) {
+        d.st = 0;
+        d.timer = 2 + rng() * 5;
+      } else {
+        const step = Math.min(dist, 0.62 * dt);
+        d.gx += (dx / dist) * step;
+        d.gy += (dy / dist) * step;
+        const sdx = dx - dy;
+        if (Math.abs(sdx) > 0.01) d.face = sdx > 0;
+        d.head = 0;
+        d.headT = 0.6;
+      }
+      continue;
+    }
+
+    d.timer -= dt;
+    if (d.timer <= 0) {
+      if (rng() < 0.6) {
+        const a = rng() * Math.PI * 2;
+        const r = 0.8 + rng() * 2.4;
+        d.tx = d.gx + Math.cos(a) * r;
+        d.ty = d.gy + Math.sin(a) * r;
+        d.st = 1;
+      }
+      d.timer = 2 + rng() * 5;
+    }
+  }
+}
+
+/* --------------------------- shepherd and flock --------------------------- */
+
+function stepFlock(wl: Wildlife, dt: number): void {
+  const at = wl.cache.flock;
+  if (!at) return;
+  const rng = wl.rng;
+
+  for (const s of wl.sheep) {
+    s.timer -= dt;
+    const dx = s.tx - s.gx;
+    const dy = s.ty - s.gy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0.12 && !s.graze) {
+      const step = Math.min(dist, 0.3 * dt);
+      s.gx += (dx / dist) * step;
+      s.gy += (dy / dist) * step;
+      const sdx = dx - dy;
+      if (Math.abs(sdx) > 0.01) s.face = sdx > 0;
+    }
+    if (s.timer > 0) continue;
+    s.graze = !s.graze;
+    s.timer = s.graze ? 3 + rng() * 5 : 2 + rng() * 4;
+    if (!s.graze) {
+      // Sheep drift, but never far: the flock stays a flock.
+      const a = rng() * Math.PI * 2;
+      const r = 0.8 + rng() * 2.4;
+      s.tx = at[0] + Math.cos(a) * r;
+      s.ty = at[1] + Math.sin(a) * r;
+    }
+  }
+
+  const h = wl.herder;
+  if (!h) return;
+  h.phase += dt;
+  const dx = h.tx - h.gx;
+  const dy = h.ty - h.gy;
+  const dist = Math.hypot(dx, dy);
+  if (dist > 0.2) {
+    const step = Math.min(dist, 0.7 * dt);
+    h.gx += (dx / dist) * step;
+    h.gy += (dy / dist) * step;
+    const sdx = dx - dy;
+    if (Math.abs(sdx) > 0.01) h.face = sdx > 0;
+    h.walking = true;
+    return;
+  }
+  h.walking = false;
+  h.timer -= dt;
+  if (h.timer > 0) return;
+  // Tending, loosely: a slow circuit of the flock at arm's length.
+  const a = rng() * Math.PI * 2;
+  const r = 2.6 + rng() * 2;
+  h.tx = at[0] + Math.cos(a) * r;
+  h.ty = at[1] + Math.sin(a) * r;
+  h.timer = 3 + rng() * 6;
+}
+
+/* ---------------------------- dogs behind carts --------------------------- */
+
+function stepDogs(scene: GenesisScene, amb: Ambient, wl: Wildlife, dt: number): void {
+  wl.dogT -= dt;
+  if (wl.dogT <= 0) {
+    wl.dogT = 0.75;
+    // A walker can be retired by `syncAmbient` at any time; a dog whose cart is
+    // gone goes with it.
+    for (let i = wl.dogs.length - 1; i >= 0; i--) {
+      if (amb.walkers.indexOf(wl.dogs[i].w) < 0) wl.dogs.splice(i, 1);
+    }
+    if (wl.dogs.length < 2) {
+      for (const w of amb.walkers) {
+        if (!w.cart) continue;
+        if (wl.dogs.some((d) => d.w === w)) continue;
+        if (wl.rng() < 0.45) continue; // not every cart has a dog
+        wl.dogs.push({
+          w,
+          back: 1.6,
+          want: 1.4,
+          timer: 1 + wl.rng() * 3,
+          gx: w.gx,
+          gy: w.gy,
+          face: w.faceRight,
+          phase: wl.rng() * 6,
+          pose: 0,
+        });
+        if (wl.dogs.length >= 2) break;
+      }
+    }
+  }
+
+  for (const d of wl.dogs) {
+    const road = scene.roadById.get(d.w.roadId);
+    const geo = road ? scene.roadGeo.get(d.w.roadId) : undefined;
+    if (!road || !geo) continue;
+    d.timer -= dt;
+    if (d.timer <= 0) {
+      // Something in the verge is worth a sniff; then it has to catch up.
+      const dawdling = d.want > 2.4;
+      d.want = dawdling ? 1.2 + wl.rng() * 0.7 : 3 + wl.rng() * 1.2;
+      d.timer = dawdling ? 2.5 + wl.rng() * 4 : 1.2 + wl.rng() * 1.6;
+    }
+    d.back += (d.want - d.back) * Math.min(1, dt * 1.5);
+    const s = Math.max(0, Math.min(geo.len, d.w.s - d.back * d.w.dir));
+    const at = alongPolyline(road.pts, geo, s);
+    const moved = Math.hypot(at[0] - d.gx, at[1] - d.gy);
+    const sdx = at[0] - d.gx - (at[1] - d.gy);
+    if (Math.abs(sdx) > 0.001) d.face = sdx > 0;
+    d.gx = at[0];
+    d.gy = at[1];
+    if (moved > 0.004) {
+      d.phase += dt;
+      d.pose = Math.floor(d.phase * 7) % 2 === 0 ? 0 : 1;
+    }
+  }
+}
+
+/* ------------------------------- fish jumps ------------------------------- */
+
+function stepFish(scene: GenesisScene, wl: Wildlife, dt: number, sky: Sky): void {
+  const geo = wl.cache.rgeo;
+  const river = scene.map.river;
+  if (geo && river.length >= 2) {
+    wl.fishT -= dt;
+    if (wl.fishT <= 0) {
+      // A handful an hour, and none of them in the dark.
+      wl.fishT = 14 + wl.rng() * 22;
+      if (sky.night < 0.55 && wl.fish.length < 2) {
+        const at = alongPolyline(river, geo, wl.rng() * geo.len);
+        wl.fish.push({
+          x: isoX(at[0], at[1]) + (wl.rng() - 0.5) * 8,
+          y: isoY(at[0], at[1]),
+          base: isoY(at[0], at[1]),
+          vx: (wl.rng() - 0.5) * 22,
+          vy: -(30 + wl.rng() * 12),
+        });
+      }
+    }
+  }
+  for (let i = wl.fish.length - 1; i >= 0; i--) {
+    const f = wl.fish[i];
+    f.vy += 96 * dt;
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+    if (f.vy > 0 && f.y >= f.base) {
+      wl.rings.push({ x: f.x, y: f.base, age: 0 });
+      wl.fish.splice(i, 1);
+    }
+  }
+  for (let i = wl.rings.length - 1; i >= 0; i--) {
+    wl.rings[i].age += dt;
+    if (wl.rings[i].age > 1.5) wl.rings.splice(i, 1);
+  }
+}
+
+/* -------------------------------- drawing --------------------------------- */
+
+/**
+ * Everything that stands on the ground, as depth-sorted items. Called after
+ * the crowd, so these are inside the occlusion-repair budget with it — a deer
+ * at a treeline is exactly the case that needs the trunk in front of it back.
+ */
+function pushWildlife(
+  scene: GenesisScene,
+  wl: Wildlife,
+  items: Item[],
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number
+): void {
+  const seen = (x: number, y: number) => x > wx0 && x < wx1 && y > wy0 && y < wy1;
+  const add = (sp: Sprite, gx: number, gy: number, bump = 1) => {
+    const x = isoX(gx, gy);
+    const y = isoY(gx, gy);
+    if (!seen(x, y)) return;
+    const bx = Math.round(x - sp.ox);
+    const by = Math.round(y - sp.oy);
+    items.push({
+      depth: y + bump,
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => c.drawImage(sp.c, bx, by),
+    });
+  };
+
+  for (const d of wl.deer) {
+    const pose: 0 | 1 | 2 = d.st === 2 ? 2 : d.st === 0 && d.head ? 1 : 0;
+    add(
+      cached(scene, `wd:${pose}:${d.face ? 1 : 0}:${d.seed % 3}`, () =>
+        buildDeer(pose, d.face, d.seed)
+      ),
+      d.gx,
+      d.gy
+    );
+  }
+
+  for (const s of wl.sheep) {
+    add(
+      cached(scene, `ws:${s.seed % 4}:${s.face ? 1 : 0}:${s.graze ? 1 : 0}`, () =>
+        buildGrazingSheep(s.seed, s.face, s.graze)
+      ),
+      s.gx,
+      s.gy
+    );
+  }
+
+  const h = wl.herder;
+  if (h) {
+    const x = isoX(h.gx, h.gy);
+    const y = isoY(h.gx, h.gy);
+    if (seen(x, y)) {
+      const px = Math.round(x);
+      const py = Math.round(y);
+      const action: BotAction = h.walking ? 'walk' : 'idle';
+      const { color, face, phase } = h;
+      items.push({
+        depth: y + 1,
+        bx: px - 7,
+        by: py - 20,
+        bw: 15,
+        bh: 22,
+        draw: (c) => drawBot(c, px, py, color, face, action, phase),
+      });
+    }
+  }
+
+  for (const d of wl.dogs) {
+    add(
+      cached(scene, `wg:${d.pose}:${d.face ? 1 : 0}`, () => buildDog(d.pose, d.face)),
+      d.gx,
+      d.gy
+    );
+  }
+
+  // Rings first, so a fish that is still in the air is over its own splash.
+  for (const r of wl.rings) {
+    if (!seen(r.x, r.y)) continue;
+    const { x, y } = r;
+    const rad = 1.5 + r.age * 6;
+    const a = Math.max(0, 1 - r.age / 1.5) * 0.75;
+    items.push({
+      depth: y - 0.5,
+      bx: Math.round(x - rad),
+      by: Math.round(y - rad / 2),
+      bw: Math.ceil(rad * 2),
+      bh: Math.ceil(rad),
+      draw: (c) => drawRipple(c, x, y, rad, a),
+    });
+  }
+  for (const f of wl.fish) {
+    if (!seen(f.x, f.base)) continue;
+    const { x, y, vy, base } = f;
+    items.push({
+      depth: base,
+      bx: Math.round(x - 5),
+      by: Math.round(y - 2),
+      bw: 10,
+      bh: 6,
+      draw: (c) => drawFishJump(c, x, y, vy),
+    });
+  }
+}
+
+/**
+ * Birds, over the finished item pass. They are above the canopy within a frame
+ * of leaving it, so they deliberately skip the occlusion-repair pass entirely:
+ * there is nothing in the valley that can stand in front of one.
+ */
+function drawWildlifeAir(
+  ctx: Ctx,
+  scene: GenesisScene,
+  wl: Wildlife,
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number
+): void {
+  if (!wl.birds.length) return;
+  const f0 = cached(scene, 'wb:0', () => buildBird(0));
+  const f1 = cached(scene, 'wb:1', () => buildBird(1));
+  for (const b of wl.birds) {
+    if (b.x < wx0 || b.x > wx1 || b.y < wy0 || b.y > wy1) continue;
+    const sp = Math.floor(b.ph) % 2 === 0 ? f0 : f1;
+    const fade = b.age > b.life - 0.5 ? Math.max(0, (b.life - b.age) / 0.5) : 1;
+    if (fade < 1) ctx.globalAlpha = fade;
+    ctx.drawImage(sp.c, Math.round(b.x) - sp.ox, Math.round(b.y) - sp.oy);
+    if (fade < 1) ctx.globalAlpha = 1;
+  }
+}
+
+/**
+ * Fireflies, on the viewport and after the sky — the one thing in the valley
+ * that must not be dimmed by the night fill that makes it night. Drawn in
+ * device pixels, at least one of them across whatever the zoom is.
+ */
+function drawFireflies(
+  ctx: Ctx,
+  wl: Wildlife,
+  cx: number,
+  cy: number,
+  scale: number,
+  dw: number,
+  dh: number
+): void {
+  if (wl.vis <= 0.02 || !wl.flies.length) return;
+  const px = Math.max(1, Math.round(scale));
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const f of wl.flies) {
+    const sx = (f.x - cx) * scale;
+    const sy = (f.y - cy) * scale;
+    if (sx < -4 || sx > dw + 4 || sy < -4 || sy > dh + 4) continue;
+    const s = Math.sin(f.ph * 1.6 + f.c);
+    const blink = s > 0 ? s * s * s : 0;
+    // Floored well above nothing, so a frozen tableau still reads as a marsh
+    // with fireflies over it rather than as an empty marsh.
+    ctx.globalAlpha = wl.vis * (0.2 + 0.8 * blink);
+    ctx.fillStyle = blink > 0.4 ? '#f6ffbe' : '#d3ee86';
+    ctx.fillRect(Math.round(sx), Math.round(sy), px, px);
+    if (blink > 0.45) {
+      // A hair of bloom on the bright half of the blink, so a firefly at the
+      // overview is a twinkle rather than a stuck pixel.
+      ctx.globalAlpha = wl.vis * 0.34 * blink;
+      ctx.fillRect(Math.round(sx) - px, Math.round(sy), px * 3, px);
+      ctx.fillRect(Math.round(sx), Math.round(sy) - px, px, px * 3);
+    }
+  }
+  ctx.restore();
 }
