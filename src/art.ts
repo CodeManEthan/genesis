@@ -307,6 +307,19 @@ function qR(W: number, t0: number, t1: number, h0: number, h1: number): Pt[] {
   return [rightPt(W, t0, h1), rightPt(W, t1, h1), rightPt(W, t1, h0), rightPt(W, t0, h0)];
 }
 
+/**
+ * A point `o` art-pixels clear of the front-left (SW) face, in screen space.
+ * One unit out is one tile-step out, which on a 2:1 grid is two across and one
+ * down. Porches, lean-tos, benches and crates all stand on this.
+ */
+function outL(p: Pt, o: number): Pt {
+  return [p[0] - o * 2, p[1] + o];
+}
+/** The same, clear of the front-right (SE) face. */
+function outR(p: Pt, o: number): Pt {
+  return [p[0] + o * 2, p[1] + o];
+}
+
 function drawWindow(
   ctx: Ctx,
   W: number,
@@ -316,18 +329,65 @@ function drawWindow(
   lit: boolean,
   /** When set, a dressed stone lintel over the head and a sill under the
    * cill, in this colour. Absent leaves the timber-framed window untouched. */
-  lintel?: string
+  lintel?: string,
+  /** Widen (>1) or narrow the opening. 1 is the window every caller drew
+   * before shopfronts existed, so the default changes nothing. */
+  wScale = 1,
+  /** Heighten (>1) the opening. Same deal. */
+  hScale = 1
+): void {
+  const q = side === 'l' ? qL : qR;
+  const dt = (6 * wScale) / W;
+  const hh = 3.5 * hScale;
+  poly(ctx, q(W, tc - dt, tc + dt, hc - hh, hc + hh), PAL.woodDark);
+  const ih = hh - 0.9;
+  const inner = q(W, tc - dt * 0.68, tc + dt * 0.68, hc - ih, hc + ih);
+  poly(ctx, inner, lit ? PAL.glassLit : side === 'l' ? PAL.glass : PAL.glassDark);
+  const glint = q(W, tc - dt * 0.68, tc - dt * 0.08, hc + ih * 0.19, hc + ih);
+  poly(ctx, glint, lit ? shade(PAL.glassLit, 0.35) : shade(PAL.glass, 0.4));
+  if (lintel) {
+    poly(ctx, q(W, tc - dt * 1.45, tc + dt * 1.45, hc + hh, hc + hh + 1.9), lintel);
+    poly(ctx, q(W, tc - dt * 1.3, tc + dt * 1.3, hc - hh - 1.6, hc - hh), shade(lintel, -0.14));
+  }
+}
+
+/**
+ * The lancet trick: two stepped courses of glass narrowing to a point, laid on
+ * top of a window `drawWindow` has already put in. One pixel at a time is all
+ * an arch gets at this scale, and two of them is enough to stop a chapel
+ * window looking like a kitchen one.
+ */
+function drawArchHead(
+  ctx: Ctx,
+  W: number,
+  side: 'l' | 'r',
+  tc: number,
+  hc: number,
+  lit: boolean
 ): void {
   const q = side === 'l' ? qL : qR;
   const dt = 6 / W;
-  poly(ctx, q(W, tc - dt, tc + dt, hc - 3.5, hc + 3.5), PAL.woodDark);
-  const inner = q(W, tc - dt * 0.68, tc + dt * 0.68, hc - 2.6, hc + 2.6);
-  poly(ctx, inner, lit ? PAL.glassLit : side === 'l' ? PAL.glass : PAL.glassDark);
-  const glint = q(W, tc - dt * 0.68, tc - dt * 0.08, hc + 0.5, hc + 2.6);
-  poly(ctx, glint, lit ? shade(PAL.glassLit, 0.35) : shade(PAL.glass, 0.4));
-  if (lintel) {
-    poly(ctx, q(W, tc - dt * 1.45, tc + dt * 1.45, hc + 3.5, hc + 5.4), lintel);
-    poly(ctx, q(W, tc - dt * 1.3, tc + dt * 1.3, hc - 5.1, hc - 3.5), shade(lintel, -0.14));
+  const glass = lit ? PAL.glassLit : side === 'l' ? PAL.glass : PAL.glassDark;
+  poly(ctx, q(W, tc - dt, tc + dt, hc + 3.5, hc + 4.4), PAL.woodDark);
+  poly(ctx, q(W, tc - dt * 0.62, tc + dt * 0.62, hc + 4.4, hc + 5.4), PAL.woodDark);
+  poly(ctx, q(W, tc - dt * 0.68, tc + dt * 0.68, hc + 3.5, hc + 4.3), glass);
+  poly(ctx, q(W, tc - dt * 0.34, tc + dt * 0.34, hc + 4.3, hc + 5.2), glass);
+}
+
+/**
+ * A planted box on the cill. Deterministic in the window's own position, so it
+ * never touches the structure's RNG stream.
+ */
+function drawWindowBox(ctx: Ctx, W: number, side: 'l' | 'r', tc: number, hc: number): void {
+  const q = side === 'l' ? qL : qR;
+  const dt = 7.5 / W;
+  poly(ctx, q(W, tc - dt, tc + dt, hc - 6.4, hc - 4.2), PAL.woodDark);
+  poly(ctx, q(W, tc - dt * 0.86, tc + dt * 0.86, hc - 6, hc - 4.6), PAL.wood);
+  const step = Math.round(Math.abs(tc) * 97) + (side === 'l' ? 0 : 1);
+  for (let i = 0; i < 3; i++) {
+    const t = tc + (i - 1) * (4.6 / W);
+    poly(ctx, q(W, t - 1 / W, t + 1 / W, hc - 4.4, hc - 2.4), PAL.leafDark);
+    poly(ctx, q(W, t - 0.8 / W, t + 0.8 / W, hc - 3, hc - 1.6), PAL.flower[(i + step) % PAL.flower.length]);
   }
 }
 
@@ -388,6 +448,27 @@ function drawScaffold(ctx: Ctx, W: number, h: number): void {
   poly(ctx, [a, [a[0] + 1.5, a[1] + 1], [b[0] + 1.5, b[1] + 1], b], PAL.woodDark);
 }
 
+/**
+ * The colour a roof of this style ends up. Pulled out of `drawRoof` so the
+ * lean-tos, porches and bell-cotes the role furniture bolts on can be roofed in
+ * the same material as the thing they lean against — including a quarry town's
+ * slate, which is mixed from the town's own accent.
+ */
+function roofTone(
+  style: RoofStyle,
+  accent: string,
+  condition: number,
+  material?: BuildMaterial
+): string {
+  const base =
+    style === 'thatch'
+      ? PAL.thatch
+      : material === 'stone'
+        ? mix(accent, PAL.slate, 0.66)
+        : accent;
+  return mix(base, '#8d9a86', (1 - condition) * 0.45);
+}
+
 /** Roof geometry shared by the finished and half-built passes. */
 function drawRoof(
   ctx: Ctx,
@@ -404,13 +485,7 @@ function drawRoof(
   const ry = -wallH;
   // A stone town roofs in slate — but slate mixed *from* the town's own accent,
   // so the greys still differ town to town and the ledger colour still reads.
-  const base =
-    style === 'thatch'
-      ? PAL.thatch
-      : material === 'stone'
-        ? mix(accent, PAL.slate, 0.66)
-        : accent;
-  const col = mix(base, '#8d9a86', (1 - condition) * 0.45);
+  const col = roofTone(style, accent, condition, material);
   const dark = shade(col, -0.3);
   const mid = shade(col, -0.14);
   const light = shade(col, 0.22);
@@ -535,10 +610,22 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
   /** Oast-house cone above the brewhouse drum. */
   const kilnH = role === 'brewhouse' ? 26 : 0;
 
-  const padX = 12 + (sailR ? 12 : 0) + (role === 'bakery' ? 8 : 0);
+  // Sideways room for the furniture that stands off a wall instead of on it:
+  // the homestead's washing post out past the west gable, the workshop's
+  // lean-to off the east wall. Same rule as the bakery's oven — a sprite is
+  // clipped at its own edge, so anything that leaves the footprint pays here.
+  const padX =
+    12 +
+    (sailR ? 12 : 0) +
+    (role === 'bakery' ? 8 : 0) +
+    (role === 'homestead' ? 8 : 0) +
+    (role === 'workshop' ? 6 : 0);
   /** Ridge lamp and finial on a gildhall stand clear of the roof. */
   const gildH = role === 'gildhall' ? 14 : 0;
-  const padTop = 34 + towerH + siloH + sailR + kilnH + gildH + (spec.cupola ? 22 : 0);
+  /** A chapel's bell gable sits on the ridge end, bell, cap, cross and all. */
+  const bellH = role === 'chapel' ? 22 : 0;
+  const padTop =
+    34 + towerH + siloH + sailR + kilnH + gildH + bellH + (spec.cupola ? 22 : 0);
   const padBottom = 8;
   const spriteW = W + padX * 2;
   const spriteH = padTop + Math.round(W * 0.4) + wallH + H + padBottom + 20;
@@ -651,16 +738,59 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
           const t = cols === 1 ? 0.5 : 0.18 + (0.64 * i) / (cols - 1);
           const doorSlot = f === 0 && Math.abs(t - 0.5) < 0.16;
           const lit = spec.lit || rng() < 0.2;
-          if (!doorSlot) drawWindow(ctx, W, 'l', t, hc, lit, lintelL);
-          if (role !== 'barn' || f > 0) {
-            drawWindow(ctx, W, 'r', t, hc, spec.lit || rng() < 0.16, lintelR);
+          if (!doorSlot) {
+            drawWindow(ctx, W, 'l', t, hc, lit, lintelL);
+            if (role === 'chapel') drawArchHead(ctx, W, 'l', t, hc, lit);
+            if (role === 'cottage') drawWindowBox(ctx, W, 'l', t, hc);
+          }
+          // A store's ground floor on this side is the shopfront, drawn below;
+          // a barn's is a blank wall. Both skip the roll as well as the window,
+          // so nobody else's lit pattern moves.
+          const skipR = f === 0 && (role === 'barn' || role === 'store');
+          if (!skipR) {
+            const litR = spec.lit || rng() < 0.16;
+            drawWindow(ctx, W, 'r', t, hc, litR, lintelR);
+            if (role === 'chapel') drawArchHead(ctx, W, 'r', t, hc, litR);
+            if (role === 'cottage') drawWindowBox(ctx, W, 'r', t, hc);
           }
         }
       }
 
+      /* ---- shopfront -------------------------------------------------- */
+      if (role === 'store') {
+        // The SW face is all door and awning, so the shop window goes on the
+        // SE one, where there is room for it to be a shop window: one wide,
+        // low bay over a timber stall riser, mullioned into three lights. It
+        // is a real `drawWindow`, so it lights up at dusk with everything else.
+        const bay = Math.max(1.3, (W * 0.33) / 6);
+        const dtB = (6 * bay) / W;
+        const hcB = STORY * 0.56;
+        poly(ctx, qR(W, 0.5 - dtB - 1.6 / W, 0.5 + dtB + 1.6 / W, 0, 2.2), PAL.woodDark);
+        drawWindow(ctx, W, 'r', 0.5, hcB, !!spec.lit, lintelR, bay, 1.4);
+        for (const m of [-0.36, 0.36]) {
+          poly(ctx, qR(W, 0.5 + dtB * m - 0.7 / W, 0.5 + dtB * m + 0.7 / W, hcB - 4, hcB + 4), PAL.woodDark);
+        }
+        // painted transom board over the glass
+        poly(ctx, qR(W, 0.5 - dtB - 1.6 / W, 0.5 + dtB + 1.6 / W, hcB + 4.9, hcB + 7.2), shade(accent, -0.2));
+        poly(ctx, qR(W, 0.5 - dtB - 1.6 / W, 0.5 + dtB + 1.6 / W, hcB + 4.9, hcB + 5.6), shade(accent, -0.44));
+      }
+
       /* ---- door ------------------------------------------------------ */
-      const dw = role === 'barn' ? 9 : 5;
-      const dh = role === 'barn' ? 13 : 10.5;
+      // What the doorway is *for* is half of what tells these buildings apart:
+      // a barn takes a cart, a workshop takes a finished chair, a hall takes a
+      // crowd, a chapel takes two abreast, a cottage takes one and stoops.
+      const dw =
+        role === 'barn' ? 9
+          : role === 'workshop' ? 8
+            : role === 'hall' || role === 'chapel' ? 7
+              : role === 'store' ? 6
+                : 5;
+      const dh =
+        role === 'barn' ? 13
+          : role === 'workshop' ? 12.5
+            : role === 'hall' || role === 'chapel' ? 12
+              : role === 'cottage' ? 9.5
+                : 10.5;
       const dt = dw / W;
       poly(ctx, qL(W, 0.5 - dt * 1.3, 0.5 + dt * 1.3, 0, dh + 1), PAL.woodDark);
       poly(ctx, qL(W, 0.5 - dt, 0.5 + dt, 0, dh), role === 'smithy' ? PAL.forge : PAL.wood);
@@ -670,15 +800,63 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
         rect(ctx, knob[0], knob[1], 1, 1, PAL.glassLit);
       }
       poly(ctx, qL(W, 0.5 - dt * 1.6, 0.5 + dt * 1.6, -1.5, 0.4), PAL.stone);
+
+      if (role === 'chapel') {
+        // Double door: a centre stile between the leaves, and a stepped arch
+        // over the pair to answer the lancets. The arch *is* the door head, so
+        // a stone chapel skips the dressed lintel below rather than fighting it.
+        poly(ctx, qL(W, 0.5 - dt * 1.3, 0.5 + dt * 1.3, dh + 1, dh + 2.3), PAL.woodDark);
+        poly(ctx, qL(W, 0.5 - dt * 0.95, 0.5 + dt * 0.95, dh + 2.3, dh + 3.5), PAL.woodDark);
+        poly(ctx, qL(W, 0.5 - dt * 0.8, 0.5 + dt * 0.8, dh, dh + 1.6), PAL.wood);
+        poly(ctx, qL(W, 0.5 - dt * 0.45, 0.5 + dt * 0.45, dh + 1.6, dh + 2.7), PAL.wood);
+        poly(ctx, qL(W, 0.5 - 0.7 / W, 0.5 + 0.7 / W, 0, dh + 2), PAL.woodDark);
+      }
+
+      if (role === 'workshop') {
+        // Wide door standing half open: the near leaf swung out into the yard,
+        // the shop dark behind it — or lamplit, at night, which is the whole
+        // reason a workshop is worth walking past after dusk.
+        poly(ctx, qL(W, 0.5 - dt * 0.1, 0.5 + dt, 0, dh), shade(PAL.ink, -0.25));
+        poly(
+          ctx,
+          qL(W, 0.5 - dt * 0.1, 0.5 + dt * 0.6, 1, dh - 3),
+          spec.lit ? PAL.glassLit : shade(PAL.forge, -0.5)
+        );
+        const hb = leftPt(W, 0.5 - dt, 0);
+        const ht = leftPt(W, 0.5 - dt, dh);
+        const ob = outL(hb, 4.5);
+        const ot = outL(ht, 4.5);
+        poly(ctx, [ht, ot, ob, hb], PAL.wood);
+        // planks across the leaf, so it reads as a door standing open and not
+        // as a pale slab leaning on the wall
+        for (const f of [0.24, 0.52, 0.8]) {
+          const y0 = ht[1] + (hb[1] - ht[1]) * f;
+          const y1 = ot[1] + (ob[1] - ot[1]) * f;
+          poly(ctx, [[ht[0], y0], [ot[0], y1], [ot[0], y1 + 1], [ht[0], y0 + 1]], PAL.woodDark);
+          poly(ctx, [[ht[0], y0 - 1], [ot[0], y1 - 1], [ot[0], y1], [ht[0], y0]], PAL.woodLight);
+        }
+        poly(ctx, [ot, ob, [ob[0] + 1.4, ob[1]], [ot[0] + 1.4, ot[1]]], PAL.woodDark);
+        poly(ctx, [
+          [ht[0], ht[1] + 1],
+          [ot[0], ot[1] + 1],
+          [ot[0], ot[1] + 2.2],
+          [ht[0], ht[1] + 2.2],
+        ], PAL.woodLight);
+      }
+
       // A dressed lintel across the door head: the one stone detail big enough
       // to survive the fitted overview, so it is worth spending the pixels on.
-      if (stone) {
+      if (stone && role !== 'chapel') {
         poly(ctx, qL(W, 0.5 - dt * 1.8, 0.5 + dt * 1.8, dh + 1, dh + 3.2), shade(wl, 0.2));
       }
 
       if (spec.awning) {
-        const a0 = leftPt(W, 0.5 - dt * 2.4, 13);
-        const a1 = leftPt(W, 0.5 + dt * 2.4, 13);
+        // The canopy is sized off the doorway but capped: a workshop's cart-wide
+        // door would otherwise stretch the awning across the entire wall and
+        // bury everything else the role puts on it.
+        const at = Math.min(dt * 2.4, 13 / W);
+        const a0 = leftPt(W, 0.5 - at, 13);
+        const a1 = leftPt(W, 0.5 + at, 13);
         const px = -8;
         const py = 4;
         const lerp = (t: number): Pt => [a0[0] + (a1[0] - a0[0]) * t, a0[1] + (a1[1] - a0[1]) * t];
@@ -862,7 +1040,247 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
       poly(ctx, qL(W, 0.5 + pw * 2.2, 0.5 + pw * 3.6, 6.8, 10.7), GOLD);
     }
 
-    if (spec.cupola && p >= 0.62) {
+    if (role === 'homestead' && p >= 0.62) {
+      // The founding house. It is the first building on the map, the one the
+      // day opens on and the one every visitor sees first, so it gets the
+      // furniture that says *lived in* rather than merely *finished*: a porch
+      // you could stand under, split wood against the gable, washing on the
+      // line and a butt under the eaves. All of it timber, which on a quarry
+      // town's masonry reads as timber on stone — which is what it would be.
+      const rTone = roofTone(roof, accent, condition, spec.material);
+
+      /* porch over the door */
+      const pt = 11 / W;
+      const dep = 5;
+      const ph = 13;
+      const a0 = leftPt(W, 0.5 - pt, 0);
+      const a1 = leftPt(W, 0.5 + pt, 0);
+      const b0 = outL(a0, dep);
+      const b1 = outL(a1, dep);
+      poly(ctx, [a0, a1, [b1[0], b1[1] + 2], [b0[0], b0[1] + 2]], PAL.shadow);
+      poly(ctx, [a0, a1, b1, b0], PAL.woodLight);
+      poly(ctx, [b0, b1, [b1[0], b1[1] + 1.6], [b0[0], b0[1] + 1.6]], PAL.woodDark);
+      rect(ctx, b0[0], b0[1] - ph, 1.6, ph, PAL.wood);
+      rect(ctx, b1[0] - 1.6, b1[1] - ph, 1.6, ph, PAL.wood);
+      poly(ctx, [
+        [a0[0], a0[1] - ph - 4.5],
+        [a1[0], a1[1] - ph - 4.5],
+        [b1[0], b1[1] - ph],
+        [b0[0], b0[1] - ph],
+      ], shade(rTone, 0.12));
+      poly(ctx, [
+        [b0[0], b0[1] - ph],
+        [b1[0], b1[1] - ph],
+        [b1[0], b1[1] - ph + 1.8],
+        [b0[0], b0[1] - ph + 1.8],
+      ], shade(rTone, -0.34));
+
+      /* woodpile stacked against the SE wall */
+      const wp = outR(rightPt(W, 0.52, 0), 1.5);
+      poly(ctx, diamond(wp[0] + 5, wp[1] + 1, 24), PAL.shadow);
+      for (let c = 0; c < 3; c++) {
+        const cx = wp[0] + c * 4.4;
+        const cy0 = wp[1] - c * 2.2;
+        for (let r = 0; r < (c === 2 ? 2 : 3); r++) {
+          const y = cy0 - r * 3.4;
+          rect(ctx, cx, y - 3.4, 4.4, 3.4, PAL.woodDark);
+          rect(ctx, cx + 0.8, y - 2.8, 2.8, 2.2, PAL.woodLight);
+        }
+      }
+
+      /* washing line off the west gable */
+      const px0 = -W / 2 - 12;
+      const py0 = 9;
+      rect(ctx, px0, py0 - 22, 1.6, 22, PAL.wood);
+      rect(ctx, px0 - 2.4, py0 - 23.4, 6.4, 1.6, PAL.woodDark);
+      const lx1 = -W / 2 + 2;
+      const ly1 = -wallH + 3;
+      poly(ctx, [
+        [px0 + 1, py0 - 22],
+        [lx1, ly1],
+        [lx1, ly1 + 1],
+        [px0 + 1, py0 - 21],
+      ], PAL.woodDark);
+      for (let i = 0; i < 3; i++) {
+        const f = 0.2 + i * 0.26;
+        const hx = px0 + 1 + (lx1 - px0 - 1) * f;
+        const hy = py0 - 22 + (ly1 - py0 + 22) * f;
+        const col = mix(PAL.flower[[0, 4, 3][i]], '#ffffff', 0.46);
+        rect(ctx, hx - 2, hy + 1, 5, 1, shade(col, -0.28));
+        rect(ctx, hx - 2, hy + 2, 5, 5, col);
+        rect(ctx, hx - 2, hy + 4, 1, 3, shade(col, -0.16));
+        rect(ctx, hx + 2, hy + 4, 1, 3, shade(col, -0.16));
+      }
+
+      /* rain butt under the eaves at the front corner */
+      const rb = outR(rightPt(W, 0.14, 0), 3);
+      poly(ctx, diamond(rb[0], rb[1] + 1, 13), PAL.shadow);
+      rect(ctx, rb[0] - 4, rb[1] - 10, 8, 10, PAL.wood);
+      rect(ctx, rb[0] - 4, rb[1] - 10, 3, 10, PAL.woodLight);
+      rect(ctx, rb[0] - 4, rb[1] - 8, 8, 1, PAL.stoneDark);
+      rect(ctx, rb[0] - 4, rb[1] - 3, 8, 1, PAL.stoneDark);
+      poly(ctx, diamond(rb[0], rb[1] - 10, 8), '#7fb6cd');
+    }
+
+    if (role === 'hall' && p >= 0.62) {
+      // A hall is a building with business at the door: brackets under the
+      // eaves to say it was built properly, a notice board to say what for,
+      // and a finial on the far ridge end so it carries a profile at map zoom.
+      for (const t of [0.04, 0.35, 0.5, 0.65, 0.96]) {
+        poly(ctx, qL(W, t - 2.1 / W, t + 2.1 / W, wallH - 5, wallH - 0.4), PAL.woodDark);
+        poly(ctx, qL(W, t - 2.1 / W, t - 0.8 / W, wallH - 5, wallH - 0.4), PAL.wood);
+        poly(ctx, qR(W, t - 2.1 / W, t + 2.1 / W, wallH - 5, wallH - 0.4), shade(PAL.woodDark, -0.14));
+      }
+
+      // Standing off the west end of the door's own wall. Anything set out from
+      // this face slides left as well as down, so a board placed to the RIGHT of
+      // the door would end up standing in front of it.
+      const nb = outL(leftPt(W, 0.14, 0), 3.5);
+      poly(ctx, diamond(nb[0], nb[1] + 1, 16), PAL.shadowSoft);
+      rect(ctx, nb[0] - 5, nb[1] - 13, 1.4, 13, PAL.wood);
+      rect(ctx, nb[0] + 4, nb[1] - 10, 1.4, 10, PAL.wood);
+      poly(ctx, [[nb[0] - 7, nb[1] - 22], [nb[0] + 7, nb[1] - 18.5], [nb[0] + 7, nb[1] - 8.5], [nb[0] - 7, nb[1] - 12]], PAL.woodDark);
+      poly(ctx, [[nb[0] - 6, nb[1] - 21], [nb[0] + 6, nb[1] - 18], [nb[0] + 6, nb[1] - 10], [nb[0] - 6, nb[1] - 13]], PAL.woodLight);
+      poly(ctx, [[nb[0] - 7, nb[1] - 22.6], [nb[0] + 7, nb[1] - 19.1], [nb[0] + 7, nb[1] - 17.5], [nb[0] - 7, nb[1] - 21]], accent);
+      rect(ctx, nb[0] - 5, nb[1] - 19.5, 4, 4, PAL.chalk);
+      rect(ctx, nb[0] + 0.5, nb[1] - 17.5, 4, 3, PAL.chalk);
+      rect(ctx, nb[0] - 4, nb[1] - 13.5, 5, 2, PAL.chalk);
+
+      // Finial on the SE ridge end — the NW end is where a banner pole goes,
+      // and a hall very often has one.
+      const RWh = W + 8;
+      const fx = roof === 'gable' || roof === 'thatch' ? RWh / 4 : 0;
+      const fy =
+        roof === 'gable' || roof === 'thatch'
+          ? -wallH + RWh / 8 - roofH
+          : roof === 'hip'
+            ? -wallH - roofH
+            : -wallH - 5;
+      rect(ctx, fx, fy - 9, 1.4, 10, PAL.woodDark);
+      poly(ctx, diamond(fx + 0.7, fy - 9, 6), accent);
+      poly(ctx, [[fx - 2.3, fy - 9], [fx + 0.7, fy - 9], [fx + 0.7, fy - 10.5]], shade(accent, 0.3));
+      rect(ctx, fx, fy - 13.5, 1.4, 4, shade(accent, -0.3));
+    }
+
+    if (role === 'store' && p >= 0.62) {
+      // A shingle on an iron bracket, hung off the east end of the shop wall
+      // where it can be read from along the lane. It goes on this face and not
+      // the door's because the door's already has the awning over it, and two
+      // things projecting off one wall at head height is one too many.
+      const s0 = rightPt(W, 0.93, Math.min(wallH - 3, 15));
+      const arm = 5;
+      const s1 = outR(s0, arm);
+      poly(ctx, [s0, s1, [s1[0], s1[1] + 1.2], [s0[0], s0[1] + 1.2]], PAL.ink);
+      poly(ctx, [[s0[0], s0[1] + 1.2], [s0[0], s0[1] + 5.5], [s1[0] - 5, s1[1] + 1.2]], PAL.ink);
+      const pA = outR(s0, 1.6);
+      const pB = s1;
+      rect(ctx, pB[0] - 1, pB[1] + 1, 1, 2, PAL.ink);
+      poly(ctx, [pA, pB, [pB[0], pB[1] + 10], [pA[0], pA[1] + 10]], PAL.woodDark);
+      poly(ctx, [
+        [pA[0] + 0.8, pA[1] + 1.2],
+        [pB[0] - 0.8, pB[1] + 1.2],
+        [pB[0] - 0.8, pB[1] + 8.8],
+        [pA[0] + 0.8, pA[1] + 8.8],
+      ], accent);
+      rect(ctx, pA[0] - 4.5, pA[1] + 3.4, 5, 1.2, PAL.chalk);
+      rect(ctx, pA[0] - 4.5, pA[1] + 6, 3.4, 1.2, PAL.chalk);
+
+      const cq = outL(leftPt(W, 0.86, 0), 3);
+      poly(ctx, diamond(cq[0] + 2, cq[1] + 1, 18), PAL.shadow);
+      const crate = (x: number, y: number, s: number) => {
+        poly(ctx, [[x - s, y], [x, y + s / 2], [x, y + s / 2 - s], [x - s, y - s]], PAL.woodLight);
+        poly(ctx, [[x, y + s / 2], [x + s, y], [x + s, y - s], [x, y + s / 2 - s]], PAL.wood);
+        poly(ctx, diamond(x, y - s, s * 2), shade(PAL.woodLight, 0.16));
+      };
+      crate(cq[0], cq[1] - 1, 5);
+      crate(cq[0] + 7, cq[1] - 3, 4.5);
+      crate(cq[0] + 1, cq[1] - 11, 3.5);
+    }
+
+    if (role === 'workshop' && p >= 0.62) {
+      // A bench out in the daylight with the job on it, and a lean-to down the
+      // east wall for the stock that must not get wet. The half-open door is
+      // drawn with the doorway, above.
+      // Well clear of the wall: the swung door leaf lands on the same patch of
+      // yard, and a bench tucked in tight ends up inside it.
+      const bq = outL(leftPt(W, 0.86, 0), 6.5);
+      poly(ctx, diamond(bq[0] - 3, bq[1] + 1, 20), PAL.shadowSoft);
+      const g0: Pt = [bq[0] - 10, bq[1] - 5];
+      const g1: Pt = [bq[0] + 2, bq[1] + 1];
+      poly(ctx, [[g0[0], g0[1] - 6], [g1[0], g1[1] - 6], [g1[0], g1[1] - 4.2], [g0[0], g0[1] - 4.2]], PAL.woodLight);
+      poly(ctx, [[g0[0], g0[1] - 4.2], [g1[0], g1[1] - 4.2], [g1[0], g1[1] - 3.4], [g0[0], g0[1] - 3.4]], PAL.woodDark);
+      rect(ctx, g0[0] + 1, g0[1] - 3.6, 1.4, 3.6, PAL.wood);
+      rect(ctx, g1[0] - 2.4, g1[1] - 3.6, 1.4, 3.6, PAL.wood);
+      // a saw leaning on the bench end, and a mallet lying on the top
+      poly(ctx, [
+        [g0[0] + 2, g0[1] - 6],
+        [g0[0] + 5.4, g0[1] - 15],
+        [g0[0] + 6.8, g0[1] - 14.6],
+        [g0[0] + 3.4, g0[1] - 5.6],
+      ], PAL.stoneLight);
+      rect(ctx, g0[0] + 4.4, g0[1] - 8, 2, 2, PAL.woodDark);
+      rect(ctx, g1[0] - 7, g1[1] - 9, 4.4, 2.6, PAL.wood);
+      rect(ctx, g1[0] - 5.4, g1[1] - 6.6, 1.2, 2.4, PAL.woodDark);
+
+      const lt0 = rightPt(W, 0.3, 0);
+      const lt1 = rightPt(W, 0.82, 0);
+      const ldep = 5;
+      // The lean-to hangs off the *wall*, never off the roof: a single-storey
+      // workshop has 12px of wall, and a lean-to pitched from above the eaves
+      // stops reading as an outbuilding and starts reading as a second roof.
+      const lwall = Math.min(wallH - 1.5, 15);
+      const lph = lwall - 5;
+      const q0 = outR(lt0, ldep);
+      const q1 = outR(lt1, ldep);
+      const rTone = roofTone(roof, accent, condition, spec.material);
+      poly(ctx, [lt0, lt1, [q1[0], q1[1] + 1.5], [q0[0], q0[1] + 1.5]], PAL.shadow);
+      // boards stacked in the dry
+      for (let i = 0; i < 3; i++) {
+        const yy = -1.5 - i * 2.4;
+        poly(ctx, [
+          [q0[0] - 3, q0[1] + yy],
+          [q1[0] - 3, q1[1] + yy],
+          [q1[0] - 3, q1[1] + yy - 2],
+          [q0[0] - 3, q0[1] + yy - 2],
+        ], i % 2 ? PAL.woodLight : PAL.wood);
+      }
+      rect(ctx, q0[0] - 1.6, q0[1] - lph, 1.6, lph, PAL.woodDark);
+      rect(ctx, q1[0], q1[1] - lph, 1.6, lph, PAL.woodDark);
+      poly(ctx, [
+        [lt0[0], lt0[1] - lwall],
+        [lt1[0], lt1[1] - lwall],
+        [q1[0] + 1.6, q1[1] - lph],
+        [q0[0] - 1.6, q0[1] - lph],
+      ], shade(rTone, -0.24));
+      poly(ctx, [
+        [q0[0] - 1.6, q0[1] - lph],
+        [q1[0] + 1.6, q1[1] - lph],
+        [q1[0] + 1.6, q1[1] - lph + 1.8],
+        [q0[0] - 1.6, q0[1] - lph + 1.8],
+      ], shade(rTone, -0.5));
+    }
+
+    if (role === 'cottage' && p >= 0.62) {
+      // A stub of picket running out along the east wall — enough to say the
+      // ground in front of this door belongs to somebody. The window boxes go
+      // on with the windows, above, so they land on whichever face got one.
+      const f0 = outR(rightPt(W, 0.12, 0), 3);
+      poly(ctx, [
+        [f0[0] + 0.6, f0[1] - 4.4],
+        [f0[0] + 13, f0[1] - 10.9],
+        [f0[0] + 13, f0[1] - 9.5],
+        [f0[0] + 0.6, f0[1] - 3],
+      ], PAL.wood);
+      for (let i = 0; i < 4; i++) {
+        const x = f0[0] + i * 4.2;
+        const y = f0[1] - i * 2.1;
+        rect(ctx, x, y - 7, 1.4, 7, PAL.woodLight);
+        rect(ctx, x, y - 8.2, 1.4, 1.4, PAL.woodDark);
+      }
+    }
+
+    // A chapel puts a bell gable on the ridge instead — see above.
+    if (spec.cupola && p >= 0.62 && role !== 'chapel') {
       const cy = -wallH - roofH - 2;
       rect(ctx, -5, cy - 9, 10, 9, PAL.wall);
       rect(ctx, 0, cy - 9, 5, 9, PAL.wallShade);
@@ -886,6 +1304,50 @@ export function buildStructure(spec: StructureSpec): StructureSprite {
       rect(ctx, cx, cy - 13, 3, 14, PAL.stoneDark);
       rect(ctx, cx - 4, cy - 15, 8, 2, shade(PAL.stone, -0.25));
       smoke = [cx, cy - 16];
+    }
+
+    if (role === 'chapel' && p >= 0.62) {
+      // A bell gable, not a tower: one arch, one bell, one cross, sat astride
+      // the near ridge end. The generic cupola is suppressed for a chapel
+      // above, because a lantern *and* a bell-cote on one small roof read as
+      // two towers, and a chapel that out-towers the tower is the wrong
+      // silhouette entirely.
+      //
+      // It goes on the SOUTH-EAST end and it goes on last, because the two
+      // things that stand proud of a chapel's ridge are both already spoken
+      // for: the banner pole a landmark plot gets sits over the north-west end,
+      // and the chimney comes up through the south-east slope. Losing a corner
+      // of a chimney behind a bell-cote is fine; losing the bell is not.
+      const RWb = W + 8;
+      const bx = roof === 'gable' || roof === 'thatch' ? RWb / 4 : 0;
+      const by =
+        roof === 'flat'
+          ? -wallH - 4
+          : roof === 'hip'
+            ? -wallH - roofH + 1
+            : -wallH + RWb / 8 - roofH + 1;
+      const bw = 12;
+      const bh = 15;
+      ctx.save();
+      ctx.translate(bx, by);
+      const top = 2 - bh;
+      poly(ctx, [[-bw / 2, 2], [0, 2 + bw / 4], [0, 2 + bw / 4 - bh], [-bw / 2, 2 - bh]], wl);
+      poly(ctx, [[0, 2 + bw / 4], [bw / 2, 2], [bw / 2, 2 - bh], [0, 2 + bw / 4 - bh]], wr);
+      // the arched opening, cut into the near face
+      poly(ctx, [[-bw / 2 + 2, -1], [-2, 0], [-2, top + 3.5], [-bw / 2 + 2, top + 2.5]], PAL.ink);
+      poly(ctx, [[-bw / 2 + 2, top + 2.5], [-bw / 2 + 3.4, top + 3.2], [-bw / 2 + 2, top + 3.2]], wl);
+      poly(ctx, [[-2, top + 3.5], [-2, top + 4.2], [-3.4, top + 4.2]], wl);
+      // the bell
+      blob(ctx, -bw / 2 + 4.6, top + 4.6, [2, 4, 5, 5, 5], '#c9a24e');
+      rect(ctx, -bw / 2 + 4, top + 9.6, 5, 1, '#8f6f33');
+      rect(ctx, -bw / 2 + 4.4, top + 10.6, 1, 1, PAL.ink);
+      // capping gable and cross
+      const rTone = roofTone(roof, accent, condition, spec.material);
+      poly(ctx, [[-bw / 2 - 2, top + 2], [0, top + 2 + bw / 4], [0, top - 7]], rTone);
+      poly(ctx, [[0, top + 2 + bw / 4], [bw / 2 + 2, top + 2], [0, top - 7]], shade(rTone, -0.32));
+      rect(ctx, 0, top - 13, 1.4, 7, PAL.ink);
+      rect(ctx, -2, top - 11, 5, 1.4, PAL.ink);
+      ctx.restore();
     }
 
     /* ---- still working on it ---------------------------------------- */

@@ -75,16 +75,15 @@ const ROLES: StructureRole[] = [
 /**
  * Roles that get NO special-case art inside `buildStructure` — they draw the
  * plain house and are told apart only by size, roof and the spec flags
- * (chimney / awning / banner / cupola). See the `role ===` branches in
- * src/components/designs/vale/art.ts (`buildStructure`, "role furniture"):
- * tower, granary, mill, smithy, bakery and brewhouse are the only ones with
- * their own furniture; barn, shed and granary additionally get timber walls
- * (`woody`), and barn alone gets plank seams, a wide door and no ground-floor
- * window on its right face.
+ * (chimney / awning / banner / cupola). Down to one: `house` is the honest
+ * default every other role is now a departure from. See the `role ===` branches
+ * in src/components/designs/vale/art.ts (`buildStructure`, "role furniture") —
+ * homestead, chapel, hall, store, workshop and cottage each have their own,
+ * on top of tower, granary, mill, smithy, bakery, brewhouse and gildhall. barn,
+ * shed and granary additionally get timber walls (`woody`), and barn alone gets
+ * plank seams and no ground-floor window on its right face.
  */
-const GENERIC_ROLES = new Set<StructureRole>([
-  'cottage', 'house', 'hall', 'workshop', 'store', 'chapel', 'homestead',
-]);
+const GENERIC_ROLES = new Set<StructureRole>(['house']);
 /** Roles whose only distinction is the timber wall treatment. */
 const WOODY_ONLY = new Set<StructureRole>(['shed']);
 /**
@@ -303,7 +302,10 @@ const SPECIMEN: Record<StructureRole, RoleSpec> = {
   house: { w: 36, floors: 2, roof: 'gable', chimney: true },
   hall: { w: 56, floors: 2, roof: 'hip', banner: true },
   barn: { w: 48, floors: 1, roof: 'thatch' },
-  workshop: { w: 36, floors: 1, roof: 'gable', awning: true },
+  // No awning on the specimen: gen.ts gives one to half of them, and a canopy
+  // over the doorway hides the half-open door and the bench this role is here
+  // to show. The awning itself is on the store specimen below.
+  workshop: { w: 36, floors: 1, roof: 'gable' },
   store: { w: 36, floors: 2, roof: 'hip', awning: true },
   chapel: { w: 40, floors: 2, roof: 'gable', cupola: true },
   tower: { w: 44, floors: 2, roof: 'hip', banner: true },
@@ -673,14 +675,14 @@ function Inhabitants({ anims }: { anims: Anim[] }) {
 
 const COVERAGE: { head: string; body: string }[] = [
   {
-    head: '7 of 16 roles share the plain-house art',
+    head: 'shed is the last role with no art of its own',
     body:
-      'cottage, house, hall, workshop, store, chapel and homestead all fall through to the same box; only size, roof and the spec flags (chimney / awning / banner / cupola) tell them apart. shed differs from a house by timber walls alone. Distinct furniture exists for tower, granary, mill, smithy, bakery, brewhouse, gildhall — and barn (plank seams, wide door).',
+      'Every role now draws something only it draws, except house — the deliberate baseline — and shed, which is still a small house with timber walls. A lean-to roof, an open front or a stack of tools would separate it from a cottage without costing much; at w24–28 there is not a lot of wall to spend on.',
   },
   {
-    head: 'homestead is the founding house and looks like any other house',
+    head: 'Only the door wall is dressed',
     body:
-      'It is the one building the day opens on and the one every visitor sees first. Worth a porch, a woodpile or a washing line of its own — and a quarry town has no stone-specific homestead either, so the first house of a stone valley is the same box in masonry.',
+      'Almost every new piece of role furniture — porch, notice board, crates, bench, hanging sign, window boxes — hangs off the two faces the camera can see. The two back faces are blank render on every building in the valley, which is right for the fixed camera and wrong the moment anything ever rotates it.',
   },
   {
     head: 'Stone stops at the walls',
@@ -793,6 +795,24 @@ export default function Catalog() {
         sub: 'the same roll, roofed in slate',
         tag: 'thatch unreachable',
         tagKind: 'unused',
+      })
+    );
+    // Role furniture is timber whatever the walls are made of, which on masonry
+    // is exactly what it would have been: a porch, a bell-cote frame and a
+    // notice board are joinery, and only the bell-cote's own wall follows the
+    // building. These two are the check that nothing clashes.
+    out.push(
+      item('mt-homestead-stone', 'homestead · stone', structure('homestead', SPECIMEN.homestead, '#63c9a8', 1, night, 3444, 'gable', 'stone'), {
+        sub: 'timber porch and washing line on masonry',
+        tag: 'quarry town',
+        tagKind: 'info',
+      })
+    );
+    out.push(
+      item('mt-chapel-stone', 'chapel · stone', structure('chapel', SPECIMEN.chapel, '#9b8fe8', 1, night, 3555, 'gable', 'stone'), {
+        sub: 'bell gable coursed with the walls, slate cap',
+        tag: 'quarry town',
+        tagKind: 'info',
       })
     );
     out.push(
@@ -1242,7 +1262,7 @@ export default function Catalog() {
         >
           <Row
             title={`Roles (${ROLES.length})`}
-            note={`${GENERIC_ROLES.size} of ${ROLES.length} draw the plain house. A gildhall is never drawn from the common or landmark bags — it takes a charter out of a buried chest.`}
+            note={`${GENERIC_ROLES.size} of ${ROLES.length} draws the plain house — house itself, the baseline the rest depart from. homestead has a porch, woodpile, washing line and rain butt; chapel a bell gable, lancets and a double door; hall eave brackets, a notice board and a ridge finial; store a shopfront, a hanging shingle and crates; workshop a half-open cart door, a bench and a lean-to; cottage window boxes and a garden fence. A gildhall is never drawn from the common or landmark bags — it takes a charter out of a buried chest.`}
             items={structures}
           />
           <Row
