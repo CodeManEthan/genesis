@@ -1184,6 +1184,112 @@ function folkPass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId?
 /* end founders and professions (additive)                                    */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* standing stones (additive) — the ledger, on the subject of the stones      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The monument is terrain, and older terrain than anything else in the valley.
+ * The settlers do not build it, move it or mention it unprompted; it reaches
+ * the ledger on exactly two occasions, and never more than one line each:
+ *
+ *   the lane   a road was routed near enough that somebody had to decide what
+ *              to do about it. It went round.
+ *   the town   the town the stones named got founded in sight of them.
+ *
+ * ── ON THE TEMPO ──────────────────────────────────────────────────────────
+ * `plan()` is bisected about forty-one times to solve for the tempo `p`; this
+ * runs once, from `narrate`. Both gates above are properties of the MAP alone —
+ * whether there is a monument, how close the road network passes, whether the
+ * namesake town is on today's roster — so the DRAW COUNT never depends on `p`.
+ * The only thing `p` may move is the hour a line lands at.
+ */
+const STONE_ROAD_LOG = [
+  'The lane gives the stones a respectful margin.',
+  'The surveyor walks out to the stones on {where}, looks at them, and takes the lane round.',
+  'There was talk of running the road through the stones. There was not much talk.',
+  'The lane bends twice on {where} for no reason anybody writes down. The stones are the reason.',
+  'Nobody can say who set the stones up on {where}. The road is set to go round them, and goes round them.',
+];
+
+const STONE_FOUND_LOG = [
+  '{town} is founded in sight of the ring. The ring does not comment.',
+  '{town} takes its name off the stones on {where}. The stones had it first.',
+  'They found {town} within sight of the stones and named it for them, which is the polite thing to do.',
+  '{town} is founded on {where}, under the stones. Whoever set them there is not available to object.',
+];
+
+/** How close a road has to pass, in TILE units, before anybody remarks. Wider
+ * than the ruins' notice: a ring on open moor is visible a long way off. */
+const STONE_NOTICE = 10;
+
+function stonePass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId?: string }[] {
+  const stone = (map.stones ?? [])[0];
+  if (!stone) return [];
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x73744f4e) >>> 0); // 'stON'
+  const draw = makeDrawer(rng);
+  const lines: { t: number; text: string; siteId?: string }[] = [];
+  const valley = map.valleyName;
+
+  /* ---- the lane goes round --------------------------------------------- */
+  // Nearest road wins, with an explicit id tie-break, exactly as the ruins do.
+  let bestRoad: RoadSpec | null = null;
+  let bestD = Infinity;
+  let bestFrac = 0;
+  for (const road of map.roads) {
+    const { d, frac } = nearestOn(road.pts, stone.gx, stone.gy);
+    if (d < bestD || (d === bestD && bestRoad && road.id < bestRoad.id)) {
+      bestRoad = road;
+      bestD = d;
+      bestFrac = frac;
+    }
+  }
+  if (bestRoad && bestD <= STONE_NOTICE) {
+    let t: number | null = null;
+    for (const e of pl.events) {
+      if (e.type !== 'road' || e.roadId !== bestRoad.id) continue;
+      if (e.frac + 1e-9 < bestFrac) continue;
+      if (t === null || e.t < t) t = e.t;
+    }
+    const run = pl.runs.get(bestRoad.to) ?? pl.runs.get(bestRoad.from);
+    const jitter = rng() * 0.3;
+    const line: { t: number; text: string; siteId?: string } = {
+      t: clamp((t ?? 12 + jitter * 18) + jitter, 0.4, 23.4),
+      text: fill(draw(STONE_ROAD_LOG), {
+        valley,
+        town: run ? run.site.name : valley,
+        where: stone.where,
+      }),
+    };
+    if (run) line.siteId = run.site.id;
+    lines.push(line);
+  }
+
+  /* ---- and the town that took their name -------------------------------- */
+  // `townId` is read off the FULL roster, so a quiet day may never reach it.
+  // The gate is `pl.runs`, which is today's roster and a property of the map at
+  // this scale — never of the tempo.
+  const run = stone.townId ? pl.runs.get(stone.townId) : undefined;
+  if (run && run.foundT > 0) {
+    lines.push({
+      t: clamp(run.foundT + 0.05 + rng() * 0.2, 0.4, 23.4),
+      siteId: run.site.id,
+      text: fill(draw(STONE_FOUND_LOG), {
+        valley,
+        town: run.site.name,
+        where: stone.where,
+      }),
+    });
+  }
+
+  return lines;
+}
+
+/* -------------------------------------------------------------------------- */
+/* end standing stones (additive)                                             */
+/* -------------------------------------------------------------------------- */
+
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
   const range = (a: number, b: number) => a + rng() * (b - a);
@@ -1284,6 +1390,11 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   // itself by however many lines the folk pass just cost.
   for (const l of folkPass(map, pl)) key.push(l);
   /* --- end founders and professions (additive) ---------------------------- */
+
+  /* --- standing stones (additive): the lane goes round, the town is named -- */
+  // Folded into `key` on exactly the same terms as the two passes above.
+  for (const l of stonePass(map, pl)) key.push(l);
+  /* --- end standing stones (additive) ------------------------------------- */
 
   for (const sid of pl.order) {
     const run = pl.runs.get(sid)!;
