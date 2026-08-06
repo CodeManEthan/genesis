@@ -204,6 +204,20 @@ function dayKey(d = new Date()): string {
 const daySeed = (d?: Date) => hashSeed(dayKey(d));
 
 /**
+ * How far back a seed is still recognised as a *date* rather than a number.
+ *
+ * It used to be one day either side, which was all the live clock and the world
+ * waiting past midnight ever needed. `/days` links back a fortnight, though, and
+ * a day that arrives as an anonymous number loses the two things that made it
+ * that day: its season comes off a substream instead of its own month, and its
+ * inherited ruin comes off `seed - 1` instead of the day before it. Widening the
+ * search is the whole fix — an archived day is a date, so it is treated as one.
+ *
+ * Cheap: sixteen string hashes at world-build time, and never per frame.
+ */
+const RECALL_DAYS = 14;
+
+/**
  * Which month a seed belongs to, or null if it belongs to no date at all.
  *
  * This is the one place that knows whether a seed came out of the calendar, and
@@ -214,7 +228,7 @@ const daySeed = (d?: Date) => hashSeed(dayKey(d));
  */
 function monthOfSeed(seed: number): number | null {
   const now = new Date();
-  for (let k = -1; k <= 1; k++) {
+  for (let k = -RECALL_DAYS; k <= 1; k++) {
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + k, 12);
     if (daySeed(d) === seed) return d.getMonth() + 1;
   }
@@ -230,14 +244,15 @@ const dayFor = (seed: number) => dayInfo(seed, monthOfSeed(seed));
  * Same date-detection trick as `monthOfSeed` above, and for the same reason:
  * this file is the only place that knows whether a seed came out of a calendar.
  * A date-derived seed's predecessor is the day before it; a browsed seed's is
- * simply seed - 1, which is exactly what ‹ steps back to. The window covers
- * yesterday, today and tomorrow, so the world waiting on the other side of
+ * simply seed - 1, which is exactly what ‹ steps back to. The window reaches
+ * from a fortnight back to tomorrow, so the world waiting on the other side of
  * midnight gets today as ITS yesterday — the ghost of tomorrow's valley is the
- * landmark of the one the visitor has just watched being built.
+ * landmark of the one the visitor has just watched being built — and a day
+ * opened from `/days` gets the ruin it really inherited.
  */
 function prevDaySeed(seed: number): number {
   const now = new Date();
-  for (let k = -1; k <= 1; k++) {
+  for (let k = -RECALL_DAYS; k <= 1; k++) {
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + k, 12);
     if (daySeed(d) !== seed) continue;
     return daySeed(new Date(now.getFullYear(), now.getMonth(), now.getDate() + k - 1, 12));
