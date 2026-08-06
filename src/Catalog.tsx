@@ -24,6 +24,9 @@ import {
   buildRowboat,
   buildSignpost,
   buildStake,
+  /* ---- standing stones (additive) ---- */
+  buildStones,
+  /* ---- end standing stones (additive) ---- */
   buildStructure,
   buildStump,
   buildTree,
@@ -1236,6 +1239,27 @@ export default function Catalog() {
     []
   );
 
+  /* ---- standing stones (additive) ---- */
+  /**
+   * One specimen of each monument, at the middle of the size range gen.ts
+   * draws from. `buildStones` is the same factory the world bakes with, so
+   * these are literally the sprites a valley with a moor might be carrying.
+   */
+  const monuments = useMemo(
+    () =>
+      (
+        [
+          { kind: 'circle', w: 52, count: 6, fallen: 2, rot: 0.6, seed: 8821, sub: '6 uprights, one down' },
+          { kind: 'dolmen', w: 32, count: 2, fallen: -1, rot: 1.1, seed: 4519, sub: 'two and a capstone' },
+          { kind: 'row', w: 48, count: 4, fallen: -1, rot: 0.35, seed: 7703, sub: '4 stones marching' },
+        ] as const
+      ).map((m) =>
+        item(`st-${m.kind}`, m.kind, spriteCanvas(buildStones(m)), { sub: m.sub })
+      ),
+    []
+  );
+  /* ---- end standing stones (additive) ---- */
+
   const commonCounts = useMemo(() => {
     const m = new Map<StructureRole, number>();
     for (const r of COMMON_ROLES) m.set(r, (m.get(r) ?? 0) + 1);
@@ -1249,7 +1273,7 @@ export default function Catalog() {
     inhabitants: anims.length,
     wildlife: wildlife.length,
     infra: bridges.length + roads.length + grounds.length,
-    terrain: lakes.length + outcrops.length + seasons.length,
+    terrain: lakes.length + outcrops.length + monuments.length + seasons.length,
     palette: ACCENTS.length + SKY_DAYS.length,
   };
 
@@ -1365,7 +1389,7 @@ export default function Catalog() {
           id="terrain"
           title="Terrain"
           count={counts.terrain}
-          blurb="The parts of the ground bake that are not a flat tint: standing water, bare rock showing through, and what the month does to the leaves."
+          blurb="The parts of the ground bake that are not a flat tint: standing water, bare rock showing through, whatever somebody stood on end on the moor four thousand years ago, and what the month does to the leaves."
         >
           <Row
             title="Lakes"
@@ -1377,6 +1401,13 @@ export default function Catalog() {
             note="outcropTint() — the biome tint pulled towards bare stone under every outcrop, so a quarry reads as exposed rock rather than as a tidy pile of stones on a lawn."
             items={outcrops}
           />
+          {/* ---- standing stones (additive) ---- */}
+          <Row
+            title={`Standing stones (${monuments.length} kinds)`}
+            note="buildStones() — the one thing in the valley older than the ruins, and the only terrain that can name a town. About two seeds in five raise a monument, and only ever on a moor chunk, so a valley with no open moor has no stones at all. A circle keeps one stone down in the heather; a dolmen is the only silhouette with a horizontal in it; a row steps down in height so the eye reads a direction. Nothing here is drawn twice — one to a valley."
+            items={monuments}
+          />
+          {/* ---- end standing stones (additive) ---- */}
           <Row
             title="Seasons"
             note="makePools(season) repaints the six deciduous pools once, at bake, on the finished pixels. Conifers keep their needles; the ground has its own shift, and the woodland beyond the map only half turns."

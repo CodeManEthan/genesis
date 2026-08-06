@@ -52,13 +52,23 @@ import {
   type RuinKind,
   type RuinSpec,
   /* ---- end ruins (additive) ---- */
+  /* ---- standing stones (additive) ---- */
+  type StoneKind,
+  type StoneSpec,
+  /* ---- end standing stones (additive) ---- */
   type SiteSpec,
   type StructureRole,
   type TreeKind,
   type TreeSpec,
   type Vec2,
 } from './types.ts';
-import { townNames, valleyName } from './names.ts';
+import {
+  valleyName,
+  /* ---- standing stones (additive) ---- */
+  stoneTownName,
+  townNamesDrawn,
+  /* ---- end standing stones (additive) ---- */
+} from './names.ts';
 
 /* ========================================================================== */
 /*  geometry helpers — all in u/v space                                       */
@@ -1653,6 +1663,202 @@ export const uvPolyDist = polyDist;
 /* ========================================================================== */
 
 /* ========================================================================== */
+/*  standing stones (additive)                                                */
+/* ========================================================================== */
+
+/**
+ * Older than the ruins, and a good deal harder to shift.
+ *
+ * At most ONE stone monument to a valley, and only ever out on open moor. A
+ * seed whose day has no moor chunk in it gets no stones at all, and that is the
+ * point: about two valleys in five have one, and the ones that do have the only
+ * thing in the map old enough to have named a town.
+ *
+ * ── THE SCALE RULE ────────────────────────────────────────────────────────
+ * The same rule ruins live under: this is TERRAIN. Nothing below reads `scale`,
+ * every draw comes off a derived substream rather than the main sequence, and
+ * the siting is tested against the FULL road network and the FULL town roster —
+ * which are exactly what a smaller day is a prefix of. So the monument is
+ * byte-identical at 0.25x and at 4x, and so is the town it named.
+ *
+ * ── THE MARGIN ────────────────────────────────────────────────────────────
+ * The clearances are a shade wider than a ruin's. A ruin is somebody's wall and
+ * the lane can run along it; a ring of stones is something the lane goes round.
+ */
+const STONE_ROAD_CLEAR = 3.2;
+const STONE_RIVER_CLEAR = 3;
+const STONE_SITE_CLEAR = 3.2;
+const STONE_LAKE_CLEAR = 2;
+const STONE_ROCK_CLEAR = 1.4;
+/** Stones and somebody's walls are two different ages; keep them apart. */
+const STONE_RUIN_CLEAR = 10;
+/** And a buried chest is a third. */
+const STONE_CHEST_CLEAR = 7;
+/**
+ * How much open ground there can be between the monument and a town's RIM
+ * before the town stops being "in sight of the stones". Measured from the rim
+ * rather than the centre because the clearance above already keeps the ring off
+ * the green, and a centre test would leave a band too narrow to ever land in.
+ */
+export const STONE_NAME_REACH = 9;
+
+interface StoneSite {
+  u: number;
+  v: number;
+  r: number;
+}
+
+/** Where the monument stands, in u/v, alongside the spec the map carries. */
+interface StonePlacement {
+  spec: StoneSpec;
+  u: number;
+  v: number;
+}
+
+function raiseStones(
+  seed: number,
+  content: { u0: number; v0: number; u1: number; v1: number },
+  river: Pt[],
+  chunks: Chunk[],
+  sites: StoneSite[],
+  roadLines: Pt[][],
+  chests: ChestSpec[],
+  ruins: RuinSpec[],
+  offLake: (p: Pt, margin: number) => boolean,
+  offRock: (p: Pt, margin: number) => boolean
+): StonePlacement | null {
+  // A derived substream: never the main stream, never the scale. 'STON'.
+  const srng = mulberry32((seed ^ 0x53544f4e) >>> 0);
+
+  // Three valleys in five never had anybody who built in stone. The roll comes
+  // first and unconditionally, so the substream's shape does not depend on
+  // whether the map happens to have any moor to put a ring on.
+  const wanted = srng() < 0.4;
+
+  // Moor only, and the chunk list is already in a fixed order, so this is a
+  // deterministic candidate set. No moor, no stones — that is the scarcity.
+  const moor = chunks.filter((c) => c.biome === 'moor');
+  if (!wanted || !moor.length) return null;
+
+  const biomeAt = (p: Pt): Biome => {
+    for (const c of chunks) {
+      if (p[0] >= c.u0 && p[0] < c.u1 && p[1] >= c.v0 && p[1] < c.v1) return c.biome;
+    }
+    return 'meadow';
+  };
+
+  /* ---- somewhere high, dry and useless -------------------------------- */
+  let at: Pt | null = null;
+  for (let t = 0; t < 3000 && !at; t++) {
+    const c = moor[Math.min(moor.length - 1, Math.floor(srng() * moor.length))];
+    const p: Pt = [lerp(c.u0 + 1, c.u1 - 1, srng()), lerp(c.v0 + 1, c.v1 - 1, srng())];
+    // The chunk grid covers `bounds`, which runs wider than the framed content.
+    if (p[0] < content.u0 + 4 || p[0] > content.u1 - 4) continue;
+    if (p[1] < content.v0 + 4 || p[1] > content.v1 - 4) continue;
+    if (biomeAt(p) !== 'moor') continue;
+    if (polyDist(p, river) < STONE_RIVER_CLEAR) continue;
+    if (offLake(p, STONE_LAKE_CLEAR)) continue;
+    if (offRock(p, STONE_ROCK_CLEAR)) continue;
+    let clear = true;
+    for (const s of sites) {
+      if (dist(p, [s.u, s.v]) < s.r + STONE_SITE_CLEAR) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    for (const line of roadLines) {
+      if (polyDist(p, line) < STONE_ROAD_CLEAR) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    for (const r of ruins) {
+      if (dist(p, [r.gx - r.gy, r.gx + r.gy]) < STONE_RUIN_CLEAR) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    for (const ch of chests) {
+      if (dist(p, [ch.gx - ch.gy, ch.gx + ch.gy]) < STONE_CHEST_CLEAR) {
+        clear = false;
+        break;
+      }
+    }
+    if (!clear) continue;
+    at = p;
+  }
+  if (!at) return null;
+
+  /* ---- what they put up ------------------------------------------------ */
+  // Four draws, always, whatever the answers turn out to be.
+  const kindRoll = srng();
+  const countRoll = srng();
+  const wRoll = srng();
+  const fallRoll = srng();
+
+  const kind: StoneKind = kindRoll < 0.42 ? 'circle' : kindRoll < 0.72 ? 'dolmen' : 'row';
+  const count = kind === 'circle' ? 5 + Math.floor(countRoll * 3) : kind === 'row' ? 3 + Math.floor(countRoll * 2) : 2;
+  // Ring diameter, or the length of the row. A dolmen is two stones and a lid,
+  // so it covers a good deal less ground than either.
+  const w =
+    kind === 'dolmen'
+      ? 28 + Math.floor(wRoll * 3) * 4 // 28 | 32 | 36
+      : 44 + Math.floor(wRoll * 4) * 4; // 44 .. 56
+  // Only a circle has one down: a dolmen with a stone out is a heap, and a row
+  // with a gap in it is not a row.
+  const fallen = kind === 'circle' ? Math.floor(fallRoll * count) : -1;
+  // The ring's turn, and the direction a row marches. Quantised to whole
+  // degrees so two monuments that happen to line up share one sprite bake.
+  const rot = (Math.round(fallRoll * 360) * Math.PI) / 180;
+
+  const [gx, gy] = uv(at[0], at[1]);
+  return {
+    spec: {
+      id: 'st0',
+      gx,
+      gy,
+      seed: (seed + 4483) >>> 0,
+      kind,
+      count,
+      fallen,
+      w,
+      rot,
+      biome: 'moor',
+      where: chestWhere(seed, 'moor'),
+    },
+    u: at[0],
+    v: at[1],
+  };
+}
+
+/**
+ * The town the stones named, or -1.
+ *
+ * Read off the FULL roster, so which town it is cannot change with the pace —
+ * a quiet day may simply never get round to founding it. Nearest rim wins, and
+ * the tie-break is the roster index, which is founding order.
+ */
+function stoneNamesake(sites: StoneSite[], u: number, v: number): number {
+  let take = -1;
+  let takeD = Infinity;
+  for (let i = 0; i < sites.length; i++) {
+    const d = dist([sites[i].u, sites[i].v], [u, v]) - sites[i].r;
+    if (d < takeD) {
+      takeD = d;
+      take = i;
+    }
+  }
+  return take >= 0 && takeD <= STONE_NAME_REACH ? take : -1;
+}
+
+/* ========================================================================== */
+/*  end standing stones (additive)                                            */
+/* ========================================================================== */
+
+/* ========================================================================== */
 /*  the generator                                                             */
 /* ========================================================================== */
 
@@ -1899,7 +2105,14 @@ function buildMap(seed: number, scale: number): GenesisMap {
     [pool[i], pool[j]] = [pool[j], pool[i]];
   }
   const usedNames = new Set<string>();
-  const names = townNames(rng, sites.length, usedNames);
+  /* ---- standing stones (additive) ---- */
+  // `townNamesDrawn` is `townNames` with each name's rolls kept alongside it —
+  // the same code path and the same draws, so nothing here moved. The rolls are
+  // what lets a town by the monument be renamed further down without the
+  // naming stream noticing: see `stoneTownName` in names.ts.
+  const named = townNamesDrawn(rng, sites.length, usedNames);
+  const names = named.map((d) => d.name);
+  /* ---- end standing stones (additive) ---- */
   const landmarkOffset = Math.floor(rng() * LANDMARK_ROLES.length);
   const scatterTarget = 100 + Math.floor(rng() * 80);
   const valley = valleyName(rng);
@@ -1953,7 +2166,13 @@ function buildMap(seed: number, scale: number): GenesisMap {
     sites.push(...baseline, ...frontier);
   }
   if (sites.length > names.length) {
-    names.push(...townNames(rng, sites.length - names.length, usedNames));
+    /* ---- standing stones (additive) ---- */
+    // Same draws as the `townNames` call this replaced; `named` just keeps the
+    // rolls, and stays index-aligned with `names`.
+    const more = townNamesDrawn(rng, sites.length - names.length, usedNames);
+    named.push(...more);
+    names.push(...more.map((d) => d.name));
+    /* ---- end standing stones (additive) ---- */
   }
   sites.forEach((s, i) => {
     s.id = `s${i}`;
@@ -2185,6 +2404,44 @@ function buildMap(seed: number, scale: number): GenesisMap {
     offRock
   );
   /* ---- end ruins (additive) ---------------------------------------------- */
+
+  /* ---- standing stones (additive) ---------------------------------------- */
+  // Terrain, on its own substream — see raiseStones above for the scale rule.
+  // It runs here for the reasons the ruins do (after the chunks, the FULL road
+  // network, the chests and the walls it keeps clear of; before the trees, so
+  // the ring is bare ground) and for one of its own: nothing below this line
+  // has read a town's NAME yet, so the monument can still rename one.
+  const placement = raiseStones(
+    seed,
+    content,
+    river,
+    chunks,
+    sites,
+    roadLines,
+    chests,
+    ruins,
+    offLake,
+    offRock
+  );
+  const stones: StoneSpec[] = [];
+  if (placement) {
+    const take = stoneNamesake(sites, placement.u, placement.v);
+    if (take >= 0) {
+      // Not a new draw and not a reordering — the same rolls that town's
+      // ordinary name came off, looked up in the stone-flavoured pools. Every
+      // other town keeps the name it already had, down to the last letter.
+      const was = sites[take].name;
+      usedNames.delete(was);
+      const now = stoneTownName(named[take].rolls, usedNames, was);
+      usedNames.add(now);
+      sites[take].name = now;
+      names[take] = now;
+      placement.spec.townId = sites[take].id;
+      placement.spec.townName = now;
+    }
+    stones.push(placement.spec);
+  }
+  /* ---- end standing stones (additive) ------------------------------------ */
 
   /* ---- buildings -------------------------------------------------------- */
   const GOLDEN = 2.399963;
@@ -3403,6 +3660,24 @@ function buildMap(seed: number, scale: number): GenesisMap {
   }
   /* ---- end ruins (additive) ---------------------------------------------- */
 
+  /* ---- standing stones (additive) ---------------------------------------- */
+  // A monument clears its own ground, and has done for a very long time: the
+  // ring is heather and nothing else. Same rule as the ruins above — only
+  // unclaimed undergrowth gives way, so nobody's felling appointment is
+  // cancelled — and the ring's position is scale-free, so the tree list stays
+  // byte-identical at every pace.
+  for (const st of stones) {
+    const su = st.gx - st.gy;
+    const sv = st.gx + st.gy;
+    const clearR = fpR(st.w) + 0.7;
+    for (const i of treesNear(su, sv, clearR)) {
+      const t = trees[i];
+      if (protectedTrees.has(t.id) || roadClaimed.has(t.id) || dead.has(t.id)) continue;
+      if (dist(treeUV[i], [su, sv]) < clearR) dead.add(t.id);
+    }
+  }
+  /* ---- end standing stones (additive) ------------------------------------ */
+
   const liveTrees = trees.filter((t) => !dead.has(t.id));
 
   /* ---- assemble --------------------------------------------------------- */
@@ -3462,6 +3737,9 @@ function buildMap(seed: number, scale: number): GenesisMap {
     /* ---- ruins (additive) ---- */
     ruins,
     /* ---- end ruins (additive) ---- */
+    /* ---- standing stones (additive) ---- */
+    stones,
+    /* ---- end standing stones (additive) ---- */
     valleyName: valley,
   };
 }

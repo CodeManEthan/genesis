@@ -27,6 +27,9 @@ const {
   JETTY_LEN,
   JETTY_REACH,
   JETTY_LAKE_REACH,
+  /* ---- standing stones (additive) ---- */
+  STONE_NAME_REACH,
+  /* ---- end standing stones (additive) ---- */
 } = await import(join(root, 'src/components/designs/genesis/gen.ts'));
 const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
 
@@ -351,6 +354,34 @@ function report(seed) {
     );
   }
   /* ---- end ruins (additive) --------------------------------------------- */
+
+  /* ---- standing stones (additive) --------------------------------------- */
+  const stones = map.stones ?? [];
+  say(`\nSTANDING STONES (${stones.length})`);
+  for (const st of stones) {
+    const p = uvOf(st);
+    let road = Infinity;
+    for (const rd of map.roads) road = Math.min(road, polyDist(p, roadUV.get(rd.id)));
+    let rim = Infinity;
+    let who = '--';
+    for (const s of map.sites) {
+      const d = d2(p, uvOf(s)) - s.radius;
+      if (d < rim) {
+        rim = d;
+        who = s.id;
+      }
+    }
+    const named = st.townId ? `${st.townId} “${st.townName}”` : 'nobody';
+    say(
+      `  ${st.id} ${st.kind.padEnd(6)} u,v ${f1(p[0]).padStart(6)},${f1(p[1]).padStart(6)}  ` +
+        `${st.biome.padEnd(6)} ${('“' + st.where + '”').padEnd(16)} ` +
+        `${st.count} up, fallen ${String(st.fallen).padStart(2)}, w ${st.w}, ` +
+        `${String(Math.round((st.rot * 180) / Math.PI)).padStart(3)}deg  ` +
+        `road ${f1(road).padStart(5)}  nearest rim ${f1(rim).padStart(5)} (${who})  ` +
+        `named ${named}`
+    );
+  }
+  /* ---- end standing stones (additive) ------------------------------------ */
 
   say(`\nforest character: ${woodCharacter(seed)}`);
   say(`tree kinds: ${hist(map.trees, (t) => t.kind)}`);
@@ -787,6 +818,100 @@ function checks(seed, map, scale = 1) {
     );
   }
 
+  /* (z2) standing stones (additive): at most one to a valley, always on moor,
+     clear of every road, green, shore, boulder field, ruin and buried chest,
+     standing on ground it has kept clear of trees — and, where a town is close
+     enough to have taken its name off them, saying so.
+     Stones are TERRAIN — the scale-identity half is in subsetChecks. */
+  {
+    const stones = map.stones ?? [];
+    // Its own copy of the lake outlines, for the reason the ruins block above
+    // keeps one: the shared `rings` is declared further down.
+    const wet = (map.lakes ?? []).map((lk) => lakeRingUV(lk));
+    const bad = [];
+    let minRoad = Infinity;
+    let minRiver = Infinity;
+    let minRim = Infinity;
+    for (const st of stones) {
+      if (st.id !== 'st0') bad.push(`${st.id} is not st0 — one monument to a valley`);
+      const p = uvOf(st);
+      const chunk = map.chunks.find(
+        (k) => p[0] >= k.u0 && p[0] < k.u1 && p[1] >= k.v0 && p[1] < k.v1
+      );
+      if (!chunk) bad.push(`${st.id} sits outside every chunk`);
+      else if (chunk.biome !== 'moor') bad.push(`${st.id} stands in ${chunk.biome}, not moor`);
+      if (st.biome !== 'moor') bad.push(`${st.id} says ${st.biome}`);
+      if (!st.where) bad.push(`${st.id} has nowhere to be`);
+      if (!['circle', 'dolmen', 'row'].includes(st.kind)) bad.push(`${st.id} kind ${st.kind}`);
+      if (st.w % 4 !== 0 || st.w < 16) bad.push(`${st.id} footprint ${st.w}`);
+      const want =
+        st.kind === 'circle'
+          ? st.count >= 5 && st.count <= 7
+          : st.kind === 'dolmen'
+            ? st.count === 2
+            : st.count >= 3 && st.count <= 4;
+      if (!want) bad.push(`${st.id} is a ${st.kind} of ${st.count}`);
+      // Only a circle has one down, and it has to be one of its own.
+      if (st.kind === 'circle' && !(st.fallen >= 0 && st.fallen < st.count))
+        bad.push(`${st.id} fallen ${st.fallen} of ${st.count}`);
+      if (st.kind !== 'circle' && st.fallen !== -1) bad.push(`${st.id} ${st.kind} has one down`);
+      if (!(st.rot >= 0 && st.rot <= Math.PI * 2 + 1e-9)) bad.push(`${st.id} rot ${st.rot}`);
+
+      for (const rd of map.roads) minRoad = Math.min(minRoad, polyDist(p, roadUV.get(rd.id)));
+      minRiver = Math.min(minRiver, polyDist(p, river));
+      let rim = Infinity;
+      let who = null;
+      for (const s of map.sites) {
+        const d = d2(p, uvOf(s)) - s.radius;
+        if (d < rim) {
+          rim = d;
+          who = s;
+        }
+      }
+      minRim = Math.min(minRim, rim);
+      for (const r of map.ruins ?? [])
+        if (d2(p, uvOf(r)) < 10 - 1e-9) bad.push(`${st.id} crowds ${r.id}`);
+      for (const c of map.chests ?? [])
+        if (d2(p, uvOf(c)) < 7 - 1e-9) bad.push(`${st.id} stands on ${c.id}`);
+      if (wet.length && lakesShoreDist(p, wet) < 2 - 1e-9) bad.push(`${st.id} stands in a lake`);
+      for (const o of map.outcrops ?? [])
+        if (d2(p, uvOf(o)) < o.radius + 1.4 - 1e-9) bad.push(`${st.id} stands on ${o.id}`);
+
+      // A monument clears its own ground: nothing standing inside the ring.
+      const clearR = st.w / TW + 0.7;
+      let inside = 0;
+      for (const tr of map.trees) if (d2(p, uvOf(tr)) < clearR - 1e-9) inside++;
+      if (inside) bad.push(`${st.id} has ${inside} tree(s) inside the ring`);
+
+      // The name hook, checked from this end: if a town took the stones' name
+      // it must be the nearest rim and it must be inside the reach; and the
+      // nearest rim inside the reach must have taken it. Roster trimming is the
+      // one exemption — a namesake the day never founded is not on this map.
+      if (st.townId) {
+        const town = map.sites.find((s) => s.id === st.townId);
+        if (town) {
+          if (town.name !== st.townName)
+            bad.push(`${st.id} names ${st.townId} “${st.townName}”, map says “${town.name}”`);
+          if (d2(p, uvOf(town)) - town.radius > STONE_NAME_REACH + 1e-9)
+            bad.push(`${st.id} named ${st.townId}, ${f1(d2(p, uvOf(town)) - town.radius)} away`);
+        }
+      } else if (who && rim <= STONE_NAME_REACH - 1e-9) {
+        bad.push(`${st.id} left ${who.id} unnamed at rim ${f1(rim)}`);
+      }
+    }
+    check(
+      'z2 stones on the moor, ring kept clear',
+      stones.length <= 1 &&
+        bad.length === 0 &&
+        (!stones.length || (minRoad >= 3.2 && minRiver >= 3 && minRim >= 3.2)),
+      `${stones.length} monument(s)` +
+        (stones.length
+          ? `, nearest road ${f1(minRoad)}, river ${f1(minRiver)}, town rim ${f1(minRim)}`
+          : '') +
+        (bad.length ? ` — ${bad.join('; ')}` : '')
+    );
+  }
+
   /* (s) no two towns wear the same accent */
   {
     const acc = map.sites.map((s) => s.accent);
@@ -1071,9 +1196,13 @@ function subsetChecks(seed) {
   // `ruins` joins them for exactly the same reason: overgrown walls were there
   // before the first house and the day neither raises them nor pulls them down,
   // so where they are and what shape they are in is a pure function of the seed.
+  // `stones` joins them on exactly the same terms, and one more besides: the
+  // town a monument NAMED is picked off the full roster, so which town it is
+  // cannot move with the pace either — that half is pinned by the site-meta
+  // comparison below, which includes the name.
   // (The GHOST is not map data at all — it is a function of two seeds and lives
   // in ghost.ts, outside `GenesisMap`, so it is not checked here.)
-  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'ruins', 'bounds', 'content', 'valleyName']) {
+  for (const field of ['river', 'riverWidth', 'lakes', 'outcrops', 'chunks', 'trees', 'scatter', 'chests', 'ruins', 'stones', 'bounds', 'content', 'valleyName']) {
     const ok = maps.every((m) => same(m[field], maps[0][field]));
     check(`terrain: ${field} identical`, ok);
   }
@@ -1224,6 +1353,57 @@ function chestReport(n) {
   );
 }
 
+/* ---- standing stones (additive) ------------------------------------------ */
+
+/**
+ * How often a valley has a monument, what kind it is, and how often it named
+ * the town down the hill. Two figures matter: about two seeds in five raising
+ * one (rarer and nobody ever meets the feature; commoner and it stops being the
+ * oldest thing in the valley), and how many of those namesake towns the DEFAULT
+ * pace actually founds — a name nobody sees is a name nobody reads.
+ */
+function stoneReport(n) {
+  const kinds = {};
+  const counts = {};
+  let days = 0;
+  let named = 0;
+  let shown = 0;
+  let noMoor = 0;
+  const sample = [];
+  for (let s = 1; s <= n; s++) {
+    const map = generateMap(s);
+    if (!map.chunks.some((c) => c.biome === 'moor')) noMoor++;
+    const st = (map.stones ?? [])[0];
+    if (!st) continue;
+    days++;
+    kinds[st.kind] = (kinds[st.kind] ?? 0) + 1;
+    counts[`${st.kind} x${st.count}`] = (counts[`${st.kind} x${st.count}`] ?? 0) + 1;
+    if (!st.townName) continue;
+    named++;
+    if (map.sites.some((x) => x.id === st.townId)) {
+      shown++;
+      if (sample.length < 8) sample.push(`${st.townName} (seed ${s})`);
+    }
+  }
+  const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : '--');
+  const hist = (o) =>
+    Object.entries(o)
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+      .map(([k, v]) => `${k} ${v}`)
+      .join(', ');
+  console.log(`\nSTANDING STONES over ${n} seeds`);
+  console.log(`  monument on:    ${days} days (${pct(days, n)}); ${noMoor} seeds have no moor at all`);
+  console.log(`  kinds:          ${hist(kinds)}`);
+  console.log(`  shapes:         ${hist(counts)}`);
+  console.log(
+    `  named a town:   ${named}/${days} monuments (${pct(named, days)}), ` +
+      `of which ${shown} are founded at the baseline pace (${pct(shown, n)} of all days)`
+  );
+  if (sample.length) console.log(`  e.g. ${sample.join(', ')}`);
+}
+
+/* ---- end standing stones (additive) -------------------------------------- */
+
 /* ---------------------------------- main --------------------------------- */
 
 const argv = process.argv.slice(2);
@@ -1267,6 +1447,9 @@ if (argv[0] === '--sweep') {
   console.log(`sweep ${Math.min(n, 60)} seeds subset stability: ${subFails.length ? `FAIL ${subFails.join(',')}` : 'ALL PASS'}`);
   if (subFails.length) allPass = false;
   chestReport(n);
+  /* ---- standing stones (additive) ---- */
+  stoneReport(n);
+  /* ---- end standing stones (additive) ---- */
 } else {
   const seeds = argv.length ? argv.map(Number) : [1, 42, 20260802];
   for (const s of seeds) {

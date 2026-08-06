@@ -79,6 +79,9 @@ import {
   buildShed,
   buildSignpost,
   buildStake,
+  /* ---- standing stones (additive) ---- */
+  buildStones,
+  /* ---- end standing stones (additive) ---- */
   buildStructure,
   buildStump,
   buildTree,
@@ -131,6 +134,9 @@ import {
   /* ---- ruins (additive) ---- */
   type RuinSpec,
   /* ---- end ruins (additive) ---- */
+  /* ---- standing stones (additive) ---- */
+  type StoneSpec,
+  /* ---- end standing stones (additive) ---- */
   type SiteSpec,
   type TreeSpec,
   type Vec2,
@@ -1377,6 +1383,18 @@ function* buildVeg(
   }
   /* ---- end ruins (additive) ---------------------------------------------- */
 
+  /* ---- standing stones (additive) ---------------------------------------- */
+  // On exactly the ruins' terms, and for the same reason: the monument was here
+  // before the first house and will be here after the last lamp, so it goes on
+  // at build time and is never touched again. No slot, no reconcile, no patch.
+  // Indexed with `on.length` directly, so this block is safe in any position —
+  // see the MERGE NOTE on the market block above.
+  for (const st of scene.map.stones ?? []) {
+    add(stoneSprite(scene, st), st.gx, st.gy, R_RUIN, on.length);
+    on.push(true);
+  }
+  /* ---- end standing stones (additive) ------------------------------------ */
+
   yield;
   // Sorted by depth, then by the rank the old per-frame pass implied, then by
   // build order — for the wood, whose ordering predates all this, by `bx`.
@@ -1649,6 +1667,30 @@ function ruinSprite(scene: GenesisScene, r: RuinSpec): Sprite {
 }
 
 /* ---- end ruins (additive) ------------------------------------------------ */
+
+/* ---- standing stones (additive) ------------------------------------------ */
+
+/**
+ * The monument's sprite. Cached on every field of the spec that changes a
+ * pixel — the bearing is already quantised to whole degrees by gen.ts, so two
+ * valleys whose stones happen to line up share one bake.
+ */
+function stoneSprite(scene: GenesisScene, s: StoneSpec): Sprite {
+  const deg = Math.round((s.rot * 180) / Math.PI);
+  const key = `st:${s.kind}:${s.w}:${s.count}:${s.fallen}:${deg}:${s.seed}`;
+  return cached(scene, key, () =>
+    buildStones({
+      kind: s.kind,
+      w: s.w,
+      count: s.count,
+      fallen: s.fallen,
+      rot: (deg * Math.PI) / 180,
+      seed: s.seed,
+    })
+  );
+}
+
+/* ---- end standing stones (additive) -------------------------------------- */
 
 function cached(scene: GenesisScene, key: string, make: () => Sprite): Sprite {
   const hit = scene.extra.get(key);

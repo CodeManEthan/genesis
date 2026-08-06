@@ -45,10 +45,46 @@ const VALE_ELEMENTS = [
 /** Head nouns for a valley. */
 const VALE_NOUNS = ['Vale', 'Dale', 'Hollow', 'Bottom', 'Reach', 'Glen', 'Combe'];
 
+/* ---- standing stones (additive) ---- */
+
+/**
+ * A town in sight of the stones is named FOR them, and the pools it draws from
+ * are these. Same shape as the lists above — a leading element and a trailing
+ * one — so a stone name is built by exactly the same machinery, off exactly the
+ * same rolls, and only ever looks the numbers up somewhere else.
+ *
+ * The two tail lists are the SAME LENGTH on purpose: one roll picks the tail,
+ * and whether it is welded on (Stanhow, Harrowstone) or stands as its own word
+ * (Dolmen Lea, Ring Barton) is decided by a roll the ordinary name was already
+ * making anyway.
+ */
+const STONE_STEMS = [
+  'Stan', 'Stane', 'Ring', 'Harrow', 'Hoar', 'Grey', 'Long', 'Dolmen',
+  'Cairn', 'Barrow', 'Crom', 'Mene', 'Standing', 'Grim', 'Nine', 'Wayland',
+];
+
+/** Welded on: Stanhow, Harrowstone, Greyton. */
+const STONE_TAILS = [
+  'how', 'stone', 'barton', 'lea', 'henge', 'moor', 'stead', 'ton',
+  'gate', 'field', 'ridge', 'combe', 'borough', 'tor', 'wick', 'holt',
+];
+
+/** Standing alone: Dolmen Lea, Ring Barton, Wayland Cross. */
+const STONE_HEADS = [
+  'Barton', 'Lea', 'Ring', 'Cross', 'Rigg', 'Fold', 'Green', 'Bank',
+  'Holt', 'Combe', 'Moor', 'Rise', 'Hill', 'Row', 'End', 'Field',
+];
+
+/* ---- end standing stones (additive) ---- */
+
 /* --------------------------------- helpers -------------------------------- */
 
 const pick = <T,>(rng: () => number, list: readonly T[]): T =>
   list[Math.min(list.length - 1, Math.floor(rng() * list.length))];
+
+/** `pick`, but off a roll somebody else already made. */
+const at = <T,>(list: readonly T[], roll: number): T =>
+  list[Math.min(list.length - 1, Math.floor(roll * list.length))];
 
 /**
  * Join a stem to a suffix, collapsing a doubled letter at the seam so we get
@@ -63,12 +99,79 @@ function join(stem: string, suffix: string): string {
 
 /* ------------------------------- public API ------------------------------- */
 
+/* ---- standing stones (additive) ---- */
+
+/**
+ * The raw uniforms behind one attempt at a town name, in draw order:
+ *
+ *   [0] stem   [1] suffix   [2] the modifier gate   [3] the modifier, if drawn
+ *
+ * Recording them is the whole trick behind stone-named towns. A town by the
+ * monument must not cost the naming stream a single extra draw, or every town
+ * after it in the roster would be renamed and the map would stop being a pure
+ * function of its seed in the way the subset check pins down. So the stones
+ * never roll anything: they take the rolls the ordinary name had already made
+ * and look them up in a different set of word lists.
+ */
+export type NameRolls = readonly number[];
+
+/** One attempt at a name, and the rolls it came off. */
+export interface NameDraw {
+  name: string;
+  rolls: number[];
+}
+
+/** `townName`, with the rolls kept. The draw sequence is identical. */
+function rollTownName(rng: () => number): NameDraw {
+  const rolls: number[] = [];
+  const roll = () => {
+    const x = rng();
+    rolls.push(x);
+    return x;
+  };
+  const stem = at(STEMS, roll());
+  const suffix = at(SUFFIXES, roll());
+  const base = join(stem, suffix);
+  const name = roll() < 0.14 ? `${at(MODIFIERS, roll())} ${base}` : base;
+  return { name, rolls };
+}
+
+/**
+ * The same name, told by the stones: "Stanhow", "Dolmen Lea", "Harrowstone",
+ * "Nether Ring Barton". Pure — it makes no draws at all.
+ *
+ * `used` is every other name on the map. A collision walks the tail index on
+ * by one, which is deterministic and still in the pool; if the whole pool is
+ * somehow spoken for, the town keeps the name it already had.
+ */
+export function stoneTownName(
+  rolls: NameRolls,
+  used: ReadonlySet<string>,
+  fallback: string
+): string {
+  if (rolls.length < 3) return fallback;
+  const si = Math.min(STONE_STEMS.length - 1, Math.floor(rolls[0] * STONE_STEMS.length));
+  const ti = Math.min(STONE_TAILS.length - 1, Math.floor(rolls[1] * STONE_TAILS.length));
+  // The modifier gate does double duty: below 0.5 the tail welds on, above it
+  // the tail stands as its own word. Same roll, a second question asked of it.
+  const welded = rolls[2] < 0.5;
+  const mod = rolls.length > 3 ? at(MODIFIERS, rolls[3]) : '';
+  for (let k = 0; k < STONE_TAILS.length; k++) {
+    const j = (ti + k) % STONE_TAILS.length;
+    const base = welded
+      ? join(STONE_STEMS[si], STONE_TAILS[j])
+      : `${STONE_STEMS[si]} ${STONE_HEADS[j]}`;
+    const name = mod ? `${mod} ${base}` : base;
+    if (!used.has(name)) return name;
+  }
+  return fallback;
+}
+
+/* ---- end standing stones (additive) ---- */
+
 /** A town name: "Alderford", "Bramblemere", "Nether Foxholt". */
 export function townName(rng: () => number): string {
-  const stem = pick(rng, STEMS);
-  const suffix = pick(rng, SUFFIXES);
-  const base = join(stem, suffix);
-  return rng() < 0.14 ? `${pick(rng, MODIFIERS)} ${base}` : base;
+  return rollTownName(rng).name;
 }
 
 /** A valley name: "The Alder Vale", "Wrenmoor Dale", "The Vale of Foxholt". */
@@ -91,14 +194,33 @@ export function valleyName(rng: () => number): string {
  * disturbing the names it already handed out.
  */
 export function townNames(rng: () => number, n: number, used = new Set<string>()): string[] {
-  const out: string[] = [];
+  return townNamesDrawn(rng, n, used).map((d) => d.name);
+}
+
+/* ---- standing stones (additive) ---- */
+
+/**
+ * `townNames`, with each name's rolls kept alongside it — see `NameRolls`.
+ * `townNames` is now a thin wrapper over this, so there is exactly one naming
+ * code path and the two cannot drift apart by a single draw.
+ */
+export function townNamesDrawn(
+  rng: () => number,
+  n: number,
+  used = new Set<string>()
+): NameDraw[] {
+  const out: NameDraw[] = [];
   for (let i = 0; i < n; i++) {
-    let name = townName(rng);
-    for (let tries = 0; tries < 200 && used.has(name); tries++) name = townName(rng);
+    let d = rollTownName(rng);
+    for (let tries = 0; tries < 200 && used.has(d.name); tries++) d = rollTownName(rng);
     // Absolute fallback — deterministic and still readable.
-    if (used.has(name)) name = `${name} ${['Magna', 'Parva', 'Green', 'End'][i % 4]}`;
-    used.add(name);
-    out.push(name);
+    if (used.has(d.name)) {
+      d = { name: `${d.name} ${['Magna', 'Parva', 'Green', 'End'][i % 4]}`, rolls: d.rolls };
+    }
+    used.add(d.name);
+    out.push(d);
   }
   return out;
 }
+
+/* ---- end standing stones (additive) ---- */

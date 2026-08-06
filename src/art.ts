@@ -2972,6 +2972,310 @@ function ruinDrum(
 /*  end ruins (additive)                                                      */
 /* ========================================================================== */
 
+/* ========================================================================== */
+/*  standing stones (additive)                                                */
+/* ========================================================================== */
+
+/**
+ * Weathered grey uprights on the moor: a ring, a dolmen, or a row.
+ *
+ * Genesis-only and purely additive — the vale never asks for any of it.
+ *
+ * ── GROUND SPACE ──────────────────────────────────────────────────────────
+ * Everything below is laid out on the ground plane and projected the way a
+ * circle on an isometric tile grid projects: a ground vector of length `l` at
+ * bearing `a` lands at screen `(l·cos a, l·sin a / 2)`. That one line is why a
+ * ring of stones reads as a ring and not as a wheel seen face on, and it is the
+ * same 2:1 the tiles themselves are drawn at.
+ *
+ * ── WHY THEY READ AT ZOOM 1 ───────────────────────────────────────────────
+ * A ruin's trick is its ragged top edge. A standing stone's is its GAPS: the
+ * silhouette is sky between uprights, so the stones are held narrow, spaced
+ * wide, and kept a long way apart in value from the moor tint behind them. The
+ * moss goes on as accents — the base, the shaded flank — and never mixed
+ * through the body, for the same reason the ruins' does.
+ */
+
+/** Weathered grey, pulled a touch towards the moor it has been sitting on. */
+function stoneTones(): { l: string; r: string; cap: string } {
+  // Deliberately grey, not white. The valley's cream walls and its birch trunks
+  // are both very pale, and a near-white upright on open moor turns into one or
+  // the other at any zoom under three; a granite that is two steps down from
+  // `wall` is the only value in the palette that reads as neither.
+  return {
+    l: mix(PAL.stone, PAL.biome.moor, 0.1),
+    r: shade(mix(PAL.stoneDark, PAL.biome.moor, 0.16), -0.16),
+    cap: mix(PAL.stoneLight, PAL.stone, 0.5),
+  };
+}
+
+/** Filled isometric ellipse, half as tall as it is wide — the tile ratio. */
+function isoEllipse(ctx: Ctx, cx: number, cy: number, r: number, color: string): void {
+  ctx.fillStyle = color;
+  const h = Math.max(1, Math.round(r / 2));
+  for (let i = -h; i <= h; i++) {
+    const k = Math.sqrt(Math.max(0, 1 - (i / h) ** 2));
+    const w = Math.round(r * k * 2);
+    if (w > 0) ctx.fillRect(Math.round(cx - w / 2), Math.round(cy + i), w, 1);
+  }
+}
+
+/** A ground point `l` along bearing `a` and `m` across it, in screen pixels. */
+function groundPt(l: number, m: number, a: number): Pt {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return [l * c - m * s, (l * s + m * c) / 2];
+}
+
+/**
+ * The ground a monument stands on: heather cropped back to turf, because
+ * whoever set the stones up cleared the ring and the moor has never quite got
+ * it back. This is the drawn half of the tree-free rule gen.ts enforces.
+ */
+function stoneGround(ctx: Ctx, R: number, rng: () => number): void {
+  isoEllipse(ctx, 0, 1, R + 9, PAL.shadowSoft);
+  isoEllipse(ctx, 0, 0, R + 6, mix(PAL.biome.moor, PAL.moss, 0.3));
+  isoEllipse(ctx, 0, 0, R + 1, shade(mix(PAL.biome.moor, PAL.moss, 0.16), -0.04));
+  // A few tufts of heather that got away with it, round the rim.
+  for (let i = 0; i < 7; i++) {
+    const a = rng() * Math.PI * 2;
+    const rad = R * (0.72 + rng() * 0.34);
+    const x = Math.round(Math.cos(a) * rad);
+    const y = Math.round((Math.sin(a) * rad) / 2);
+    rect(ctx, x, y - 1, 1 + Math.floor(rng() * 2), 1, PAL.leafDark);
+  }
+}
+
+/** Moss up the shaded flank and lichen on the weather side of one stone. */
+function stoneWeather(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  rng: () => number
+): void {
+  const lichen = mix(PAL.chalk, PAL.moss, 0.35);
+  for (let i = 0; i < 3; i++) {
+    const yy = Math.round(y - rng() * h * 0.85);
+    rect(ctx, Math.round(x - w / 2), yy, 1 + Math.floor(rng() * 2), 1, PAL.moss);
+  }
+  for (let i = 0; i < 2; i++) {
+    const yy = Math.round(y - h * (0.35 + rng() * 0.5));
+    rect(ctx, Math.round(x + rng() * w * 0.3), yy, 1 + Math.floor(rng() * 2), 1, lichen);
+  }
+  // and the moss that always creeps up out of the turf at the foot
+  rect(ctx, Math.round(x - w / 2), Math.round(y) - 1, Math.max(2, Math.round(w)), 1, PAL.moss);
+}
+
+/**
+ * One upright: a slab, wider at the foot than at the head, leaning a little
+ * because nothing anybody stood on end stays quite on end for four thousand
+ * years. Drawn dark, then the lit flank laid over the left of it — the same
+ * two-value split that gives every building in the valley its silhouette.
+ */
+function upright(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  lean: number,
+  t: { l: string; r: string; cap: string },
+  rng: () => number
+): void {
+  const tw = w * (0.66 + rng() * 0.2); // head width
+  const bl = x - w / 2;
+  const br = x + w / 2;
+  const tl = x - tw / 2 + lean;
+  const tr = x + tw / 2 + lean;
+  const ty = y - h;
+
+  isoEllipse(ctx, x + lean * 0.4, y + 1, w * 1.35, PAL.shadowSoft);
+  poly(ctx, [[tl, ty], [tr, ty], [br, y], [bl, y]], t.r);
+  // the lit flank: the left five-ninths of the slab
+  const ml = x - w / 2 + w * 0.56;
+  const mt = x - tw / 2 + tw * 0.56 + lean;
+  poly(ctx, [[tl, ty], [mt, ty], [ml, y], [bl, y]], t.l);
+  // the head, which catches the sky
+  poly(ctx, [[tl, ty], [tr, ty], [tr - 0.5, ty + 1.6], [tl + 0.5, ty + 1.6]], t.cap);
+  // bedding planes — a couple of dark seams is what says "stone" at zoom 1
+  for (let i = 0; i < 2; i++) {
+    const f = 0.25 + rng() * 0.5;
+    const yy = Math.round(y - h * f);
+    const ww = w + (tw - w) * f;
+    rect(ctx, Math.round(x - ww / 2 + lean * f), yy, Math.max(2, Math.round(ww * 0.8)), 1, shade(t.r, -0.2));
+  }
+  stoneWeather(ctx, x, y, w, h, rng);
+}
+
+/**
+ * A slab lying flat on the ground, `l` long and `m` wide, at bearing `a`.
+ * Drawn twice — once dropped by its thickness in a dark tone, once on top in a
+ * light one — so the near edge keeps a lip and it reads as stone rather than as
+ * a stain in the grass. The fallen stone of a circle, and a dolmen's capstone.
+ */
+function slab(
+  ctx: Ctx,
+  cx: number,
+  cy: number,
+  l: number,
+  m: number,
+  a: number,
+  th: number,
+  t: { l: string; r: string; cap: string }
+): void {
+  const face = (dy: number, color: string) => {
+    const c: Pt[] = [
+      groundPt(-l / 2, -m / 2, a),
+      groundPt(l / 2, -m / 2, a),
+      groundPt(l / 2, m / 2, a),
+      groundPt(-l / 2, m / 2, a),
+    ];
+    poly(ctx, c.map((p) => [cx + p[0], cy + p[1] + dy] as Pt), color);
+  };
+  face(th, shade(t.r, -0.24));
+  face(0, t.l);
+  // a seam along the long axis, to keep a big flat face from going soapy
+  const s0 = groundPt(-l * 0.36, -m * 0.16, a);
+  const s1 = groundPt(l * 0.36, -m * 0.16, a);
+  poly(
+    ctx,
+    [
+      [cx + s0[0], cy + s0[1]],
+      [cx + s1[0], cy + s1[1]],
+      [cx + s1[0], cy + s1[1] + 1],
+      [cx + s0[0], cy + s0[1] + 1],
+    ],
+    shade(t.l, -0.16)
+  );
+}
+
+export interface StoneArt {
+  kind: 'circle' | 'dolmen' | 'row';
+  /** Ring diameter, or row length, in art px — a multiple of 4. */
+  w: number;
+  /** Uprights: 5..7 in a circle, 2 in a dolmen, 3..4 in a row. */
+  count: number;
+  /** Index of the one that came down, or -1. Circles only. */
+  fallen: number;
+  /** Which way the ring is turned, or the row is marching. Ground radians. */
+  rot: number;
+  seed: number;
+}
+
+/**
+ * Three monuments, three silhouettes:
+ *
+ *   circle   a wide ring of narrow uprights of uneven height, one of them flat
+ *            in the heather. Reads as a ring because of the gaps between them.
+ *   dolmen   two uprights close together carrying a capstone — the only one of
+ *            the three with a horizontal at the top, and by a long way the most
+ *            recognisable shape from across the valley.
+ *   row      three or four stones marching in a straight line, evenly spaced
+ *            and stepping down in height as they go, so the eye reads a
+ *            direction rather than a cluster.
+ */
+export function buildStones(spec: StoneArt): Sprite {
+  const W = Math.max(16, Math.round(spec.w / 4) * 4);
+  const R = W / 2;
+  const rng = mulberry32(spec.seed >>> 0);
+  const t = stoneTones();
+  const TOPH = Math.round(R / 2) + 42;
+  const CW = W + 30;
+  const CH = TOPH + Math.round(R / 2) + 16;
+
+  return makeSprite(CW, CH, CW / 2, TOPH, (ctx) => {
+    stoneGround(ctx, R, rng);
+
+    /** One upright's worth of layout: where it stands and how big it is. */
+    interface Up {
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      lean: number;
+      down: boolean;
+      a: number;
+    }
+    const ups: Up[] = [];
+
+    if (spec.kind === 'dolmen') {
+      // Two stones and a lid. They stand close, square to each other, and the
+      // capstone overhangs both — a doorway with nothing behind it.
+      const d = R * 0.52;
+      const h = 22 + Math.floor(rng() * 6);
+      for (let i = 0; i < 2; i++) {
+        const p = groundPt(i === 0 ? -d : d, 0, spec.rot);
+        ups.push({
+          x: p[0],
+          y: p[1],
+          w: 11 + rng() * 4,
+          h: h + (i === 0 ? 0 : -1 - Math.floor(rng() * 3)),
+          lean: (rng() - 0.5) * 1.4,
+          down: false,
+          a: spec.rot,
+        });
+      }
+    } else if (spec.kind === 'row') {
+      // Evenly spaced, stepping down as they march.
+      const h0 = 26 + Math.floor(rng() * 5);
+      for (let i = 0; i < spec.count; i++) {
+        const f = spec.count > 1 ? i / (spec.count - 1) - 0.5 : 0;
+        const p = groundPt(f * W, 0, spec.rot);
+        ups.push({
+          x: p[0],
+          y: p[1],
+          w: 10 + rng() * 4,
+          h: Math.round(h0 * (1 - i * 0.13)) + Math.floor(rng() * 3),
+          lean: (rng() - 0.5) * 2.4,
+          down: false,
+          a: spec.rot,
+        });
+      }
+    } else {
+      for (let i = 0; i < spec.count; i++) {
+        const a = spec.rot + (i / spec.count) * Math.PI * 2;
+        const p = groundPt(R, 0, a);
+        ups.push({
+          x: p[0],
+          y: p[1],
+          w: 9 + rng() * 4,
+          h: 18 + Math.floor(rng() * 12),
+          lean: (rng() - 0.5) * 2.6,
+          down: i === spec.fallen,
+          a,
+        });
+      }
+    }
+
+    // Back to front, then left to right — the order every other static in the
+    // valley is painted in, so a stone in front of another one is in front.
+    const order = ups.map((_, i) => i).sort((a, b) => ups[a].y - ups[b].y || ups[a].x - ups[b].x || a - b);
+    for (const i of order) {
+      const u = ups[i];
+      if (u.down) {
+        // Down, and pointing outward — a stone falls away from its neighbours.
+        slab(ctx, u.x, u.y, u.h, u.w * 1.5, u.a + Math.PI / 2, 2, t);
+        rect(ctx, Math.round(u.x - u.w), Math.round(u.y + 1), Math.round(u.w * 2), 1, PAL.moss);
+        continue;
+      }
+      upright(ctx, u.x, u.y, u.w, u.h, u.lean, t, rng);
+    }
+
+    if (spec.kind === 'dolmen') {
+      // The lid goes on last: it is above and in front of both uprights.
+      const top = Math.min(ups[0].y - ups[0].h, ups[1].y - ups[1].h) + 2;
+      const mid = (ups[0].x + ups[1].x) / 2;
+      slab(ctx, mid, top, R * 1.45, 12 + rng() * 4, spec.rot, 4, t);
+    }
+  });
+}
+
+/* ========================================================================== */
+/*  end standing stones (additive)                                            */
+/* ========================================================================== */
+
 /* ====================== market day, and the festival ====================== *
  * MARKET+FESTIVAL — additive block. Four sprite factories and one measurement,
  * used by Genesis for the rare market day and for the evening a valley earns by

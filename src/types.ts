@@ -376,6 +376,54 @@ export interface RuinSpec {
 
 /* ========================== end ruins (additive) ========================== */
 
+/* ======================= standing stones (additive) ======================= */
+
+/**
+ * What somebody dragged up onto the moor, and why the town down the hill is
+ * called what it is called.
+ *
+ *   circle   five to seven uprights in a ring, one of them down in the heather.
+ *   dolmen   two uprights carrying a capstone: a door with nothing behind it.
+ *   row      three or four stones marching, evenly spaced, all one way.
+ */
+export type StoneKind = 'circle' | 'dolmen' | 'row';
+
+/**
+ * A stone monument. TERRAIN, exactly as ruins and chests are: every field is a
+ * pure function of the seed and is byte-identical at 0.25x and at 4x, drawn
+ * from a derived substream (`mulberry32(seed ^ salt)`) that never touches
+ * gen.ts's main sequence.
+ *
+ * At most one to a valley, and only ever on a moor chunk — so a seed whose day
+ * has no open moor in it has no stones either. That is the scarcity that makes
+ * them worth walking to.
+ */
+export interface StoneSpec {
+  id: string; // "st0"
+  gx: number;
+  gy: number;
+  seed: number;
+  kind: StoneKind;
+  /** Uprights: 5..7 for a circle, 2 for a dolmen, 3..4 for a row. */
+  count: number;
+  /** Index of the one that came down, or -1 where none did. Circles only. */
+  fallen: number;
+  /** Ring diameter / row length in art px, a multiple of 4 — as `RuinSpec.w`. */
+  w: number;
+  /** Which way the ring is turned, or the row is marching. Ground radians. */
+  rot: number;
+  /** The ground it stands on. Always 'moor'. */
+  biome: Biome;
+  /** Ledger-ready name for the place: "the high moor". */
+  where: string;
+  /** Roster id of the town that took its name from the stones, if any. */
+  townId?: string;
+  /** That town's name, as the stones left it. */
+  townName?: string;
+}
+
+/* ===================== end standing stones (additive) ===================== */
+
 export interface GenesisMap {
   version: 1;
   seed: number;
@@ -411,6 +459,12 @@ export interface GenesisMap {
    * Optional so hand-written fixtures predating the feature still typecheck. */
   ruins?: RuinSpec[];
   /* ---- end ruins (additive) --------------------------------------------- */
+  /* ---- standing stones (additive) --------------------------------------- */
+  /** Nought or one stone monument, and only on a moor. Terrain: identical at
+   * every pace scale. Optional so hand-written fixtures predating the feature
+   * still typecheck; absent means the same as empty. */
+  stones?: StoneSpec[];
+  /* ---- end standing stones (additive) ----------------------------------- */
   valleyName: string;
 }
 
