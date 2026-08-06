@@ -515,6 +515,50 @@ export function waterBlob(ctx: Ctx, pts: Vec2[], color: string): void {
 }
 
 /**
+ * One lake, laid down in the six-strip family the ground bake uses: sand, dark
+ * sand, shallow, water, deep, and a darker heart — because a pond with a light
+ * middle reads as a puddle. Then foam where the water meets the sand and a
+ * couple of flat glints out on the surface, both seeded off the lake so they
+ * never crawl.
+ *
+ * Lifted out of `buildGenesisScene` verbatim so the catalog page can bake a
+ * lake of its own with exactly the renderer's own strips.
+ */
+export function bakeLake(ctx: Ctx, lk: LakeSpec): void {
+  const ring = (k: number) => lakeRing(lk, k);
+  waterBlob(ctx, ring(1.15), PAL.sand);
+  waterBlob(ctx, ring(1.07), shade(PAL.sand, -0.12));
+  waterBlob(ctx, ring(1.0), PAL.waterLight);
+  waterBlob(ctx, ring(0.93), PAL.water);
+  waterBlob(ctx, ring(0.76), PAL.waterDeep);
+  waterBlob(ctx, ring(0.44), shade(PAL.waterDeep, -0.16));
+  const lrng = mulberry32((lk.seed ^ 0x606f0a11) >>> 0);
+  const shore = ring(1.0);
+  for (let i = 0; i < shore.length; i++) {
+    const a = shore[i];
+    const b = shore[(i + 1) % shore.length];
+    const t = lrng();
+    const gx = a[0] + (b[0] - a[0]) * t;
+    const gy = a[1] + (b[1] - a[1]) * t;
+    rect(ctx, isoX(gx, gy) - 2, isoY(gx, gy), 3 + lrng() * 4, 1, PAL.waterFoam);
+  }
+  const glint = ring(0.6);
+  for (let i = 0; i < glint.length; i += 5) {
+    const [gx, gy] = glint[i];
+    rect(ctx, isoX(gx, gy) - 3, isoY(gx, gy), 4 + lrng() * 5, 1, shade(PAL.waterLight, 0.18));
+  }
+}
+
+/**
+ * The ground under an outcrop: bare rock showing through the biome tint, by
+ * `rocky` (0 at the edge of the influence, 1 at the heart of it). Exported so
+ * the catalog can show the tint on its own.
+ */
+export function outcropTint(col: string, rocky: number): string {
+  return mix(col, PAL.stoneDark, rocky * 0.62);
+}
+
+/**
  * One road, painted along a tile-space polyline: verge, edge, carriageway, a
  * paler centre for a highway, then loose stones seeded from `stoneSeed` so the
  * ruts do not crawl frame to frame. Exported so the catalog can draw a sample
@@ -653,7 +697,7 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
       const glade = gladeAt(gx, gy);
       if (glade > 0) col = mix(col, PAL.dirtPale, glade * 0.3);
       const rocky = rockAt(gx, gy);
-      if (rocky > 0) col = mix(col, PAL.stoneDark, rocky * 0.62);
+      if (rocky > 0) col = outcropTint(col, rocky);
 
       isoTile(ctx, sx, sy, col);
 
@@ -676,35 +720,7 @@ export function buildGenesisScene(map: GenesisMap, day: DayInfo = PLAIN_DAY): Ge
   /* ---- the lakes ------------------------------------------------------- */
   // Drawn BEFORE the river, so a river-fed lake reads as the water widening
   // out rather than as a pond laid on top of a channel that vanishes into it.
-  // Same five-strip family as the river below — sand, dark sand, shallow,
-  // water, deep — plus a darker heart, because a pond with a light middle
-  // reads as a puddle.
-  for (const lk of map.lakes ?? []) {
-    const ring = (k: number) => lakeRing(lk, k);
-    waterBlob(ctx, ring(1.15), PAL.sand);
-    waterBlob(ctx, ring(1.07), shade(PAL.sand, -0.12));
-    waterBlob(ctx, ring(1.0), PAL.waterLight);
-    waterBlob(ctx, ring(0.93), PAL.water);
-    waterBlob(ctx, ring(0.76), PAL.waterDeep);
-    waterBlob(ctx, ring(0.44), shade(PAL.waterDeep, -0.16));
-    // Foam where the water meets the sand, and a couple of flat glints out on
-    // the surface, both seeded off the lake so they never crawl.
-    const lrng = mulberry32((lk.seed ^ 0x606f0a11) >>> 0);
-    const shore = ring(1.0);
-    for (let i = 0; i < shore.length; i++) {
-      const a = shore[i];
-      const b = shore[(i + 1) % shore.length];
-      const t = lrng();
-      const gx = a[0] + (b[0] - a[0]) * t;
-      const gy = a[1] + (b[1] - a[1]) * t;
-      rect(ctx, isoX(gx, gy) - 2, isoY(gx, gy), 3 + lrng() * 4, 1, PAL.waterFoam);
-    }
-    const glint = ring(0.6);
-    for (let i = 0; i < glint.length; i += 5) {
-      const [gx, gy] = glint[i];
-      rect(ctx, isoX(gx, gy) - 3, isoY(gx, gy), 4 + lrng() * 5, 1, shade(PAL.waterLight, 0.18));
-    }
-  }
+  for (const lk of map.lakes ?? []) bakeLake(ctx, lk);
 
   /* ---- the river ------------------------------------------------------- */
   // Run both ends on past the map edge so the water leaves the frame instead of
@@ -3685,20 +3701,42 @@ function drawFireflies(
     const sx = (f.x - cx) * scale;
     const sy = (f.y - cy) * scale;
     if (sx < -4 || sx > dw + 4 || sy < -4 || sy > dh + 4) continue;
-    const s = Math.sin(f.ph * 1.6 + f.c);
-    const blink = s > 0 ? s * s * s : 0;
-    // Floored well above nothing, so a frozen tableau still reads as a marsh
-    // with fireflies over it rather than as an empty marsh.
-    ctx.globalAlpha = wl.vis * (0.2 + 0.8 * blink);
-    ctx.fillStyle = blink > 0.4 ? '#f6ffbe' : '#d3ee86';
-    ctx.fillRect(Math.round(sx), Math.round(sy), px, px);
-    if (blink > 0.45) {
-      // A hair of bloom on the bright half of the blink, so a firefly at the
-      // overview is a twinkle rather than a stuck pixel.
-      ctx.globalAlpha = wl.vis * 0.34 * blink;
-      ctx.fillRect(Math.round(sx) - px, Math.round(sy), px * 3, px);
-      ctx.fillRect(Math.round(sx), Math.round(sy) - px, px, px * 3);
-    }
+    drawFirefly(ctx, sx, sy, fireflyBlink(f.ph, f.c), wl.vis, px);
   }
   ctx.restore();
+}
+
+/**
+ * Where a firefly is in its blink, 0..1. Cubed, so the dark half of the cycle
+ * is long and the bright half is a flash rather than a fade.
+ */
+export function fireflyBlink(ph: number, c: number): number {
+  const s = Math.sin(ph * 1.6 + c);
+  return s > 0 ? s * s * s : 0;
+}
+
+/**
+ * One firefly, in device pixels, on a context already in `lighter`. Exported
+ * for the catalog page, which has one marsh and no world behind it.
+ */
+export function drawFirefly(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  blink: number,
+  vis: number,
+  px = 1
+): void {
+  // Floored well above nothing, so a frozen tableau still reads as a marsh
+  // with fireflies over it rather than as an empty marsh.
+  ctx.globalAlpha = vis * (0.2 + 0.8 * blink);
+  ctx.fillStyle = blink > 0.4 ? '#f6ffbe' : '#d3ee86';
+  ctx.fillRect(Math.round(x), Math.round(y), px, px);
+  if (blink > 0.45) {
+    // A hair of bloom on the bright half of the blink, so a firefly at the
+    // overview is a twinkle rather than a stuck pixel.
+    ctx.globalAlpha = vis * 0.34 * blink;
+    ctx.fillRect(Math.round(x) - px, Math.round(y), px * 3, px);
+    ctx.fillRect(Math.round(x), Math.round(y) - px, px, px * 3);
+  }
 }

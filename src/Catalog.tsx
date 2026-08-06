@@ -14,7 +14,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   PAL,
+  buildBird,
   buildCrane,
+  buildDeer,
+  buildDog,
+  buildGrazingSheep,
   buildNameBoard,
   buildSignpost,
   buildStake,
@@ -24,22 +28,37 @@ import {
   drawBot,
   drawCart,
   drawCraneLoad,
+  drawFishJump,
+  drawRipple,
   drawWheel,
   isoTile,
   shade,
   type BotAction,
+  type BuildMaterial,
   type Ctx,
   type Sprite,
 } from '../vale/art';
-import { drawBridge, makePools, paintRoad } from './scene';
+import {
+  bakeLake,
+  drawBridge,
+  drawFirefly,
+  fireflyBlink,
+  makePools,
+  outcropTint,
+  paintRoad,
+  skyAt,
+} from './scene';
 import {
   ACCENTS,
   COMMON_ROLES,
   FLAVOUR_PROPS,
   LANDMARK_ROLES,
+  QUARRY_REACH,
   THATCH_ROLES,
   WOOD_CHARACTER_NAMES,
+  sampleLake,
 } from './gen';
+import { PLAIN_DAY, type DayInfo, type Season } from './daytype';
 import type { Biome, RoofStyle, StructureRole, TreeKind, Vec2 } from './types';
 
 /* ------------------------------ enumerations ----------------------------- */
@@ -66,6 +85,12 @@ const GENERIC_ROLES = new Set<StructureRole>([
 ]);
 /** Roles whose only distinction is the timber wall treatment. */
 const WOODY_ONLY = new Set<StructureRole>(['shed']);
+/**
+ * Roles no roster can draw. A gildhall is only ever raised on a charter dug out
+ * of a buried chest, which is why it is allowed a silhouette — gilt ridge, gilt
+ * eaves, a ridge lamp and a plaque — that no ordinary plot can have.
+ */
+const CHEST_ONLY = new Set<StructureRole>(['gildhall']);
 
 const TREE_KINDS: TreeKind[] = ['oak', 'pine', 'blossom', 'hedgerow', 'birch', 'willow', 'fir'];
 const TREE_INDEX: Record<TreeKind, 0 | 1 | 2 | 3 | 4 | 5 | 6> = {
@@ -79,10 +104,16 @@ const PROP_POOLS = [
   'bush', 'rock', 'flowers', 'reeds', 'stump', 'crop', 'haystack', 'fenceL',
   'fenceR', 'shed', 'cart', 'crates', 'lumber', 'barrels', 'well', 'lamp',
   'sheep', 'campfire',
-  // Buried treasure. Never a PropSpec — chests are their own list on the map —
-  // but pooled all the same, so they belong on this shelf.
-  'chest-buried', 'chest-closed', 'chest-open',
+  // The stone yard of a quarry town: dressed blocks waiting to go up.
+  'quarry-blocks',
 ];
+
+/**
+ * Buried treasure. Never a PropSpec — chests are their own list on the map, and
+ * nothing resolves them by kind — but pooled all the same, so they belong on
+ * this shelf. The timeline walks a chest along them: mound → dug open → open.
+ */
+const TREASURE_POOLS = ['chest-buried', 'chest-closed', 'chest-open'];
 
 /** Kinds not in the pools — built on demand by `propSprite()` in scene.ts. */
 const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane'];
@@ -92,21 +123,21 @@ const EXTRA_PROPS = ['nameboard', 'signpost', 'stake', 'crane'];
  *  - wild scatter  SCATTER_KINDS (gen.ts, "wild scatter"): bush, rock, stump,
  *    flowers, sheep, reeds — plus fenceL/fenceR from the field-fence pass.
  *  - site essentials (gen.ts, site dressing): well, nameboard, lamp, signpost,
- *    campfire, lumber.
+ *    campfire, lumber — plus quarry-blocks and crane in the stone yard of any
+ *    town that came up within QUARRY_REACH of an outcrop.
  *  - flavour tail: FLAVOUR_PROPS = crop, haystack, crates, barrels, cart, shed.
- * `crane` is never a PropSpec: scene.ts conjures one in the yard of any
- * landmark-sized plot still going up. `stake` has a builder and a propSprite
- * case but no generator ever asks for it.
+ * `stake` has a builder and a propSprite case but no generator ever asks for it.
  */
 const GENERATED = new Set<string>([
   'bush', 'rock', 'stump', 'flowers', 'sheep', 'reeds', 'fenceL', 'fenceR',
   'well', 'nameboard', 'lamp', 'signpost', 'campfire', 'lumber',
+  // The stone yard, emitted with the essentials so it survives every pace.
+  'quarry-blocks', 'crane',
   // The three states of a buried chest. gen.ts emits 0..2 ChestSpecs a day and
   // the timeline moves them between these sprites.
-  'chest-buried', 'chest-closed', 'chest-open',
+  ...TREASURE_POOLS,
   ...FLAVOUR_PROPS,
 ]);
-const SCENE_ONLY = new Set<string>(['crane']);
 
 const ACCENT = '#63c9a8';
 
@@ -291,7 +322,8 @@ function structure(
   progress: number,
   lit: boolean,
   seed: number,
-  roof?: RoofStyle
+  roof?: RoofStyle,
+  material?: BuildMaterial
 ): HTMLCanvasElement {
   const sp = buildStructure({
     role,
@@ -301,6 +333,7 @@ function structure(
     roof: roof ?? spec.roof,
     progress,
     condition: 1,
+    material,
     chimney: spec.chimney,
     cupola: spec.cupola,
     awning: spec.awning,
@@ -380,6 +413,149 @@ function biomeCanvas(b: Biome): HTMLCanvasElement {
       }
     }
   });
+}
+
+/* -------------------------------- terrain --------------------------------- */
+
+/**
+ * A lake of its own, on a field of meadow: `sampleLake()` builds a real
+ * LakeSpec out of the generator's shape machinery and `bakeLake()` lays down
+ * exactly the six strips the ground bake lays down, foam and glints included.
+ */
+function lakeCanvas(seed: number): HTMLCanvasElement {
+  return bake(168, 112, 84, 56, (ctx) => {
+    const jitter = [0.0, -0.035, 0.04, -0.015];
+    for (let v = -7; v <= 7; v++) {
+      for (let u = -5; u <= 5; u++) {
+        if ((u + v) & 1) continue;
+        const h = (Math.imul(u | 0, 374761393) ^ Math.imul(v | 0, 668265263)) >>> 0;
+        isoTile(ctx, u * 16, v * 8, shade(PAL.biome.meadow, jitter[h % 4]));
+      }
+    }
+    bakeLake(ctx, sampleLake(seed, 2.4, 1.8));
+  });
+}
+
+/**
+ * The ground under an outcrop at one strength of `rocky`: the biome tint pulled
+ * towards bare stone by `outcropTint()`, which is the only thing that tells a
+ * quarry apart from a suspiciously tidy pile of stones on a lawn.
+ */
+function outcropCanvas(rocky: number): HTMLCanvasElement {
+  return bake(100, 52, 50, 26, (ctx) => {
+    const jitter = [0.0, -0.035, 0.04, -0.015];
+    let i = 0;
+    for (let gy = -1; gy <= 1; gy++) {
+      for (let gx = -1; gx <= 1; gx++) {
+        const base = shade(PAL.biome.moor, jitter[i++ % 4]);
+        isoTile(ctx, (gx - gy) * 16, (gx + gy) * 8, outcropTint(base, rocky));
+      }
+    }
+  });
+}
+
+const SEASONS: Season[] = ['winter', 'spring', 'summer', 'autumn'];
+
+/* ---------------------------------- sky ----------------------------------- */
+
+/** The three day types that bend the light itself, plus an ordinary day. */
+const SKY_DAYS: { key: string; label: string; note: string; day: DayInfo; mark?: [number, number] }[] = [
+  { key: 'normal', label: 'normal', note: 'midnight → midnight', day: PLAIN_DAY },
+  {
+    key: 'eclipse',
+    label: 'eclipse',
+    note: '13:27 → 14:12 · night crosses its threshold, so lamps light at two in the afternoon',
+    day: { type: 'eclipse', season: 'summer', from: 13.45, to: 14.2 },
+    mark: [13.45, 14.2],
+  },
+  {
+    key: 'storm',
+    label: 'storm',
+    note: '14:00 → 15:45 · deliberately stops short of the lamp threshold — a wet afternoon is dim, not dark',
+    day: { type: 'storm', season: 'summer', from: 14, to: 15.75 },
+    mark: [14, 15.75],
+  },
+];
+
+const SKY_W = 480;
+const SKY_H = 34;
+
+/**
+ * `skyAt()` across a whole day, applied the way `renderGenesis` applies it: a
+ * multiply fill at `a` over the valley's own green, then the horizon wash at
+ * `lift`. One pixel column per two and a half minutes.
+ */
+function skyStrip(day: DayInfo, from = 0, to = 24): HTMLCanvasElement {
+  const c = document.createElement('canvas');
+  c.width = SKY_W;
+  c.height = SKY_H;
+  const g = c.getContext('2d')!;
+  for (let x = 0; x < SKY_W; x++) {
+    const t = from + ((x + 0.5) / SKY_W) * (to - from);
+    const sky = skyAt(t, day);
+    g.fillStyle = PAL.biome.meadow;
+    g.fillRect(x, 0, 1, SKY_H);
+    if (sky.a > 0.002) {
+      g.save();
+      g.globalCompositeOperation = 'multiply';
+      g.globalAlpha = sky.a;
+      g.fillStyle = sky.css;
+      g.fillRect(x, 0, 1, SKY_H);
+      g.restore();
+    }
+    if (sky.lift > 0.004) {
+      const grad = g.createLinearGradient(0, 0, 0, SKY_H);
+      const cool = t < 12;
+      grad.addColorStop(0, cool ? 'rgba(126,158,214,1)' : 'rgba(255,180,99,1)');
+      grad.addColorStop(1, cool ? 'rgba(126,158,214,0)' : 'rgba(255,180,99,0)');
+      g.save();
+      g.globalCompositeOperation = 'lighter';
+      g.globalAlpha = sky.lift;
+      g.fillStyle = grad;
+      g.fillRect(x, 0, 1, SKY_H);
+      g.restore();
+    }
+    // A hairline along the bottom wherever the lamps are earning their keep.
+    if (sky.lamps > 0.02) {
+      g.globalAlpha = Math.min(1, sky.lamps);
+      g.fillStyle = '#f0c75e';
+      g.fillRect(x, SKY_H - 2, 1, 2);
+      g.globalAlpha = 1;
+    }
+  }
+  return c;
+}
+
+/** Decimal hours as a clock reading: 13.45 → 13:27. */
+function hhmm(h: number): string {
+  const m = Math.round((h % 1) * 60);
+  return `${Math.floor(h)}:${String(m).padStart(2, '0')}`;
+}
+
+function SkyStrip({ day, from, to, hours }: { day: DayInfo; from?: number; to?: number; hours: number[] }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const c = skyStrip(day, from ?? 0, to ?? 24);
+    el.width = c.width;
+    el.height = c.height;
+    el.getContext('2d')!.drawImage(c, 0, 0);
+  }, [day, from, to]);
+  const a = from ?? 0;
+  const b = to ?? 24;
+  return (
+    <div className="sky">
+      <canvas ref={ref} />
+      <div className="ticks">
+        {hours.map((h) => (
+          <span key={h} style={{ left: `${((h - a) / (b - a)) * 100}%` }}>
+            {h % 1 === 0 ? `${h}` : hhmm(h)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 /* -------------------------------- animated -------------------------------- */
@@ -472,14 +648,19 @@ function Inhabitants({ anims }: { anims: Anim[] }) {
 
 const COVERAGE: { head: string; body: string }[] = [
   {
-    head: '7 of 15 roles share the plain-house art',
+    head: '7 of 16 roles share the plain-house art',
     body:
-      'cottage, house, hall, workshop, store, chapel and homestead all fall through to the same box; only size, roof and the spec flags (chimney / awning / banner / cupola) tell them apart. shed differs from a house by timber walls alone. Distinct furniture exists for tower, granary, mill, smithy, bakery, brewhouse — and barn (plank seams, wide door).',
+      'cottage, house, hall, workshop, store, chapel and homestead all fall through to the same box; only size, roof and the spec flags (chimney / awning / banner / cupola) tell them apart. shed differs from a house by timber walls alone. Distinct furniture exists for tower, granary, mill, smithy, bakery, brewhouse, gildhall — and barn (plank seams, wide door).',
   },
   {
     head: 'homestead is the founding house and looks like any other house',
     body:
-      'It is the one building the day opens on and the one every visitor sees first. Worth a porch, a woodpile or a washing line of its own.',
+      'It is the one building the day opens on and the one every visitor sees first. Worth a porch, a woodpile or a washing line of its own — and a quarry town has no stone-specific homestead either, so the first house of a stone valley is the same box in masonry.',
+  },
+  {
+    head: 'Stone stops at the walls',
+    body:
+      'material: "stone" reaches coursed walls, quoins, lintels and a slate roof, and nothing else. A quarry town’s well, lamps, fences and signpost are the same timber-and-render props a meadow town puts up, and there is no drystone wall or stone bridge anywhere in the set.',
   },
   {
     head: 'The flat roof is drawable and never generated',
@@ -502,14 +683,19 @@ const COVERAGE: { head: string; body: string }[] = [
       'structFor() in scene.ts always passes condition: 1, so the weathering mix (greyed walls, faded roof) never shows. A frontier holding that has stood since dawn could weather a little.',
   },
   {
-    head: 'Only one animal, and it never moves',
+    head: 'Nothing uses the water',
     body:
-      'buildSheep is the whole fauna: no birds, no dogs, no horse on the highway. Sheep are static scatter — a flock that drifted a pixel or two would carry the meadow.',
+      'Lakes and river carry fish, ripples and foam, and not one thing anybody built: no boat, no jetty, no moored punt, no ford besides the bridge. A lake is scenery a town happens to stand next to rather than something it works.',
   },
   {
-    head: 'No water life and no weather',
+    head: 'The wildlife is four animals and no predators',
     body:
-      'The river gets foam flecks and nothing else — no boat, no jetty, no ford crossing besides the bridge. Nothing in the catalog reacts to rain, wind or season.',
+      'deer, dog, grazing sheep, bird — plus fireflies and a fish. No horse on the highway, no cattle in the farm biome, nothing that hunts and nothing anyone owns. Birds also never perch: they fly a line and fade.',
+  },
+  {
+    head: 'The season repaints leaves and grass, and stops there',
+    body:
+      'seasonCanvas runs over the six DECIDUOUS pools and the ground tint. crop, haystack, reeds and flowers are summer art in every month, so a winter valley still has a green cornfield in it.',
   },
   {
     head: 'Trees have two states and a nudge',
@@ -539,13 +725,58 @@ export default function Catalog() {
           structure(role, SPECIMEN[role], ACCENTS[i % ACCENTS.length], 1, night, 1000 + i * 97),
           {
             sub: `w${SPECIMEN[role].w} · ${SPECIMEN[role].floors}f · ${SPECIMEN[role].roof}`,
-            tag: GENERIC_ROLES.has(role) ? 'generic' : WOODY_ONLY.has(role) ? 'walls only' : undefined,
+            tag: GENERIC_ROLES.has(role)
+              ? 'generic'
+              : CHEST_ONLY.has(role)
+                ? 'chest-granted only'
+                : WOODY_ONLY.has(role)
+                  ? 'walls only'
+                  : undefined,
             tagKind: GENERIC_ROLES.has(role) ? 'generic' : 'info',
           }
         )
       ),
     [night]
   );
+
+  /**
+   * One role, both ways up. Everything a quarry town's walls do — courses,
+   * staggered joints, quoins at the corner, dressed lintels over the openings —
+   * plus what the roof does about it, which is turn slate.
+   */
+  const materials = useMemo(() => {
+    const out: Item[] = [];
+    out.push(
+      item('mt-house-timber', 'house · timber', structure('house', SPECIMEN.house, '#6cc4d9', 1, night, 3111, 'gable', 'timber'), {
+        sub: 'render + frame, accent roof',
+      })
+    );
+    out.push(
+      item('mt-house-stone', 'house · stone', structure('house', SPECIMEN.house, '#6cc4d9', 1, night, 3111, 'gable', 'stone'), {
+        sub: 'courses, quoins, lintels, slate',
+        tag: 'quarry town',
+        tagKind: 'info',
+      })
+    );
+    out.push(
+      item('mt-cottage-timber', 'cottage · timber', structure('cottage', SPECIMEN.cottage, '#f0c75e', 1, night, 3222, 'thatch', 'timber'), {
+        sub: 'a THATCH_ROLE, thatched',
+      })
+    );
+    out.push(
+      item('mt-cottage-stone', 'cottage · stone', structure('cottage', SPECIMEN.cottage, '#f0c75e', 1, night, 3222, 'hip', 'stone'), {
+        sub: 'the same roll, roofed in slate',
+        tag: 'thatch unreachable',
+        tagKind: 'unused',
+      })
+    );
+    out.push(
+      item('mt-stone-build', 'stone · mid-build', structure('hall', SPECIMEN.hall, '#9b8fe8', 0.55, night, 3333, 'gable', 'stone'), {
+        sub: 'progress 0.55 — masonry inside the scaffold',
+      })
+    );
+    return out;
+  }, [night]);
 
   const stages = useMemo(() => {
     const spec = SPECIMEN.house;
@@ -606,13 +837,13 @@ export default function Catalog() {
     return out;
   }, []);
 
-  const props = useMemo(() => {
+  const poolItems = (kinds: string[], prefix: string): Item[] => {
     const out: Item[] = [];
-    for (const kind of PROP_POOLS) {
+    for (const kind of kinds) {
       const p = pools[kind] ?? [];
       p.forEach((sp, i) =>
         out.push(
-          item(`pp-${kind}-${i}`, kind, spriteCanvas(sp), {
+          item(`${prefix}-${kind}-${i}`, kind, spriteCanvas(sp), {
             sub: p.length > 1 ? `${i + 1}/${p.length}` : undefined,
             tag: GENERATED.has(kind) ? undefined : 'unused',
             tagKind: 'unused',
@@ -621,7 +852,10 @@ export default function Catalog() {
       );
     }
     return out;
-  }, [pools]);
+  };
+
+  const props = useMemo(() => poolItems(PROP_POOLS, 'pp'), [pools]);
+  const treasure = useMemo(() => poolItems(TREASURE_POOLS, 'tz'), [pools]);
 
   const extras = useMemo(() => {
     const out: Item[] = [];
@@ -638,7 +872,8 @@ export default function Catalog() {
     }
     out.push(
       item('ex-crane', 'crane', spriteCanvas(buildCrane('#f0c75e')), {
-        tag: SCENE_ONLY.has('crane') ? 'scene-only' : undefined,
+        sub: 'quarry yard + landmark builds',
+        tag: 'generated',
         tagKind: 'info',
       })
     );
@@ -729,6 +964,144 @@ export default function Catalog() {
     return list;
   }, []);
 
+  /**
+   * The fauna. Everything below is the same builder the wildlife pass calls;
+   * only the clock is this page's, so a bird flaps at ~3Hz instead of at
+   * whatever its own phase is doing over the wood.
+   */
+  const wildlife = useMemo<Anim[]>(() => {
+    const list: Anim[] = [];
+    const birds = [buildBird(0), buildBird(1)];
+    list.push({
+      key: 'wl-bird',
+      label: 'bird · flap',
+      sub: 'buildBird(0|1)',
+      w: 16,
+      h: 16,
+      ox: 8,
+      oy: 8,
+      draw: (ctx, t) => {
+        const sp = birds[Math.floor(t * 6) % 2];
+        ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+      },
+    });
+    const poses: [0 | 1 | 2, string][] = [
+      [0, 'alert'],
+      [1, 'grazing'],
+      [2, 'bolting'],
+    ];
+    for (const [pose, name] of poses) {
+      const sp = buildDeer(pose, true, pose === 0 ? 7 : 9);
+      list.push({
+        key: `wl-deer-${pose}`,
+        label: `deer · ${name}`,
+        sub: `pose ${pose}${pose === 0 ? ' · antlered' : ''}`,
+        w: 26,
+        h: 24,
+        ox: 11,
+        oy: 20,
+        draw: (ctx) => ctx.drawImage(sp.c, -sp.ox, -sp.oy),
+      });
+    }
+    const deerL = buildDeer(0, false, 7);
+    list.push({
+      key: 'wl-deer-left',
+      label: 'deer · facing left',
+      sub: 'faceRight = false',
+      w: 26,
+      h: 24,
+      ox: 15,
+      oy: 20,
+      draw: (ctx) => ctx.drawImage(deerL.c, -deerL.ox, -deerL.oy),
+    });
+    const dogs = [buildDog(0, true), buildDog(1, true)];
+    list.push({
+      key: 'wl-dog',
+      label: 'dog · trot',
+      sub: 'buildDog(0|1)',
+      w: 18,
+      h: 18,
+      ox: 8,
+      oy: 14,
+      draw: (ctx, t) => {
+        const sp = dogs[Math.floor(t * 4) % 2];
+        ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+      },
+    });
+    const sheep = [buildGrazingSheep(103, true, false), buildGrazingSheep(103, true, true)];
+    list.push({
+      key: 'wl-sheep',
+      label: 'sheep · head up / down',
+      sub: 'buildGrazingSheep',
+      w: 22,
+      h: 20,
+      ox: 10,
+      oy: 15,
+      draw: (ctx, t) => {
+        const sp = sheep[Math.floor(t / 1.6) % 2];
+        ctx.drawImage(sp.c, -sp.ox, -sp.oy);
+      },
+    });
+    // The arc `stepFish` integrates: launched at -34px/s under 96px/s², so it
+    // is up for about seven tenths of a second and leaves a ring where it lands.
+    const V0 = -34;
+    const G = 96;
+    const AIR = (-2 * V0) / G;
+    // The ring outlives the jump by twice over, so the loop runs to the end of
+    // the ring and straight back into the next fish — no dead frame in a cell
+    // that only exists to show the pair.
+    const LOOP = AIR + 1.5;
+    list.push({
+      key: 'wl-fish',
+      label: 'fish · jump + ring',
+      sub: 'drawFishJump / drawRipple',
+      w: 40,
+      h: 26,
+      ox: 13,
+      oy: 17,
+      draw: (ctx, t) => {
+        const p = t % LOOP;
+        if (p < AIR) {
+          const vy = V0 + G * p;
+          drawFishJump(ctx, p * 12, V0 * p + 0.5 * G * p * p, vy);
+        } else {
+          const age = p - AIR;
+          drawRipple(ctx, AIR * 12, 0, 1.5 + age * 6, Math.max(0, 1 - age / 1.5) * 0.75);
+        }
+      },
+    });
+    // Fireflies get their own night: they are drawn after the sky multiply in
+    // the world precisely so nothing can dim them, and a firefly on a daylit
+    // swatch is a grey pixel.
+    const FLIES = [
+      [10, 12, 0],
+      [24, 20, 1.9],
+      [38, 9, 3.4],
+      [30, 30, 5.1],
+      [16, 27, 2.6],
+      [45, 24, 0.8],
+    ];
+    list.push({
+      key: 'wl-firefly',
+      label: 'firefly · blink',
+      sub: 'drawFirefly, over the sky fill',
+      w: 56,
+      h: 40,
+      ox: 0,
+      oy: 0,
+      draw: (ctx, t) => {
+        ctx.fillStyle = '#1b2430';
+        ctx.fillRect(0, 0, 56, 40);
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for (const [x, y, c] of FLIES) drawFirefly(ctx, x, y, fireflyBlink(t * 3, c), 1, 1);
+        ctx.restore();
+        ctx.globalAlpha = 1;
+      },
+    });
+    return list;
+  }, []);
+
   const bridges = useMemo(
     () =>
       ([1, 2, 3] as const).map((s) =>
@@ -749,6 +1122,41 @@ export default function Catalog() {
     []
   );
 
+  const lakes = useMemo(
+    () =>
+      [4211, 9137].map((s, i) =>
+        item(`lk-${s}`, `lake ${i + 1}`, lakeCanvas(s), {
+          sub: 'sand · dark sand · shallow · water · deep · heart',
+        })
+      ),
+    []
+  );
+
+  const outcrops = useMemo(
+    () =>
+      [0, 0.5, 1].map((k) =>
+        item(`oc-${k}`, 'outcrop tint', outcropCanvas(k), {
+          sub: k === 0 ? 'rocky 0 — plain moor' : `rocky ${k.toFixed(1)}`,
+        })
+      ),
+    []
+  );
+
+  /**
+   * One oak, four times over. `makePools(season)` repaints the six deciduous
+   * pools at bake, on the finished pixels, so this is literally the sprite the
+   * world would draw that month.
+   */
+  const seasons = useMemo(
+    () =>
+      SEASONS.map((s) =>
+        item(`sn-${s}`, s, spriteCanvas(makePools(s).oak[0]), {
+          sub: s === 'summer' ? 'as drawn' : 'seasonCanvas',
+        })
+      ),
+    []
+  );
+
   const commonCounts = useMemo(() => {
     const m = new Map<StructureRole, number>();
     for (const r of COMMON_ROLES) m.set(r, (m.get(r) ?? 0) + 1);
@@ -756,12 +1164,14 @@ export default function Catalog() {
   }, []);
 
   const counts = {
-    structures: structures.length + stages.length + roofs.length,
+    structures: structures.length + materials.length + stages.length + roofs.length,
     trees: trees.length + treeStates.length,
-    props: props.length + extras.length,
+    props: props.length + treasure.length + extras.length,
     inhabitants: anims.length,
+    wildlife: wildlife.length,
     infra: bridges.length + roads.length + grounds.length,
-    palette: ACCENTS.length,
+    terrain: lakes.length + outcrops.length + seasons.length,
+    palette: ACCENTS.length + SKY_DAYS.length,
   };
 
   return (
@@ -786,7 +1196,9 @@ export default function Catalog() {
         <a href="#trees">Trees <b>{counts.trees}</b></a>
         <a href="#props">Props <b>{counts.props}</b></a>
         <a href="#inhabitants">Inhabitants <b>{counts.inhabitants}</b></a>
+        <a href="#wildlife">Wildlife <b>{counts.wildlife}</b></a>
         <a href="#infrastructure">Infrastructure <b>{counts.infra}</b></a>
+        <a href="#terrain">Terrain <b>{counts.terrain}</b></a>
         <a href="#palette">Palette <b>{counts.palette}</b></a>
         <a href="#coverage">Coverage <b>{COVERAGE.length}</b></a>
       </nav>
@@ -796,12 +1208,17 @@ export default function Catalog() {
           id="structures"
           title="Structures"
           count={counts.structures}
-          blurb="buildStructure(spec) — one specimen per StructureRole, then the universal progress ladder and the roof styles. A “generic” tag means the role has no special-case art of its own."
+          blurb="buildStructure(spec) — one specimen per StructureRole, then the two materials, the universal progress ladder and the roof styles. A “generic” tag means the role has no special-case art of its own."
         >
           <Row
             title={`Roles (${ROLES.length})`}
-            note={`${GENERIC_ROLES.size} of ${ROLES.length} draw the plain house.`}
+            note={`${GENERIC_ROLES.size} of ${ROLES.length} draw the plain house. A gildhall is never drawn from the common or landmark bags — it takes a charter out of a buried chest.`}
             items={structures}
+          />
+          <Row
+            title="Materials"
+            note={`spec.material — absent is 'timber'. Every plot of a town that came up within QUARRY_REACH (${QUARRY_REACH} u/v units) of an outcrop is 'stone': coursed walls with staggered joints, quoins alternating at the corner, dressed lintels over the openings, and a roof of slate mixed from the town's own accent. gen.ts short-circuits the thatch roll on stone, so no combination of seeds produces a thatched masonry cottage.`}
+            items={materials}
           />
           <Row title="Progress stages" note="Shared by every role — shown on a house." items={stages} />
           <Row title="Roof styles" items={roofs} />
@@ -828,6 +1245,11 @@ export default function Catalog() {
           blurb="Every pooled kind from makePools(), all pool variants, plus the four built on demand by propSprite(). “unused” means gen.ts never emits it."
         >
           <Row title={`Pools (${PROP_POOLS.length} kinds)`} items={props} />
+          <Row
+            title={`Treasure (${TREASURE_POOLS.length} states)`}
+            note="Pooled, but never a PropSpec: chests are their own list on the map. The timeline walks a found chest along all three — mound, prised open, emptied."
+            items={treasure}
+          />
           <Row title={`Seeded extras (${EXTRA_PROPS.length})`} items={extras} />
         </Section>
 
@@ -841,6 +1263,15 @@ export default function Catalog() {
         </Section>
 
         <Section
+          id="wildlife"
+          title="Wildlife"
+          count={counts.wildlife}
+          blurb="Everything alive that nobody built. Deer work the treeline at either end of the day, the flock drifts and grazes, a dog trots the green, birds cross the wood, a fish clears the river and leaves a ring, and the fireflies come up over the marsh after dark. Same ~8fps clock as the inhabitants above."
+        >
+          <Inhabitants anims={wildlife} />
+        </Section>
+
+        <Section
           id="infrastructure"
           title="Infrastructure"
           count={counts.infra}
@@ -851,13 +1282,64 @@ export default function Catalog() {
           <Row title="Biome ground" items={grounds} />
         </Section>
 
+        <Section
+          id="terrain"
+          title="Terrain"
+          count={counts.terrain}
+          blurb="The parts of the ground bake that are not a flat tint: standing water, bare rock showing through, and what the month does to the leaves."
+        >
+          <Row
+            title="Lakes"
+            note="sampleLake() off the generator's own shape machinery, laid down by the renderer's bakeLake(): six blobs on one stored outline scaled about its centre, then foam on the shore and a couple of flat glints, both seeded off the lake so they never crawl."
+            items={lakes}
+          />
+          <Row
+            title="Outcrop ground"
+            note="outcropTint() — the biome tint pulled towards bare stone under every outcrop, so a quarry reads as exposed rock rather than as a tidy pile of stones on a lawn."
+            items={outcrops}
+          />
+          <Row
+            title="Seasons"
+            note="makePools(season) repaints the six deciduous pools once, at bake, on the finished pixels. Conifers keep their needles; the ground has its own shift, and the woodland beyond the map only half turns."
+            items={seasons}
+          />
+        </Section>
+
         <section id="palette">
           <h2>
-            Palette & tables<span className="count">{ACCENTS.length}</span>
+            Palette & tables<span className="count">{counts.palette}</span>
           </h2>
           <p className="blurb">
-            The gem accents a site can wear, and the tables gen.ts draws roles and woodland from.
+            The gem accents a site can wear, the light across a day, and the tables gen.ts draws
+            roles and woodland from.
           </p>
+          <div className="row">
+            <h3>Sky ({SKY_DAYS.length})</h3>
+            <p className="note">
+              skyAt(t, day) applied the way renderGenesis applies it — a multiply fill at{' '}
+              <code>a</code> over the valley's green, then the horizon wash at <code>lift</code>.
+              The gold hairline along the bottom is <code>lamps</code>: where it shows, windows are
+              lit and lamps have their halos.
+            </p>
+            {SKY_DAYS.map((d) => (
+              <div className="skyrow" key={d.key}>
+                <div className="skyhead">
+                  <b>{d.label}</b>
+                  <span>{d.note}</span>
+                </div>
+                <SkyStrip
+                  day={d.day}
+                  from={d.mark ? Math.floor(d.mark[0]) - 1 : 0}
+                  to={d.mark ? Math.ceil(d.mark[1]) + 1 : 24}
+                  hours={
+                    d.mark
+                      ? [Math.floor(d.mark[0]) - 1, d.mark[0], d.mark[1], Math.ceil(d.mark[1]) + 1]
+                      : [0, 4, 8, 12, 16, 20, 24]
+                  }
+                />
+              </div>
+            ))}
+          </div>
           <div className="row">
             <h3>Accents ({ACCENTS.length})</h3>
             <div className="swatches">
@@ -981,6 +1463,19 @@ const CSS = `
 .cat .tag.generic { background:rgba(240,199,94,.28); color:#8a6b1c; }
 .cat .tag.unused { background:rgba(239,127,147,.22); color:#a83f55; }
 .cat .tag.info { background:rgba(108,196,217,.24); color:#256f85; }
+.cat .skyrow { margin:.5rem 0 .9rem; max-width:480px; }
+.cat .skyhead { display:flex; flex-wrap:wrap; align-items:baseline; gap:.4rem;
+  font-size:.72rem; margin-bottom:.2rem; }
+.cat .skyhead b { font-weight:600; }
+.cat .skyhead span { color:rgba(65,58,85,.55); }
+.cat .sky { position:relative; }
+.cat .sky canvas { display:block; width:100%; height:34px; border-radius:5px;
+  border:1px solid var(--line); }
+.cat .ticks { position:relative; height:1rem; }
+.cat .ticks span { position:absolute; transform:translateX(-50%); font-size:.62rem;
+  color:rgba(65,58,85,.5); white-space:nowrap; }
+.cat .note code { font-size:.72rem; background:rgba(65,58,85,.07); border-radius:3px;
+  padding:0 .2rem; }
 .cat .swatches { display:flex; flex-wrap:wrap; gap:.4rem; }
 .cat .sw { display:flex; flex-direction:column; gap:.2rem; align-items:center; }
 .cat .sw span { width:56px; height:34px; border-radius:6px; border:1px solid var(--line); }

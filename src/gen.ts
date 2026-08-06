@@ -42,6 +42,7 @@ import {
   type ChestSpec,
   type Chunk,
   type GenesisMap,
+  type LakeSpec,
   type PropSpec,
   type RoadSpec,
   type RoofStyle,
@@ -404,6 +405,44 @@ function lakeOutline(l: Lake, k: number, n = 28): Pt[] {
     out.push([l.u + x * c - y * s, l.v + x * s + y * c]);
   }
   return out;
+}
+
+/**
+ * One lake standing on its own, centred on the origin — the same wobble draw
+ * and the same outline `makeLakes` produces, without a valley around it.
+ *
+ * Additive: `generateMap` does not call this and no world changes shape because
+ * of it. It exists so the dev catalog page can bake a real `LakeSpec` without
+ * generating a whole map to fish one out of.
+ */
+export function sampleLake(seed: number, rx = 3.4, ry = 2.6): LakeSpec {
+  const srng = mulberry32((seed ^ 0x3d9f1b27) >>> 0);
+  const l = makeLake({
+    id: 'lk-sample',
+    u: 0,
+    v: 0,
+    rx,
+    ry,
+    w1: 0.06 + srng() * 0.11,
+    w2: 0.03 + srng() * 0.07,
+    p1: srng() * Math.PI * 2,
+    p2: srng() * Math.PI * 2,
+    rot: srng() * Math.PI * 2,
+    seed: seed >>> 0,
+    fed: false,
+  });
+  const [gx, gy] = uv(l.u, l.v);
+  return {
+    id: l.id,
+    gx,
+    gy,
+    rx: l.rx,
+    ry: l.ry,
+    rot: l.rot,
+    seed: l.seed,
+    fed: l.fed,
+    pts: lakeOutline(l, 1).map((p) => uv(p[0], p[1]) as Vec2),
+  };
 }
 
 /**
