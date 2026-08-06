@@ -52,13 +52,22 @@ import {
   type RuinKind,
   type RuinSpec,
   /* ---- end ruins (additive) ---- */
+  /* ---- founders and professions (additive) ---- */
+  type Profession,
+  /* ---- end founders and professions (additive) ---- */
   type SiteSpec,
   type StructureRole,
   type TreeKind,
   type TreeSpec,
   type Vec2,
 } from './types.ts';
-import { townNames, valleyName } from './names.ts';
+import {
+  /* ---- founders and professions (additive) ---- */
+  founderNames,
+  /* ---- end founders and professions (additive) ---- */
+  townNames,
+  valleyName,
+} from './names.ts';
 
 /* ========================================================================== */
 /*  geometry helpers — all in u/v space                                       */
@@ -728,6 +737,72 @@ export const THATCH_ROLES = new Set<StructureRole>(['cottage', 'barn', 'shed', '
 
 /** Flavour dressing that shows up as a town matures. */
 export const FLAVOUR_PROPS = ['crop', 'haystack', 'crates', 'barrels', 'cart', 'shed'];
+
+/* ============ founders and professions (additive block) ================== *
+ * A town's trade, and the two bags it re-weights.
+ *
+ * ── THE ONE RULE ──────────────────────────────────────────────────────────
+ * A profession may change WHAT a roll means. It may never change HOW MANY
+ * rolls are made. Both bags below are read with exactly the single draw the
+ * plain bag was read with — `pick(brng, bag)` and `bag[floor(prng()*len)]` —
+ * so a differently sized bag is fine and a differently shaped one is not. Get
+ * that wrong and every stream downstream of it shifts, which is the one way
+ * this feature could have broken subset stability.
+ * -------------------------------------------------------------------------- */
+
+/** How close a town's RIM must come to the river bank or a lake shore, in u/v,
+ * before it is a fishing town. Deliberately generous next to JETTY_REACH: a
+ * town can live off water it cannot moor a boat on. */
+export const FISH_REACH = 5;
+
+/** The disc, in u/v, that a town's founding wood is counted over … */
+export const LOG_REACH = 8;
+/**
+ * … and how many WILD trees have to be standing in it.
+ *
+ * Wild means the chunk planting pass only — not the grove the town clears out
+ * of its own green, and not the trees a road corridor brought with it, neither
+ * of which says anything about the country the town chose.
+ *
+ * 22 over a disc of ~201 u² looks low against the forest biome's 0.27/u², and
+ * it is: no town in the valley is founded in deep wood, because the chunk pass
+ * lays a ring of `farm` around every baseline holding before a single tree goes
+ * in. The figure is calibrated instead so that roughly the woodiest fifth of
+ * the roster qualifies — which is what "this lot went out to where the timber
+ * was" has to mean in a valley that ploughs its own doorstep.
+ */
+export const LOG_TREES = 22;
+
+/** How far past its rim a town counts ploughed ground, and how many farm
+ * chunks it takes. Two, because one is the halo every town grows for itself. */
+export const FARM_REACH = 9;
+export const FARM_CHUNKS = 4;
+
+/**
+ * The ordinary-plot bag, per trade. Each is COMMON_ROLES with a handful of
+ * entries added, so the shift is a nudge in the odds rather than a different
+ * town: a fishing town still builds mostly cottages, it just keeps more of
+ * its goods under cover.
+ */
+export const PROFESSION_ROLES: Record<Profession, StructureRole[]> = {
+  // Nets, salt, barrels, and somewhere dry to put all three.
+  fishing: [...COMMON_ROLES, 'store', 'store', 'store', 'shed', 'shed'],
+  // Sawyers and joiners, and lean-tos full of what they cut.
+  logging: [...COMMON_ROLES, 'workshop', 'workshop', 'workshop', 'shed', 'shed'],
+  // Somewhere to put the harvest before the rain gets at it.
+  farming: [...COMMON_ROLES, 'barn', 'barn', 'granary', 'granary', 'shed'],
+  plain: COMMON_ROLES,
+};
+
+/** The flavour-dressing bag, per trade. Same rule: one draw, any length. */
+export const PROFESSION_FLAVOUR: Record<Profession, string[]> = {
+  fishing: [...FLAVOUR_PROPS, 'crates', 'barrels', 'crates', 'barrels'],
+  logging: [...FLAVOUR_PROPS, 'lumber', 'lumber', 'lumber', 'cart'],
+  farming: [...FLAVOUR_PROPS, 'haystack', 'crop', 'haystack', 'crop'],
+  plain: FLAVOUR_PROPS,
+};
+
+/* ========== end founders and professions (additive block) ================ */
 
 /* --------------------------- boats and jetties --------------------------- *
  * ADDITIVE BLOCK. A town builds a jetty when it has water to build one on and
@@ -2186,6 +2261,251 @@ function buildMap(seed: number, scale: number): GenesisMap {
   );
   /* ---- end ruins (additive) ---------------------------------------------- */
 
+  /* ---- trees ------------------------------------------------------------ */
+  // ┌── WHY THE WOOD IS PLANTED HERE, ABOVE THE ROOFS ───────────────────┐
+  // │ founders and professions (additive). A town's trade is read off    │
+  // │ the ground it was founded on, and one of the things that ground    │
+  // │ has on it is trees — so the wild wood has to exist before the      │
+  // │ first plot is rolled.                                              │
+  // │                                                                    │
+  // │ Moving it costs nothing. Every one of the three planting passes    │
+  // │ below draws from its OWN substream (per chunk, per site, per road) │
+  // │ and takes not a single number off the main `rng`, so the whole     │
+  // │ block commutes with the buildings block: the maps this generator   │
+  // │ produced before the move are byte-identical to the ones it         │
+  // │ produces after it. The `clears` passes stay where they were, below │
+  // │ the roofs, because those genuinely do need the plots.              │
+  // └────────────────────────────────────────────────────────────────────┘
+  // Real woodland. The day's story is crews cutting their way through it, so
+  // the wood has to be thick enough that a road or a plot is genuinely carved
+  // out of something. Density is concentrated where the work happens — inside
+  // the town clearings and down the road corridors — while meadow stays open,
+  // so the map keeps its contrast instead of turning into one green mat.
+  const TREE_DENSITY: Record<Biome, number> = {
+    forest: 0.27,
+    meadow: 0.07,
+    farm: 0.095,
+    wetland: 0.12,
+    moor: 0.035,
+  };
+  /** Extra trees packed into the town clearings, per unit area. */
+  const GROVE_DENSITY = 0.36;
+  /** Extra trees down the planned road corridors, and how wide they lie. */
+  const CORRIDOR_DENSITY = 0.24;
+  const CORRIDOR_HALF = 3;
+  /** No two trunks closer than this. */
+  const TREE_GAP = 0.62;
+  /** Trees a single plot may require felled before it can be surveyed. */
+  const PLOT_CLEAR_CAP = 11;
+  // The day's woodland, re-weighted by the seed's forest character (see
+  // WOOD_CHARACTERS): the base mix per biome, then one kind pushed to the
+  // front so one valley reads birch-bright and the next fir-dark. Weights are
+  // normalised, and the choice is made from a derived substream, so nothing
+  // about it depends on the pace scale.
+  const TREE_KINDS = woodland(seed);
+
+  const trees: TreeSpec[] = [];
+  const treeUV: Pt[] = [];
+  let treeId = 0;
+
+  // Trees may now stand ON a planned road — the crews fell them as they build
+  // (see the road `clears` pass below). Only the water and the rock push back.
+  const treeClear = (p: Pt): boolean =>
+    polyDist(p, river) >= 1.5 && !offLake(p, TREE_LAKE_CLEAR) && !offRock(p, TREE_ROCK_CLEAR);
+
+  // Spacing test over a 1-unit hash grid, so thickening the wood stays linear.
+  const cells = new Map<number, number[]>();
+  const cellKey = (u: number, v: number) => (Math.floor(u) + 512) * 4096 + (Math.floor(v) + 512);
+  const spaced = (p: Pt): boolean => {
+    const cu = Math.floor(p[0]);
+    const cv = Math.floor(p[1]);
+    for (let du = -1; du <= 1; du++) {
+      for (let dv = -1; dv <= 1; dv++) {
+        const bucket = cells.get(cellKey(cu + du, cv + dv));
+        if (!bucket) continue;
+        for (const k of bucket) {
+          if (dist(treeUV[k], p) < TREE_GAP) return false;
+        }
+      }
+    }
+    return true;
+  };
+  /**
+   * Conservative superset of the tree indices within `r` of (u, v), read off
+   * the same 1-unit hash grid the spacing test uses. Callers still apply the
+   * exact distance test, so a superset is safe; what a caller must NOT assume
+   * is grid order, hence the ascending sort — it restores the original
+   * tree-array iteration order for every scan below.
+   */
+  const treesNear = (u: number, v: number, r: number): number[] => {
+    const out: number[] = [];
+    const cu0 = Math.floor(u - r);
+    const cu1 = Math.floor(u + r);
+    const cv0 = Math.floor(v - r);
+    const cv1 = Math.floor(v + r);
+    for (let cu = cu0; cu <= cu1; cu++) {
+      for (let cv = cv0; cv <= cv1; cv++) {
+        const bucket = cells.get(cellKey(cu, cv));
+        if (bucket) for (const k of bucket) out.push(k);
+      }
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
+  /** Same, for the cells within `r` of any segment of `line`. Deduped. */
+  const treesNearLine = (line: Pt[], r: number): number[] => {
+    const keys = new Set<number>();
+    const out: number[] = [];
+    for (let i = 0; i + 1 < line.length; i++) {
+      const a = line[i];
+      const b = line[i + 1];
+      const cu0 = Math.floor(Math.min(a[0], b[0]) - r);
+      const cu1 = Math.floor(Math.max(a[0], b[0]) + r);
+      const cv0 = Math.floor(Math.min(a[1], b[1]) - r);
+      const cv1 = Math.floor(Math.max(a[1], b[1]) + r);
+      for (let cu = cu0; cu <= cu1; cu++) {
+        for (let cv = cv0; cv <= cv1; cv++) {
+          const key = cellKey(cu, cv);
+          if (keys.has(key)) continue;
+          keys.add(key);
+          const bucket = cells.get(key);
+          if (bucket) for (const k of bucket) out.push(k);
+        }
+      }
+    }
+    out.sort((a, b) => a - b);
+    return out;
+  };
+
+  const rollKind = <T,>(r: number, table: [T, number][]): T => {
+    let acc = 0;
+    for (const [k, wt] of table) {
+      acc += wt;
+      if (r <= acc) return k;
+    }
+    return table[0][0];
+  };
+  const addTree = (p: Pt, kind: TreeKind, s: number) => {
+    const [gx, gy] = uv(p[0], p[1]);
+    const k = trees.length;
+    trees.push({ id: `tr${treeId++}`, kind, gx, gy, seed: s >>> 0 });
+    treeUV.push(p);
+    const key = cellKey(p[0], p[1]);
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(k);
+    else cells.set(key, [k]);
+  };
+
+  for (const chunk of chunks) {
+    const crng = mulberry32((chunk.seed + 991) >>> 0);
+    const area = (chunk.u1 - chunk.u0) * (chunk.v1 - chunk.v0);
+    const target = Math.round(area * TREE_DENSITY[chunk.biome]);
+    const table = TREE_KINDS[chunk.biome];
+    let placed = 0;
+    for (let t = 0; t < target * 4 && placed < target; t++) {
+      const p: Pt = [
+        lerp(chunk.u0, chunk.u1, crng()),
+        lerp(chunk.v0, chunk.v1, crng()),
+      ];
+      const kind = rollKind(crng(), table);
+      if (!treeClear(p) || !spaced(p)) continue;
+      addTree(p, kind, chunk.seed + t * 37);
+      placed++;
+    }
+  }
+
+  /* ============ founders and professions (additive block) ================ *
+   * Placed exactly here, between the WILD wood and the two planted passes
+   * below it, because "founded in thick forest" has to mean the forest that
+   * was already standing — not the grove the town will clear out of its own
+   * green, and not the corridor trees a road brought with it. At this point
+   * `trees` holds the chunk pass and nothing else, which is the wild wood.
+   *
+   * Everything below is a pure function of the FULL roster and the terrain:
+   * no main-`rng` draw, no `nSites`, no `S`. So a town has the same founder
+   * and the same trade at 0.25x as it has at 4x, and the pace control can
+   * only decide whether that town is reached today at all.
+   * ----------------------------------------------------------------------- */
+
+  /** Whoever drove the first stake, per roster index. Own substream. */
+  const founders = founderNames(seed, sites.length);
+
+  const siteProfession: Profession[] = sites.map((site, si) => {
+    // The founding homestead is the whole valley in one yard: it fishes, fells
+    // and ploughs, so it is not any one of them.
+    if (si === 0) return 'plain';
+    const p: Pt = [site.u, site.v];
+
+    // Water first: a rim within FISH_REACH of the river bank or a lake shore.
+    // Measured rim-to-water like QUARRY_REACH and JETTY_REACH, so it means the
+    // same thing for a big town and a small one — and it is deliberately the
+    // same geography that earns a town a jetty, so the two agree far more often
+    // than they disagree.
+    const water = Math.min(polyDist(p, river) - riverWidth * Math.SQRT2, lakeD(p)) - site.r;
+    if (water <= FISH_REACH) return 'fishing';
+
+    // Then wood: how much wild forest was standing within LOG_REACH of the
+    // green before anybody put an axe in it.
+    let wild = 0;
+    for (const i of treesNear(p[0], p[1], LOG_REACH)) {
+      if (dist(treeUV[i], p) <= LOG_REACH) wild++;
+    }
+    if (wild >= LOG_TREES) return 'logging';
+
+    // Then plough: farm chunks whose centre lies within FARM_REACH of the rim.
+    let fields = 0;
+    for (const c of chunks) {
+      if (c.biome !== 'farm') continue;
+      const cu = (c.u0 + c.u1) / 2;
+      const cv = (c.v0 + c.v1) / 2;
+      if (dist(p, [cu, cv]) - site.r <= FARM_REACH) fields++;
+    }
+    if (fields >= FARM_CHUNKS) return 'farming';
+
+    return 'plain';
+  });
+
+  /* ========== end founders and professions (additive block) ============== */
+
+  // Groves inside every town: the plots start forested, and the day's story is
+  // clearing them. Without this pass the "farm" biome under a town would leave
+  // nothing to fell.
+  sites.forEach((site, si) => {
+    const grng = mulberry32((seed + si * 3301 + 55) >>> 0);
+    const target = Math.round(Math.PI * site.r * site.r * GROVE_DENSITY);
+    let placed = 0;
+    for (let t = 0; t < target * 6 && placed < target; t++) {
+      const a = grng() * Math.PI * 2;
+      const rad = Math.sqrt(grng()) * site.r * 1.02;
+      const p: Pt = [site.u + Math.cos(a) * rad, site.v + Math.sin(a) * rad];
+      if (!treeClear(p) || !spaced(p)) continue;
+      addTree(p, rollKind(grng(), TREE_KINDS.forest), seed + si * 271 + t * 29);
+      placed++;
+    }
+  });
+
+  // Road corridors. Routes are planned through standing wood, so the crews
+  // have something to cut on the way out — this is what puts a double-digit
+  // clears list on a long forest route.
+  roadLines.forEach((line, ri) => {
+    const rrng = mulberry32((seed + ri * 40009 + 131) >>> 0);
+    const cum = cumulative(line);
+    const total = cum[cum.length - 1];
+    const target = Math.round(total * CORRIDOR_HALF * 2 * CORRIDOR_DENSITY);
+    let placed = 0;
+    for (let t = 0; t < target * 6 && placed < target; t++) {
+      const at = pointAtS(line, cum, rrng() * total);
+      const a = rrng() * Math.PI * 2;
+      const rad = Math.sqrt(rrng()) * CORRIDOR_HALF;
+      const p: Pt = [at[0] + Math.cos(a) * rad, at[1] + Math.sin(a) * rad];
+      if (p[0] < bounds.u0 || p[0] > bounds.u1 || p[1] < bounds.v0 || p[1] > bounds.v1) continue;
+      if (!treeClear(p) || !spaced(p)) continue;
+      addTree(p, rollKind(rrng(), TREE_KINDS.forest), seed + ri * 617 + t * 43);
+      placed++;
+    }
+  });
+
   /* ---- buildings -------------------------------------------------------- */
   const GOLDEN = 2.399963;
   const siteBuildings: BuildingSpec[][] = [];
@@ -2339,7 +2659,19 @@ function buildMap(seed: number, scale: number): GenesisMap {
         w = clamp(Math.round((baseW * 1.5) / 4) * 4, 44, 64);
         floors = brng() < 0.45 ? 3 : 2;
       } else {
-        role = pick(brng, COMMON_ROLES);
+        // founders and professions (additive): the SAME single draw, read
+        // through the bag this town's trade keeps. See PROFESSION_ROLES.
+        //
+        // Worth knowing, because it is not obvious: the `roof` ternary below
+        // spends a SECOND draw when a thatchable role rolls out of thatch, so
+        // the plot loop's draw count has always been a function of the role.
+        // Changing which role a given number lands on therefore moves the
+        // plots inside a green, and it is why this commit is a new set of
+        // worlds. It does not touch subset stability, and cannot: a town's
+        // trade is read off the FULL roster, so the sequence is the same
+        // sequence at 0.25x as at 4x. The pace ladder is unaffected; only
+        // yesterday's screenshots are.
+        role = pick(brng, PROFESSION_ROLES[siteProfession[si]]);
         w = clamp(Math.round((baseW * (0.78 + brng() * 0.4)) / 4) * 4, 24, 52);
         floors = brng() < 0.34 ? 2 : 1;
       }
@@ -2397,184 +2729,6 @@ function buildMap(seed: number, scale: number): GenesisMap {
   });
 
   const allBuildings = siteBuildings.flat();
-
-  /* ---- trees ------------------------------------------------------------ */
-  // Real woodland. The day's story is crews cutting their way through it, so
-  // the wood has to be thick enough that a road or a plot is genuinely carved
-  // out of something. Density is concentrated where the work happens — inside
-  // the town clearings and down the road corridors — while meadow stays open,
-  // so the map keeps its contrast instead of turning into one green mat.
-  const TREE_DENSITY: Record<Biome, number> = {
-    forest: 0.27,
-    meadow: 0.07,
-    farm: 0.095,
-    wetland: 0.12,
-    moor: 0.035,
-  };
-  /** Extra trees packed into the town clearings, per unit area. */
-  const GROVE_DENSITY = 0.36;
-  /** Extra trees down the planned road corridors, and how wide they lie. */
-  const CORRIDOR_DENSITY = 0.24;
-  const CORRIDOR_HALF = 3;
-  /** No two trunks closer than this. */
-  const TREE_GAP = 0.62;
-  /** Trees a single plot may require felled before it can be surveyed. */
-  const PLOT_CLEAR_CAP = 11;
-  // The day's woodland, re-weighted by the seed's forest character (see
-  // WOOD_CHARACTERS): the base mix per biome, then one kind pushed to the
-  // front so one valley reads birch-bright and the next fir-dark. Weights are
-  // normalised, and the choice is made from a derived substream, so nothing
-  // about it depends on the pace scale.
-  const TREE_KINDS = woodland(seed);
-
-  const trees: TreeSpec[] = [];
-  const treeUV: Pt[] = [];
-  let treeId = 0;
-
-  // Trees may now stand ON a planned road — the crews fell them as they build
-  // (see the road `clears` pass below). Only the water and the rock push back.
-  const treeClear = (p: Pt): boolean =>
-    polyDist(p, river) >= 1.5 && !offLake(p, TREE_LAKE_CLEAR) && !offRock(p, TREE_ROCK_CLEAR);
-
-  // Spacing test over a 1-unit hash grid, so thickening the wood stays linear.
-  const cells = new Map<number, number[]>();
-  const cellKey = (u: number, v: number) => (Math.floor(u) + 512) * 4096 + (Math.floor(v) + 512);
-  const spaced = (p: Pt): boolean => {
-    const cu = Math.floor(p[0]);
-    const cv = Math.floor(p[1]);
-    for (let du = -1; du <= 1; du++) {
-      for (let dv = -1; dv <= 1; dv++) {
-        const bucket = cells.get(cellKey(cu + du, cv + dv));
-        if (!bucket) continue;
-        for (const k of bucket) {
-          if (dist(treeUV[k], p) < TREE_GAP) return false;
-        }
-      }
-    }
-    return true;
-  };
-  /**
-   * Conservative superset of the tree indices within `r` of (u, v), read off
-   * the same 1-unit hash grid the spacing test uses. Callers still apply the
-   * exact distance test, so a superset is safe; what a caller must NOT assume
-   * is grid order, hence the ascending sort — it restores the original
-   * tree-array iteration order for every scan below.
-   */
-  const treesNear = (u: number, v: number, r: number): number[] => {
-    const out: number[] = [];
-    const cu0 = Math.floor(u - r);
-    const cu1 = Math.floor(u + r);
-    const cv0 = Math.floor(v - r);
-    const cv1 = Math.floor(v + r);
-    for (let cu = cu0; cu <= cu1; cu++) {
-      for (let cv = cv0; cv <= cv1; cv++) {
-        const bucket = cells.get(cellKey(cu, cv));
-        if (bucket) for (const k of bucket) out.push(k);
-      }
-    }
-    out.sort((a, b) => a - b);
-    return out;
-  };
-
-  /** Same, for the cells within `r` of any segment of `line`. Deduped. */
-  const treesNearLine = (line: Pt[], r: number): number[] => {
-    const keys = new Set<number>();
-    const out: number[] = [];
-    for (let i = 0; i + 1 < line.length; i++) {
-      const a = line[i];
-      const b = line[i + 1];
-      const cu0 = Math.floor(Math.min(a[0], b[0]) - r);
-      const cu1 = Math.floor(Math.max(a[0], b[0]) + r);
-      const cv0 = Math.floor(Math.min(a[1], b[1]) - r);
-      const cv1 = Math.floor(Math.max(a[1], b[1]) + r);
-      for (let cu = cu0; cu <= cu1; cu++) {
-        for (let cv = cv0; cv <= cv1; cv++) {
-          const key = cellKey(cu, cv);
-          if (keys.has(key)) continue;
-          keys.add(key);
-          const bucket = cells.get(key);
-          if (bucket) for (const k of bucket) out.push(k);
-        }
-      }
-    }
-    out.sort((a, b) => a - b);
-    return out;
-  };
-
-  const rollKind = <T,>(r: number, table: [T, number][]): T => {
-    let acc = 0;
-    for (const [k, wt] of table) {
-      acc += wt;
-      if (r <= acc) return k;
-    }
-    return table[0][0];
-  };
-  const addTree = (p: Pt, kind: TreeKind, s: number) => {
-    const [gx, gy] = uv(p[0], p[1]);
-    const k = trees.length;
-    trees.push({ id: `tr${treeId++}`, kind, gx, gy, seed: s >>> 0 });
-    treeUV.push(p);
-    const key = cellKey(p[0], p[1]);
-    const bucket = cells.get(key);
-    if (bucket) bucket.push(k);
-    else cells.set(key, [k]);
-  };
-
-  for (const chunk of chunks) {
-    const crng = mulberry32((chunk.seed + 991) >>> 0);
-    const area = (chunk.u1 - chunk.u0) * (chunk.v1 - chunk.v0);
-    const target = Math.round(area * TREE_DENSITY[chunk.biome]);
-    const table = TREE_KINDS[chunk.biome];
-    let placed = 0;
-    for (let t = 0; t < target * 4 && placed < target; t++) {
-      const p: Pt = [
-        lerp(chunk.u0, chunk.u1, crng()),
-        lerp(chunk.v0, chunk.v1, crng()),
-      ];
-      const kind = rollKind(crng(), table);
-      if (!treeClear(p) || !spaced(p)) continue;
-      addTree(p, kind, chunk.seed + t * 37);
-      placed++;
-    }
-  }
-
-  // Groves inside every town: the plots start forested, and the day's story is
-  // clearing them. Without this pass the "farm" biome under a town would leave
-  // nothing to fell.
-  sites.forEach((site, si) => {
-    const grng = mulberry32((seed + si * 3301 + 55) >>> 0);
-    const target = Math.round(Math.PI * site.r * site.r * GROVE_DENSITY);
-    let placed = 0;
-    for (let t = 0; t < target * 6 && placed < target; t++) {
-      const a = grng() * Math.PI * 2;
-      const rad = Math.sqrt(grng()) * site.r * 1.02;
-      const p: Pt = [site.u + Math.cos(a) * rad, site.v + Math.sin(a) * rad];
-      if (!treeClear(p) || !spaced(p)) continue;
-      addTree(p, rollKind(grng(), TREE_KINDS.forest), seed + si * 271 + t * 29);
-      placed++;
-    }
-  });
-
-  // Road corridors. Routes are planned through standing wood, so the crews
-  // have something to cut on the way out — this is what puts a double-digit
-  // clears list on a long forest route.
-  roadLines.forEach((line, ri) => {
-    const rrng = mulberry32((seed + ri * 40009 + 131) >>> 0);
-    const cum = cumulative(line);
-    const total = cum[cum.length - 1];
-    const target = Math.round(total * CORRIDOR_HALF * 2 * CORRIDOR_DENSITY);
-    let placed = 0;
-    for (let t = 0; t < target * 6 && placed < target; t++) {
-      const at = pointAtS(line, cum, rrng() * total);
-      const a = rrng() * Math.PI * 2;
-      const rad = Math.sqrt(rrng()) * CORRIDOR_HALF;
-      const p: Pt = [at[0] + Math.cos(a) * rad, at[1] + Math.sin(a) * rad];
-      if (p[0] < bounds.u0 || p[0] > bounds.u1 || p[1] < bounds.v0 || p[1] > bounds.v1) continue;
-      if (!treeClear(p) || !spaced(p)) continue;
-      addTree(p, rollKind(rrng(), TREE_KINDS.forest), seed + ri * 617 + t * 43);
-      placed++;
-    }
-  });
 
   /* ---- clears: which trees stand on which plot -------------------------- */
   // Computed against the FULL building roster, not the scaled-down one. Felling
@@ -3275,8 +3429,16 @@ function buildMap(seed: number, scale: number): GenesisMap {
       add(`${site.id}-fire`, 'campfire', spot(0.24, signA + Math.PI * 1.35), 51 + si);
     }
 
-    // Timber stacked where the axes have been busiest.
-    const piles = siteTimber[si] >= 44 ? 2 : siteTimber[si] >= 20 ? 1 : 0;
+    // Timber stacked where the axes have been busiest — and a stack more in a
+    // logging town, which is the one piece of dressing its trade is worth on
+    // its own (founders and professions, additive). Essentials tier, and keyed
+    // to the FULL roster, so it is there at every pace or at none.
+    const piles = clamp(
+      (siteTimber[si] >= 44 ? 2 : siteTimber[si] >= 20 ? 1 : 0) +
+        (siteProfession[si] === 'logging' ? 1 : 0),
+      0,
+      3
+    );
     for (let i = 0; i < piles; i++) {
       add(
         `${site.id}-timber${i}`,
@@ -3351,8 +3513,12 @@ function buildMap(seed: number, scale: number): GenesisMap {
     const flavourMax = flavourBase + room;
     const flavourAt = (built: number) =>
       clamp(flavourBase + Math.round((built - siteBuiltBase[si]) * 0.75), 1, flavourMax);
+    // founders and professions (additive): the SAME single draw, read through
+    // the bag this town's trade keeps. Positions are untouched — `spot()` is
+    // called with exactly the arguments it was called with before.
+    const flavourBag = PROFESSION_FLAVOUR[siteProfession[si]];
     for (let i = 0; i < flavourMax; i++) {
-      const kind = FLAVOUR_PROPS[Math.floor(prng() * FLAVOUR_PROPS.length)];
+      const kind = flavourBag[Math.floor(prng() * flavourBag.length)];
       add(`${site.id}-p${i}`, kind, spot(0.62 + prng() * 0.22, prng() * Math.PI * 2), 200 + si * 31 + i);
     }
     sitePropCount.push(essentials + flavourAt(siteBuilt[si]));
@@ -3423,6 +3589,12 @@ function buildMap(seed: number, scale: number): GenesisMap {
       // Undergrowth was already cleared against the FULL list above, so the
       // trees do not move when the tail is short.
       props: siteProps[i].slice(0, sitePropCount[i]),
+      /* ---- founders and professions (additive) -------------------------- */
+      // Both read off the FULL roster at index i, so the trim above cannot
+      // rename a town or change its trade — only leave it out of the day.
+      founder: founders[i],
+      profession: siteProfession[i],
+      /* ---- end founders and professions (additive) ---------------------- */
     };
   });
 

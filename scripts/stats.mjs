@@ -240,7 +240,10 @@ function report(seed) {
         `r ${f1(s.radius)}  river ${f1(polyDist(p, river))}  ` +
         `lake ${rings.length ? f1(lakesShoreDist(p, rings)) : '-'}  ${s.accent}  ` +
         `${s.buildings.length} bldg / ${s.props.length} props` +
-        `${isQuarryTown(s) ? '  STONE' : ''}`
+        `${isQuarryTown(s) ? '  STONE' : ''}` +
+        /* ---- founders and professions (additive) ---- */
+        `  ${(s.founder ?? '?').padEnd(16)} ${(s.profession ?? 'plain').toUpperCase()}`
+        /* ---- end founders and professions (additive) ---- */
     );
   }
 
@@ -351,6 +354,29 @@ function report(seed) {
     );
   }
   /* ---- end ruins (additive) --------------------------------------------- */
+
+  /* ---- founders and professions (additive) ------------------------------ */
+  // A town's trade is read off the FULL roster, so the interesting readout is
+  // per-scale: the same roster index keeps the same trade, and a busier day
+  // simply reaches more of them.
+  const trade = (sc) => {
+    const m = generateMap(seed, sc);
+    return `${sc}x ${m.sites.map((s) => (s.profession ?? 'plain')[0].toUpperCase()).join('')}`;
+  };
+  say(
+    `\nprofessions: ${hist(map.sites, (s) => s.profession ?? 'plain')}   ` +
+      `(${[0.25, 1, 4].map(trade).join('  ')}; F/L/A/P)`
+  );
+  say(`founders: ${map.sites.map((s) => s.founder ?? '?').join(', ')}`);
+  const dressFor = (p) =>
+    hist(
+      map.sites.filter((s) => (s.profession ?? 'plain') === p).flatMap((s) => s.props),
+      (x) => x.kind
+    ) || '-';
+  for (const p of ['fishing', 'logging', 'farming']) {
+    if (map.sites.some((s) => s.profession === p)) say(`  ${p} dressing: ${dressFor(p)}`);
+  }
+  /* ---- end founders and professions (additive) -------------------------- */
 
   say(`\nforest character: ${woodCharacter(seed)}`);
   say(`tree kinds: ${hist(map.trees, (t) => t.kind)}`);
@@ -1103,7 +1129,14 @@ function subsetChecks(seed) {
         bad++;
         continue;
       }
-      const meta = (x) => ({ id: x.id, name: x.name, gx: x.gx, gy: x.gy, radius: x.radius, accent: x.accent });
+      // `founder` and `profession` are in here on purpose: both are read off
+      // the FULL roster in gen.ts, so the pace control may leave a town out of
+      // the day but may never rename it or change what it lives on.
+      const meta = (x) => ({
+        id: x.id, name: x.name, gx: x.gx, gy: x.gy, radius: x.radius, accent: x.accent,
+        /* ---- founders and professions (additive) ---- */
+        founder: x.founder, profession: x.profession,
+      });
       if (!same(meta(a), meta(b))) bad++;
       if (b.buildings.length < a.buildings.length) bldShrink++;
       for (let j = 0; j < a.buildings.length; j++) {
@@ -1224,6 +1257,71 @@ function chestReport(n) {
   );
 }
 
+/* -------------------- founders and professions (additive) ---------------- */
+
+/**
+ * What the valley does for a living, over a lot of seeds.
+ *
+ * Read at 1x AND at 4x, because the two answer different questions. 1x is what
+ * a visitor sees on an ordinary day; 4x is the whole roster, and the trade mix
+ * there is the honest one — the frontier holdings beyond the baseline towns are
+ * the ones out in real wood, so logging climbs and ploughed ground falls as the
+ * day gets busier. Both are the same per-index assignment; the pace control
+ * only decides how far down the roster the day gets.
+ */
+function professionReport(n) {
+  const KINDS = ['fishing', 'logging', 'farming', 'plain'];
+  console.log(`\nPROFESSIONS over ${n} seeds`);
+  for (const scale of [1, 4]) {
+    const count = {};
+    const anySeed = {};
+    let towns = 0;
+    let jettyFish = 0;
+    let fishTowns = 0;
+    for (let s = 1; s <= n; s++) {
+      const map = generateMap(s, scale);
+      const have = new Set();
+      for (const site of map.sites) {
+        const p = site.profession ?? 'plain';
+        count[p] = (count[p] ?? 0) + 1;
+        towns++;
+        have.add(p);
+        if (p === 'fishing') {
+          fishTowns++;
+          if (site.props.some((x) => x.kind === 'jetty')) jettyFish++;
+        }
+      }
+      for (const k of have) anySeed[k] = (anySeed[k] ?? 0) + 1;
+    }
+    const pc = (a, b) => (b ? `${((a / b) * 100).toFixed(0)}%` : '--');
+    console.log(
+      `  ${String(scale).padStart(4)}x  ${towns} towns:  ` +
+        KINDS.map((k) => `${k} ${count[k] ?? 0} (${pc(count[k] ?? 0, towns)})`).join('  ')
+    );
+    console.log(
+      `         seeds with at least one:  ` +
+        KINDS.map((k) => `${k} ${pc(anySeed[k] ?? 0, n)}`).join('  ') +
+        `   |  fishing towns with a jetty ${pc(jettyFish, fishTowns)}`
+    );
+  }
+  // Founders are the other half of the block: unique inside a valley, and the
+  // same name at every pace. The second half is covered by subsetChecks.
+  let dupSeeds = 0;
+  const used = new Set();
+  for (let s = 1; s <= n; s++) {
+    const map = generateMap(s, 4);
+    const names = map.sites.map((x) => x.founder);
+    for (const nm of names) used.add(nm);
+    if (new Set(names).size !== names.length) dupSeeds++;
+  }
+  console.log(
+    `  founders: ${used.size} distinct names used over ${n} valleys, ` +
+      `${dupSeeds} valleys with a repeat`
+  );
+}
+
+/* ------------------ end founders and professions (additive) -------------- */
+
 /* ---------------------------------- main --------------------------------- */
 
 const argv = process.argv.slice(2);
@@ -1267,6 +1365,9 @@ if (argv[0] === '--sweep') {
   console.log(`sweep ${Math.min(n, 60)} seeds subset stability: ${subFails.length ? `FAIL ${subFails.join(',')}` : 'ALL PASS'}`);
   if (subFails.length) allPass = false;
   chestReport(n);
+  /* ---- founders and professions (additive) ---- */
+  professionReport(n);
+  /* ---- end founders and professions (additive) ---- */
 } else {
   const seeds = argv.length ? argv.map(Number) : [1, 42, 20260802];
   for (const s of seeds) {

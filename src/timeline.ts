@@ -1023,6 +1023,167 @@ function ruinPass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId?
 /* end ruins (additive)                                                       */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* founders and professions (additive) — the people, and what they live on     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Somebody drove the first stake, and the ledger knows their name.
+ *
+ * gen.ts hands every town a `founder` and a `profession`, both read off the
+ * FULL roster and the terrain (see the additive block there). This pass is
+ * what the valley says about them: the first roof, what the town lives on, and
+ * the odd line of somebody being difficult about a well.
+ *
+ * ── ON THE TEMPO ──────────────────────────────────────────────────────────
+ * Same contract as `ruinPass` above, and for the same reason: `plan()` gets
+ * bisected about forty-one times solving for the tempo `p`, and this runs once,
+ * from `narrate`. So the DRAW COUNT here is a function of the MAP alone — how
+ * many towns there are, what their trades are, and three constant caps. `p` is
+ * allowed to move the hour a line lands at and nothing else. Note in particular
+ * that nothing below branches on `run.finishes.length`: the times are chosen
+ * with a ternary, after the draw, never around it.
+ */
+
+/** The founding line, when the town has a founder to hang it on. Merged with
+ * the plain register rather than replacing it — a valley that only ever talked
+ * about its founders would read like a roll of honour. */
+const FOUND_LOG_FOLK = [
+  '{founder} drives the first stake at {town}. The rest of them argue about the second.',
+  'They give the naming of it to {founder}, who says {town}, and that is that.',
+  '{founder} walks the ground twice, picks the flat of it, and {town} starts there.',
+  '{n} settlers, and {founder} at the head of them. {town}, in {valley}.',
+  '{founder} paces out a square, calls it a green, and {town} is founded round it.',
+  '{town} is founded. {founder} got here first and intends to be reminded of it.',
+  'The road runs out at a good spot. They call it {town}, and it belongs to {valley} now.',
+  '{town} founded: four stakes, a length of string, and an argument about the well.',
+  'Another smoke in {valley}. {town} has a name before it has a roof.',
+];
+
+/** The first thing anybody finishes in a new town. */
+const FIRST_ROOF_LOG = [
+  'First roof on at {town}. {founder} sleeps under it and nobody argues the point.',
+  '{founder} watches the first rafters up at {town} and stops pretending not to be pleased.',
+  'The first roof at {town} goes on before dark. {founder} counts the slates twice.',
+  'They finish the first of it at {town}. {founder} is already pointing at the next plot.',
+  'One roof at {town}, and {founder} says that is the hard one done. It was not.',
+];
+
+/** A founder being a person, somewhere in the middle of the day. */
+const FOUNDER_FLAVOUR_LOG = [
+  '{founder} is not satisfied with the well at {town}. The well stays.',
+  '{founder} has views on where the lane ought to run. The lane runs where it was going to.',
+  'A dispute at {town} over a boundary stone. {founder} settles it by moving the stone.',
+  '{founder} is found asleep against a stack of timber at {town} and is left there.',
+  'Somebody asks {founder} what {town} will be like in ten years. {founder} says: standing.',
+  '{founder} counts the settlers at {town} twice and gets two different answers.',
+  'The plan {founder} drew for {town} this morning is already three plots out of date.',
+];
+
+/** What a town lives on, in its own words. Never drawn for a plain town. */
+const PROFESSION_LOG: Record<string, string[]> = {
+  fishing: [
+    'Nets out at first light at {town}. Two of them come back with enough to bother salting.',
+    'A line of withy traps goes into the water below {town} and is watched like treasure.',
+    'They raise a store at {town} before a second house. Everything here comes off the water.',
+    '{founder} has worked out what the fish are worth at {town} and what they are worth downstream.',
+    'Barrels stacked on the bank at {town}, and the smell of salt on a valley that has no sea.',
+  ],
+  logging: [
+    'The saw pit at {town} is dug before the first hearth. This is a timber town and knows it.',
+    'Stacked lumber halfway round the green at {town}, seasoning where it came down.',
+    '{town} fells more than it needs and stacks the difference. {founder} calls that planning.',
+    'The wood around {town} is thick enough that the axes never have to walk far.',
+    'Two saws going at {town} all afternoon, and neither of them stops for the other.',
+  ],
+  farming: [
+    'First furrow turned at {town} before the first wall is up.',
+    'They put the granary up early at {town}. {founder} has seen a wet autumn before.',
+    'Hedges laid rather than planted round the {town} fields. Somebody here has done this before.',
+    'The ground at {town} turns over black and easy. Nobody says so aloud in case it stops.',
+    '{founder} walks the {town} fields at noon and comes back talking about next year.',
+  ],
+};
+
+/** Caps, so the ledger stays a ledger. All three are constants, which is half
+ * of what keeps this pass's draw count independent of the tempo. */
+const FIRST_ROOF_LINES_MAX = 3;
+const PROFESSION_LINES_MAX = 3;
+const FOUNDER_FLAVOUR_LINES_MAX = 2;
+
+function folkPass(map: GenesisMap, pl: Plan): { t: number; text: string; siteId?: string }[] {
+  // Towns with somebody's name on them, in roster order — which is founding
+  // order, and is already unique by id, so no further tie-break is needed. A
+  // hand-written fixture with no founders simply has nothing to say here.
+  const folk = map.sites.filter((s) => !!s.founder);
+  if (!folk.length) return [];
+
+  const rng = mulberry32(((map.seed >>> 0) ^ 0x466f4c4b) >>> 0); // 'FoLK'
+  const range = (a: number, b: number) => a + rng() * (b - a);
+  const draw = makeDrawer(rng);
+  const valley = map.valleyName;
+  const lines: { t: number; text: string; siteId?: string }[] = [];
+
+  const varsFor = (site: SiteSpec) => ({
+    town: site.name,
+    valley,
+    founder: site.founder ?? site.name,
+  });
+
+  /* --- the first roof in each new town --------------------------------- */
+  // s0 is skipped: its founding house is standing at midnight, so "first roof"
+  // is the one thing that cannot be said about it.
+  for (const site of folk.filter((s) => s.id !== 's0').slice(0, FIRST_ROOF_LINES_MAX)) {
+    const run = pl.runs.get(site.id);
+    const text = fill(draw(FIRST_ROOF_LOG), varsFor(site));
+    if (!run) continue; // trimmed out of the day entirely: nothing happened here
+    const at = run.finishes.length ? run.finishes[0].t : run.doneT;
+    lines.push({ t: clamp(at + 0.06, run.foundT + 0.1, 23.3), text, siteId: site.id });
+  }
+
+  /* --- what the town lives on ------------------------------------------ */
+  const trades = folk.filter((s) => s.profession && s.profession !== 'plain');
+  // One town of each trade first, then whoever else is left, so a valley with
+  // three logging camps and one fishing village still mentions the fish.
+  const seen = new Set<string>();
+  const firstOfEach = trades.filter((s) => {
+    if (seen.has(s.profession!)) return false;
+    seen.add(s.profession!);
+    return true;
+  });
+  const spoken = new Set(firstOfEach.map((s) => s.id));
+  const order = firstOfEach.concat(trades.filter((s) => !spoken.has(s.id)));
+  for (const site of order.slice(0, PROFESSION_LINES_MAX)) {
+    const pool = PROFESSION_LOG[site.profession as string];
+    // The draw happens whatever the schedule looks like; only `t` reads it.
+    const text = fill(draw(pool), varsFor(site));
+    const run = pl.runs.get(site.id);
+    if (!run) continue;
+    const lo = run.foundT + 0.4;
+    const hi = Math.max(lo + 0.5, run.doneT);
+    lines.push({ t: clamp(lo + range(0, 1) * (hi - lo), 0.4, 23.3), text, siteId: site.id });
+  }
+
+  /* --- and a founder being a person ------------------------------------ */
+  // Drawn from the tail of the roster so it is rarely the same town that just
+  // had its first roof reported.
+  const flavour = folk.slice(-FOUNDER_FLAVOUR_LINES_MAX);
+  for (const site of flavour) {
+    const text = fill(draw(FOUNDER_FLAVOUR_LOG), varsFor(site));
+    const run = pl.runs.get(site.id);
+    if (!run) continue;
+    const lo = Math.max(run.foundT + 0.6, 7);
+    const hi = Math.max(lo + 0.6, Math.min(run.doneT, 20));
+    lines.push({ t: clamp(range(lo, hi), 0.4, 23.3), text, siteId: site.id });
+  }
+
+  return lines;
+}
+
+/* -------------------------------------------------------------------------- */
+/* end founders and professions (additive)                                    */
+/* -------------------------------------------------------------------------- */
+
 function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   const rng = mulberry32(((map.seed >>> 0) ^ 0x10cedade) >>> 0);
   const range = (a: number, b: number) => a + rng() * (b - a);
@@ -1048,7 +1209,14 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
       key.push({
         t: run.foundT,
         siteId: sid,
-        text: fill(draw(FOUND_LOG), { town: run.site.name, valley, n: run.settlers || 3 }),
+        // founders and professions (additive): one draw either way — the pool
+        // is the founder-aware one whenever the map named somebody.
+        text: fill(draw(run.site.founder ? FOUND_LOG_FOLK : FOUND_LOG), {
+          town: run.site.name,
+          valley,
+          n: run.settlers || 3,
+          founder: run.site.founder ?? run.site.name,
+        }),
       });
     }
   }
@@ -1110,6 +1278,12 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
   // below shortens itself by however many lines this just cost.
   for (const l of ruinPass(map, pl)) key.push(l);
   /* --- end ruins (additive) ---------------------------------------------- */
+
+  /* --- founders and professions (additive): the people, and their trade --- */
+  // Same reasoning again: folded into `key` so the flavour filler shortens
+  // itself by however many lines the folk pass just cost.
+  for (const l of folkPass(map, pl)) key.push(l);
+  /* --- end founders and professions (additive) ---------------------------- */
 
   for (const sid of pl.order) {
     const run = pl.runs.get(sid)!;

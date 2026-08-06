@@ -172,6 +172,27 @@ export interface BuildingSpec {
   material?: BuildMaterial;
 }
 
+/* ==================== founders and professions (additive) ================= */
+
+/**
+ * What a town lives on, read off the ground it was founded on.
+ *
+ *   fishing  its rim comes within a few units of the river or a lake — the
+ *            same geography that tends to earn it a jetty.
+ *   logging  it was founded in thick wild wood.
+ *   farming  there is ploughed ground around it.
+ *   plain    none of the above, and the founding homestead s0, which is
+ *            everything at once and so is nothing in particular.
+ *
+ * A profession is a pure function of the FULL town roster and the terrain, so
+ * it is the same at 0.25x as at 4x. It is additive in effect: it re-weights
+ * bags that were already being rolled against (building roles, dressing
+ * flavour) and adds ledger lines. It never changes how many rolls are made.
+ */
+export type Profession = 'fishing' | 'logging' | 'farming' | 'plain';
+
+/* ================== end founders and professions (additive) ============== */
+
 export interface SiteSpec {
   id: string; // "s0", "s1" … in founding order; s0 = the first homestead
   name: string; // randomly generated town name
@@ -184,6 +205,14 @@ export interface SiteSpec {
   /** Dressing that appears as the site matures (well, lamps, crops, carts…).
    * Array order = appearance order. */
   props: PropSpec[];
+  /* ---- founders and professions (additive) ---------------------------- */
+  /** Whoever drove the first stake here. Optional so hand-written fixtures
+   * predating founders still typecheck; gen.ts always writes it. */
+  founder?: string;
+  /** What the town lives on. Optional for the same reason; absent means
+   * 'plain', and gen.ts always writes it. */
+  profession?: Profession;
+  /* ---- end founders and professions (additive) ------------------------ */
 }
 
 export interface RoadSpec {
