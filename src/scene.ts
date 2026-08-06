@@ -3222,22 +3222,38 @@ function drawSmoke(
  *    `resetWildlife` re-seeds it from the same call site `resetAmbient` uses,
  *    so a scrub backwards is as reproducible here as it is there.
  *
- * Drawing splits three ways. Ground-dwellers (deer, flock, shepherd, dog,
- * fish, ripples) are pushed as ordinary depth-sorted `Item`s *after* the crowd,
- * so they are inside the occlusion-repair pass and go behind the trunks they
- * should. Birds skip repair entirely and are drawn straight over the finished
- * item pass: they are above the canopy by the second frame of a burst, so
- * there is nothing in the valley that can legitimately stand in front of one.
- * Fireflies are drawn last of all, on the *viewport* after the sky multiply —
- * a firefly that the night fill could dim would not be a firefly.
+ * Drawing splits three ways. Ground-dwellers (deer, horses, cattle, the fox,
+ * the flock, shepherd, dog, ducks, fish, ripples) are pushed as ordinary
+ * depth-sorted `Item`s *after* the crowd, so they are inside the
+ * occlusion-repair pass and go behind the trunks they should. Birds *in flight*
+ * skip repair entirely and are drawn straight over the finished item pass: they
+ * are above the canopy by the second frame of a burst, so there is nothing in
+ * the valley that can legitimately stand in front of one. Fireflies are drawn
+ * last of all, on the *viewport* after the sky multiply — a firefly that the
+ * night fill could dim would not be a firefly.
+ *
+ * A bird that has *landed* is the one exception to that rule, and deliberately.
+ * It sits on a roof ridge for a minute at a time, which is long enough that a
+ * fir standing in front of the house would be a mistake somebody notices — so a
+ * perched bird goes through the item pass like everything else, at its
+ * building's own depth plus a hair. That puts it over its own roof (the
+ * building is an item too, half a pixel behind it, so there is nothing to
+ * z-fight) and under any trunk that is genuinely nearer, which the repair pass
+ * then paints back.
  * ========================================================================== */
 
 // A local import block, so this section can be lifted or merged in one piece.
 import {
+  STORY,
   buildBird,
+  buildCattle,
   buildDeer,
   buildDog,
+  buildDuck,
+  buildFox,
   buildGrazingSheep,
+  buildHorse,
+  buildPerchedBird,
   drawFishJump,
   drawRipple,
 } from '../vale/art';
@@ -3311,6 +3327,69 @@ interface WDog {
   phase: number;
   pose: 0 | 1;
 }
+/**
+ * A bird that has landed on a finished roof. `u` is where along the ridge it
+ * is sitting, 0..1; a hop is a step in `u`, which keeps it on the ridge line
+ * whatever the roof's pitch is.
+ */
+interface WPerch {
+  roof: WRoof;
+  u: number;
+  face: boolean;
+  /** Seconds left before it goes of its own accord. */
+  life: number;
+  /** Seconds to the next hop along the ridge. */
+  hop: number;
+  /** Wing phase, so the frame it leaves on is not always the same one. */
+  ph: number;
+}
+interface WHorse {
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  timer: number;
+  headT: number;
+  head: 0 | 1;
+  face: boolean;
+  seed: number;
+}
+interface WCow {
+  gx: number;
+  gy: number;
+  tx: number;
+  ty: number;
+  timer: number;
+  graze: boolean;
+  face: boolean;
+  seed: number;
+}
+/** One fox, one night, one field edge. `k` is how far along the edge it is. */
+interface WFox {
+  gx: number;
+  gy: number;
+  k: number;
+  /** Tiles per second along the edge; sign is the direction of travel. */
+  sp: number;
+  /** 0 stopped and listening, 1 trotting. */
+  st: 0 | 1;
+  timer: number;
+  face: boolean;
+  phase: number;
+  pose: 0 | 1;
+}
+interface WDuck {
+  bx: number;
+  by: number;
+  gx: number;
+  gy: number;
+  r: number;
+  ph: number;
+  sp: number;
+  a: number;
+  b: number;
+  face: boolean;
+}
 interface WFish {
   x: number;
   y: number;
@@ -3333,6 +3412,31 @@ interface WSpot {
   iy: number;
 }
 
+/**
+ * One roof a bird can sit on: the building it belongs to, and the two ends of
+ * its ridge in world pixels *relative to the building's ground anchor*. The
+ * anchor is a map fact, the ridge is a pure function of the building spec, and
+ * neither moves during a day — so the whole thing is cache, and all the tick
+ * has to ask the snapshot is whether the house is finished yet.
+ */
+interface WRoof {
+  bid: string;
+  gx: number;
+  gy: number;
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+}
+
+/** A patch of open green by the biggest town, and the run of fence that says
+ * somebody means to keep something in it. */
+interface WPaddock {
+  gx: number;
+  gy: number;
+  fence: { gx: number; gy: number; kind: 'fenceL' | 'fenceR' }[];
+}
+
 /** Everything derived from the *map*, which a scrub cannot change. Built once
  * per scene and kept across every reset. */
 interface WCache {
@@ -3340,6 +3444,18 @@ interface WCache {
   spots: WSpot[];
   flock: Vec2 | null;
   rgeo: RoadGeo | null;
+  /** Every ridge in the valley a bird could land on, in map order. */
+  roofs: WRoof[];
+  paddock: WPaddock | null;
+  /** Middle of a farm chunk with nothing in it — where the cattle stand. */
+  pasture: Vec2 | null;
+  /** The fox's beat: two ends of one field edge, in tiles. */
+  edge: [Vec2, Vec2] | null;
+  /** The lake the ducks are on, if the valley has one worth the trouble. */
+  lake: LakeSpec | null;
+  /** Is this valley's one night a fox night, and what hour does it start? */
+  foxNight: boolean;
+  foxAt: number;
 }
 
 interface Wildlife {
@@ -3349,9 +3465,14 @@ interface Wildlife {
   clock: number;
   cache: WCache;
   birds: WBird[];
+  perch: WPerch[];
   flies: WFly[];
   deer: WDeer[];
   sheep: WSheep[];
+  horses: WHorse[];
+  cows: WCow[];
+  fox: WFox | null;
+  ducks: WDuck[];
   herder: WHerder | null;
   dogs: WDog[];
   fish: WFish[];
@@ -3364,6 +3485,22 @@ interface Wildlife {
   deerCool: number;
   fishT: number;
   dogT: number;
+  /** Seconds to the next attempt at landing a bird on a roof. */
+  perchT: number;
+  /** Seconds to the next look round for anybody walking under a perched bird. */
+  perchScan: number;
+  /** Is this one of the nights a fox comes out at all? Rolled once, at reset. */
+  foxNight: boolean;
+  /** The hour it appears, and whether tonight's has already been and gone. */
+  foxAt: number;
+  foxDone: boolean;
+  /**
+   * True only inside `resetWildlife`'s settle loop. The settle exists so that a
+   * paused or reduced-motion arrival opens on a lived-in valley — but a fox is
+   * a *sighting*, and one frozen mid-trot in a still frame would be a fixture.
+   * So the fox, alone, declines to be settled into existence.
+   */
+  settling: boolean;
 }
 
 const WILD = new WeakMap<GenesisScene, Wildlife>();
@@ -3379,6 +3516,34 @@ const DEER_WINDOWS: [number, number][] = [
 ];
 /** Tiles between a deer and a person before the deer decides otherwise. */
 const DEER_SPOOK = 3;
+
+/* -------------------------- population ceilings --------------------------
+ * Every one of these is a hard cap, not a target. The wildlife budget is a
+ * third of a millisecond a frame and the valley is meant to feel *noticed*,
+ * not stocked: two horses in one paddock read as a farm, eight read as a fair.
+ */
+const PERCH_MAX = 3;
+const HORSE_MAX = 2;
+const COW_MAX = 3;
+const DUCK_MAX = 4;
+/** Where along a ridge a bird will sit — clear of the banner at one gable end
+ * and the chimney at the other. */
+const PERCH_U0 = 0.3;
+const PERCH_U1 = 0.7;
+/** Tiles between a perched bird and somebody walking under it. */
+const PERCH_SPOOK = 1.9;
+/** …and the odds it minds, per third-of-a-second look round. Low on purpose:
+ * a bird that leaves the first time anyone walks past is a bird nobody ever
+ * sees sitting down. */
+const PERCH_FLUSH = 0.07;
+/** The hours a village bird is up and about; outside them they are roosting. */
+const PERCH_FROM = 5.8;
+const PERCH_TO = 20.4;
+/** The fox's window. It is never out before the first, never after the second. */
+const FOX_FROM = 22.0;
+const FOX_TO = 23.5;
+/** …and only on one night in three. */
+const FOX_CHANCE = 1 / 3;
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
@@ -3397,10 +3562,32 @@ function wildCache(scene: GenesisScene): WCache {
   const dens = new Map<number, number>();
   const dkey = (cx: number, cy: number) => (cx + 1024) * 4096 + (cy + 1024);
   const cellOf = (g: number) => Math.floor(g / 3);
+  /** The same grid, holding the trees themselves. Local to this function, so it
+   * is collected the moment the cache is built — a treeline is answered by the
+   * counts above, but a paddock needs to know a horse is not standing *in* an
+   * oak, and three-tile granularity is far too coarse to say so. */
+  const cellTrees = new Map<number, TreeSpec[]>();
   for (const tr of map.trees) {
     const k = dkey(cellOf(tr.gx), cellOf(tr.gy));
     dens.set(k, (dens.get(k) ?? 0) + 1);
+    const arr = cellTrees.get(k);
+    if (arr) arr.push(tr);
+    else cellTrees.set(k, [tr]);
   }
+  /** Is there a trunk within `r` tiles of here? */
+  const treeNear = (gx: number, gy: number, r: number): boolean => {
+    const cx = cellOf(gx);
+    const cy = cellOf(gy);
+    const rad = Math.ceil(r / 3);
+    for (let dy = -rad; dy <= rad; dy++) {
+      for (let dx = -rad; dx <= rad; dx++) {
+        const arr = cellTrees.get(dkey(cx + dx, cy + dy));
+        if (!arr) continue;
+        for (const tr of arr) if (Math.hypot(tr.gx - gx, tr.gy - gy) < r) return true;
+      }
+    }
+    return false;
+  };
   /** Trees in the (2*rad+1)² block of 3-tile cells around a point. */
   const around = (gx: number, gy: number, rad: number) => {
     const cx = cellOf(gx);
@@ -3467,11 +3654,215 @@ function wildCache(scene: GenesisScene): WCache {
   const pick = best as { n: number; x: number; y: number } | null;
   if (pick && pick.n >= 2) flock = [pick.x / pick.n, pick.y / pick.n];
 
+  /* ---- open ground ------------------------------------------------------
+   * The one predicate the paddock, the pasture and the fox's beat all want:
+   * inside the framed valley, off the roads and the water, out of everybody's
+   * town, and with no more wood on it than the caller can live with. */
+  const lakes = map.lakes ?? [];
+  const clearAt = (gx: number, gy: number, pad: number, clear: number): boolean => {
+    const u = gx - gy;
+    const v = gx + gy;
+    if (u < C.u0 + 3 || u > C.u1 - 3 || v < C.v0 + 3 || v > C.v1 - 3) return false;
+    if (treeNear(gx, gy, clear)) return false;
+    for (const s of map.sites) {
+      if (Math.hypot(gx - s.gx, gy - s.gy) < s.radius + 1.4) return false;
+    }
+    for (const lk of lakes) {
+      const lu = lk.gx - lk.gy;
+      const lv = lk.gx + lk.gy;
+      if (Math.hypot(u - lu, v - lv) < Math.max(lk.rx, lk.ry) + pad + 1) return false;
+    }
+    for (let i = 1; i < map.river.length; i++) {
+      if (segDist(gx, gy, map.river[i - 1], map.river[i]) < 1.8) return false;
+    }
+    for (const rd of map.roads) {
+      for (let i = 1; i < rd.pts.length; i++) {
+        if (segDist(gx, gy, rd.pts[i - 1], rd.pts[i]) < pad) return false;
+      }
+    }
+    return true;
+  };
+
+  /* ---- rooftops, for the birds that come down off the canopy ------------- */
+  const roofs: WRoof[] = [];
+  for (const s of map.sites) {
+    for (const b of s.buildings) {
+      const r = roofRidge(b);
+      if (r) roofs.push(r);
+    }
+  }
+
+  /* ---- the horse paddock, on the edge of the biggest town ---------------- *
+   * "Biggest" is first choice, not the only one: a big town is a *busy* town,
+   * and in a valley whose largest holding has four lanes coming out of it there
+   * may simply be nowhere left to keep a horse. So the next two down get asked
+   * in turn rather than the feature quietly not shipping. */
+  const bySize = map.sites.slice().sort((a, b) => b.buildings.length - a.buildings.length);
+  /** One picket panel spans 34 art px, which is 34/TW tiles along its own
+   * diagonal — the same step `gen.ts` lays its field fences on. */
+  const PANEL = 34 / TW;
+  let paddock: WPaddock | null = null;
+  // Two passes, the second a shade less fussy. Every one of these searches is
+  // written this way: a wooded valley whose biggest town happens to sit in a
+  // fork of two lanes should still get its horses, just further out.
+  for (const room of [1, 0.78]) {
+    for (const site of bySize) {
+      for (let a = 0; a < 120 && !paddock; a++) {
+        const ang = rr() * Math.PI * 2;
+        const rad = site.radius + 2.4 + rr() * 6;
+        const gx = site.gx + Math.cos(ang) * rad;
+        const gy = site.gy + Math.sin(ang) * rad;
+        if (!clearAt(gx, gy, 1.6 * room, 2 * room)) continue;
+        // The run goes *up-screen* of the horses, so the depth sort puts the
+        // rail behind them and the paddock reads as enclosed, not fenced off.
+        const alongGx = rr() < 0.5;
+        const kind = alongGx ? 'fenceL' : 'fenceR';
+        const dx = alongGx ? PANEL : 0;
+        const dy = alongGx ? 0 : PANEL;
+        const n = 2 + (rr() < 0.5 ? 0 : 1);
+        const fx = gx - 1.5 - (dx * (n - 1)) / 2;
+        const fy = gy - 1.5 - (dy * (n - 1)) / 2;
+        const fence: WPaddock['fence'] = [];
+        for (let k = 0; k < n; k++) {
+          const px = fx + dx * k;
+          const py = fy + dy * k;
+          if (!clearAt(px, py, 1.2 * room, 1.2 * room)) break;
+          fence.push({ gx: px, gy: py, kind });
+        }
+        if (fence.length < 2) continue;
+        paddock = { gx, gy, fence };
+      }
+      if (paddock) break;
+    }
+    if (paddock) break;
+  }
+
+  /* ---- the pasture, somewhere in the farmland ---------------------------- */
+  const farm = map.chunks.filter((c) => c.biome === 'farm');
+  const green = map.chunks.filter((c) => c.biome === 'farm' || c.biome === 'meadow');
+  const inChunk = (ch: GenesisMap['chunks'][number]): Vec2 => {
+    const u = ch.u0 + 1.5 + rr() * Math.max(0.1, ch.u1 - ch.u0 - 3);
+    const v = ch.v0 + 1.5 + rr() * Math.max(0.1, ch.v1 - ch.v0 - 3);
+    return [(u + v) / 2, (v - u) / 2];
+  };
+  const openIn = (
+    stock: GenesisMap['chunks'],
+    tries: number,
+    pad: number,
+    clear: number
+  ): Vec2 | null => {
+    for (let a = 0; a < tries && stock.length; a++) {
+      const at = inChunk(stock[Math.floor(rr() * stock.length)]);
+      if (clearAt(at[0], at[1], pad, clear)) return at;
+    }
+    return null;
+  };
+  // Farmland first, because that is where cattle belong; open meadow after,
+  // because a herd on the green is better than no herd at all.
+  const pasture = openIn(farm, 240, 1.5, 1.9) ?? openIn(green, 240, 1.3, 1.4);
+
+  /* ---- and one field margin for the fox ---------------------------------- *
+   * A straight run of open ground a dozen tiles long, laid on one of the eight
+   * compass directions so it reads as a hedge line rather than as an animal
+   * cutting across a field. Sampled, not swept: a fox is allowed to pass behind
+   * a tree, it just may not spend the whole sighting behind one. */
+  let edge: [Vec2, Vec2] | null = null;
+  for (const room of [1, 0.72, 0.5]) {
+    for (let a = 0; a < 240 && !edge && green.length; a++) {
+      const A = inChunk(green[Math.floor(rr() * green.length)]);
+      if (!clearAt(A[0], A[1], 1.2 * room, 1.2 * room)) continue;
+      const d = dirs[Math.floor(rr() * dirs.length)];
+      // A looser pass takes a shorter beat too: a fox that only has eight tiles
+      // of margin is still a fox, and eight tiles is twenty seconds of it.
+      const L = (5 + 7 * room + rr() * 2) / (Math.hypot(d[0], d[1]) || 1);
+      const B: Vec2 = [A[0] + d[0] * L, A[1] + d[1] * L];
+      let ok = 0;
+      for (let k = 1; k <= 4; k++) {
+        const t = k / 4;
+        if (clearAt(A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, 1.1 * room, 1.1 * room)) {
+          ok++;
+        }
+      }
+      if (ok < 3) continue;
+      edge = [A, B];
+    }
+    if (edge) break;
+  }
+
+  /* ---- is tonight a fox night? ------------------------------------------- *
+   * This has to be a *world* question, not a wildlife-stream one: the wildlife
+   * stream is seeded from a constant, so a draw off it would give the same
+   * answer in every valley there has ever been — a fox on every night or on no
+   * night at all. So it comes off the map's own substream, where "one night in
+   * three" means one seed in three, which is what a visitor actually sees. */
+  const foxNight = rr() < FOX_CHANCE;
+  const foxAt = FOX_FROM + rr() * 0.8;
+
+  /* ---- and the biggest piece of standing water, for the ducks ------------ */
+  let lake: LakeSpec | null = null;
+  for (const lk of lakes) {
+    if (lk.rx < 2.2 || lk.ry < 2.2) continue;
+    if (!lake || lk.rx * lk.ry > lake.rx * lake.ry) lake = lk;
+  }
+
   return {
     wet,
     spots,
     flock,
     rgeo: map.river.length >= 2 ? cumulative(map.river) : null,
+    roofs,
+    paddock,
+    pasture,
+    edge,
+    lake,
+    foxNight,
+    foxAt,
+  };
+}
+
+/**
+ * Where the ridge of a finished building runs, in world pixels relative to its
+ * ground anchor. This is `drawRoof`'s own geometry read back out: a gable and a
+ * thatch share a ridge between the two eave midpoints, a hip comes to a point,
+ * and a flat roof is a deck a bird can stand anywhere on.
+ *
+ * Roofs that carry furniture — a mill's sails, a granary silo, a tower, a
+ * brewhouse kiln, a gildhall's lamp, anything with a cupola — are declined
+ * rather than dodged: there is no shortage of cottages, and a bird standing
+ * inside a windmill's sweep is worse than no bird at all.
+ */
+function roofRidge(b: BuildingSpec): WRoof | null {
+  if (b.cupola) return null;
+  if (
+    b.role === 'tower' ||
+    b.role === 'mill' ||
+    b.role === 'granary' ||
+    b.role === 'brewhouse' ||
+    b.role === 'gildhall'
+  ) {
+    return null;
+  }
+  const W = Math.max(16, Math.round(b.w / 4) * 4);
+  const wallH = b.floors * STORY;
+  const base = { bid: b.id, gx: b.gx, gy: b.gy };
+  if (b.roof === 'flat') {
+    const y = -wallH - 5;
+    return { ...base, ax: -W / 4, ay: y, bx: W / 4, by: y };
+  }
+  const roofH = Math.round(W * (b.roof === 'thatch' ? 0.34 : 0.3));
+  if (b.roof === 'hip') {
+    // An apex is a point, not a line; give it a pixel either side so a hop
+    // still moves the bird instead of jittering it in place.
+    const y = -wallH - roofH + 1;
+    return { ...base, ax: -1.5, ay: y, bx: 1.5, by: y };
+  }
+  const RW = W + 8;
+  return {
+    ...base,
+    ax: -RW / 4,
+    ay: -wallH - RW / 8 - roofH,
+    bx: RW / 4,
+    by: -wallH + RW / 8 - roofH,
   };
 }
 
@@ -3484,9 +3875,14 @@ function ensureWild(scene: GenesisScene): Wildlife {
     clock: -1,
     cache: wildCache(scene),
     birds: [],
+    perch: [],
     flies: [],
     deer: [],
     sheep: [],
+    horses: [],
+    cows: [],
+    fox: null,
+    ducks: [],
     herder: null,
     dogs: [],
     fish: [],
@@ -3497,6 +3893,12 @@ function ensureWild(scene: GenesisScene): Wildlife {
     deerCool: 0,
     fishT: 6,
     dogT: 0,
+    perchT: 0,
+    perchScan: 0,
+    foxNight: false,
+    foxAt: FOX_FROM,
+    foxDone: false,
+    settling: false,
   };
   WILD.set(scene, wl);
   return wl;
@@ -3512,6 +3914,7 @@ export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   wl.rng = mulberry32(WILD_SEED);
   wl.clock = -1;
   wl.birds.length = 0;
+  wl.perch.length = 0;
   wl.deer.length = 0;
   wl.dogs.length = 0;
   wl.fish.length = 0;
@@ -3519,6 +3922,17 @@ export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   wl.deerCool = 0;
   wl.fishT = 6 + wl.rng() * 18;
   wl.dogT = 0;
+  // Short, so the settle below lands a bird or two and a frozen tableau opens
+  // with the rooftops already occupied.
+  wl.perchT = 0.5 + wl.rng() * 2;
+  wl.perchScan = 0;
+  // Whether tonight is a fox night is a fact about the valley, decided once in
+  // the map cache — so a scrub back through the evening finds the same answer,
+  // and so does a reload.
+  wl.foxNight = wl.cache.foxNight;
+  wl.foxAt = wl.cache.foxAt;
+  wl.foxDone = false;
+  wl.fox = null;
   // Whatever the axe has already got to is history, not an event: only a tree
   // that goes under it while we are watching is worth a bird.
   wl.seen.clear();
@@ -3526,11 +3940,16 @@ export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   wl.treeSize = snap.trees.size;
   seedFlies(wl);
   seedFlock(wl);
+  seedPaddock(wl);
+  seedPasture(wl);
+  seedDucks(wl);
   wl.ready = true;
   // Settle, so a paused arrival or a deep link into an hour never opens on a
   // flock standing to attention in a perfect ring.
   const sky = skyAt(snap.t);
+  wl.settling = true;
   for (let i = 0; i < 40; i++) stepWildlife(scene, amb, snap, sky, wl, 0.2);
+  wl.settling = false;
 }
 
 function seedFlies(wl: Wildlife): void {
@@ -3644,9 +4063,14 @@ function stepWildlife(
 ): void {
   stepBursts(scene, wl, snap);
   stepBirds(wl, dt);
+  stepPerch(scene, amb, wl, snap, dt);
   stepFlies(wl, dt);
   stepDeer(scene, amb, wl, dt);
   stepFlock(wl, dt);
+  stepHorses(wl, dt);
+  stepCows(wl, dt);
+  stepFox(wl, snap, dt);
+  stepDucks(wl, dt, sky);
   stepDogs(scene, amb, wl, dt);
   stepFish(scene, wl, dt, sky);
 }
@@ -3916,6 +4340,363 @@ function stepFlock(wl: Wildlife, dt: number): void {
   h.timer = 3 + rng() * 6;
 }
 
+/* ------------------------------ the paddock ------------------------------- */
+
+function seedPaddock(wl: Wildlife): void {
+  wl.horses.length = 0;
+  const pad = wl.cache.paddock;
+  if (!pad) return;
+  const rng = wl.rng;
+  const n = rng() < 0.55 ? 2 : 1;
+  for (let i = 0; i < Math.min(HORSE_MAX, n); i++) {
+    const a = rng() * Math.PI * 2;
+    const r = 0.6 + rng() * 1.4;
+    const gx = pad.gx + Math.cos(a) * r;
+    const gy = pad.gy + Math.sin(a) * r;
+    wl.horses.push({
+      gx,
+      gy,
+      tx: gx,
+      ty: gy,
+      timer: 1 + rng() * 5,
+      headT: rng() * 3,
+      head: rng() < 0.7 ? 1 : 0,
+      face: rng() < 0.5,
+      seed: 1300 + Math.floor(rng() * 900),
+    });
+  }
+}
+
+/**
+ * A horse in a paddock has nowhere to be. It puts its head down, picks it up,
+ * walks two lengths and puts it down again — and, unlike the deer, nothing on
+ * the ground can make it do anything else: a bolting horse would pull the eye
+ * clean off whatever the day is actually doing.
+ */
+function stepHorses(wl: Wildlife, dt: number): void {
+  const pad = wl.cache.paddock;
+  if (!pad || !wl.horses.length) return;
+  const rng = wl.rng;
+  for (const h of wl.horses) {
+    h.headT -= dt;
+    if (h.headT <= 0) {
+      h.head = h.head ? 0 : 1;
+      h.headT = (h.head ? 4 + rng() * 6 : 2 + rng() * 4) * 1;
+    }
+    const dx = h.tx - h.gx;
+    const dy = h.ty - h.gy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0.12) {
+      const step = Math.min(dist, 0.34 * dt);
+      h.gx += (dx / dist) * step;
+      h.gy += (dy / dist) * step;
+      const sdx = dx - dy;
+      if (Math.abs(sdx) > 0.01) h.face = sdx > 0;
+      h.head = 0;
+      h.headT = Math.max(h.headT, 0.8);
+      continue;
+    }
+    h.timer -= dt;
+    if (h.timer > 0) continue;
+    if (rng() < 0.5) {
+      const a = rng() * Math.PI * 2;
+      const r = 0.5 + rng() * 1.6;
+      h.tx = pad.gx + Math.cos(a) * r;
+      h.ty = pad.gy + Math.sin(a) * r;
+    }
+    h.timer = 5 + rng() * 9;
+  }
+}
+
+/* ------------------------------- the pasture ------------------------------ */
+
+function seedPasture(wl: Wildlife): void {
+  wl.cows.length = 0;
+  const at = wl.cache.pasture;
+  if (!at) return;
+  const rng = wl.rng;
+  const n = 2 + Math.floor(rng() * 2);
+  for (let i = 0; i < Math.min(COW_MAX, n); i++) {
+    const a = rng() * Math.PI * 2;
+    const r = 0.8 + rng() * 1.8;
+    const gx = at[0] + Math.cos(a) * r;
+    const gy = at[1] + Math.sin(a) * r;
+    wl.cows.push({
+      gx,
+      gy,
+      tx: gx,
+      ty: gy,
+      timer: rng() * 6,
+      graze: rng() < 0.7,
+      face: rng() < 0.5,
+      seed: 1700 + Math.floor(rng() * 900),
+    });
+  }
+}
+
+/** Cattle, on the flock's own state machine with the speeds halved. */
+function stepCows(wl: Wildlife, dt: number): void {
+  const at = wl.cache.pasture;
+  if (!at || !wl.cows.length) return;
+  const rng = wl.rng;
+  for (const c of wl.cows) {
+    c.timer -= dt;
+    const dx = c.tx - c.gx;
+    const dy = c.ty - c.gy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0.12 && !c.graze) {
+      const step = Math.min(dist, 0.22 * dt);
+      c.gx += (dx / dist) * step;
+      c.gy += (dy / dist) * step;
+      const sdx = dx - dy;
+      if (Math.abs(sdx) > 0.01) c.face = sdx > 0;
+    }
+    if (c.timer > 0) continue;
+    c.graze = !c.graze;
+    c.timer = c.graze ? 6 + rng() * 8 : 3 + rng() * 5;
+    if (!c.graze) {
+      const a = rng() * Math.PI * 2;
+      const r = 0.8 + rng() * 2;
+      c.tx = at[0] + Math.cos(a) * r;
+      c.ty = at[1] + Math.sin(a) * r;
+    }
+  }
+}
+
+/* --------------------------- the fox, some nights ------------------------- */
+
+/**
+ * One animal, one beat, one night in three — and never during a settle, so a
+ * frozen valley has no fox in it at all. That is the whole design: it has to be
+ * something a visitor catches, not something they can go and look at.
+ */
+function stepFox(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
+  const edge = wl.cache.edge;
+  if (!edge) return;
+  const out = snap.t < FOX_FROM || snap.t >= FOX_TO;
+  if (out) {
+    // A new evening rearms it; anything outside the window puts it away.
+    if (wl.fox) wl.fox = null;
+    if (snap.t < FOX_FROM) wl.foxDone = false;
+    return;
+  }
+  if (!wl.fox) {
+    if (wl.settling || wl.foxDone || !wl.foxNight || snap.t < wl.foxAt) return;
+    const rng = wl.rng;
+    // Which end it comes in at. `sp` carries the sign, so the step below needs
+    // no second field to remember which way round the beat is being walked.
+    const back = rng() < 0.5;
+    const A = back ? edge[1] : edge[0];
+    const B = back ? edge[0] : edge[1];
+    const len = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1;
+    wl.fox = {
+      gx: A[0],
+      gy: A[1],
+      k: 0,
+      // Tiles a second, normalised to the length of the beat. Quicker than a
+      // deer ambles and slower than a settler walks, which between them is the
+      // whole of what "trotting" looks like from across a valley.
+      sp: ((back ? -1 : 1) * (1.1 + rng() * 0.4)) / len,
+      st: 1,
+      timer: 3 + rng() * 5,
+      face: B[0] - A[0] - (B[1] - A[1]) > 0,
+      phase: 0,
+      pose: 0,
+    };
+    return;
+  }
+
+  const f = wl.fox;
+  const rng = wl.rng;
+  const back = f.sp < 0;
+  const A = edge[0];
+  const B = edge[1];
+  f.timer -= dt;
+  if (f.st === 1) {
+    f.k += Math.abs(f.sp) * dt;
+    f.phase += dt;
+    f.pose = Math.floor(f.phase * 6) % 2 === 0 ? 0 : 1;
+    if (f.k >= 1) {
+      wl.fox = null;
+      wl.foxDone = true;
+      return;
+    }
+    if (f.timer <= 0) {
+      // Stops, listens, moves on. This is most of what makes it read as a fox.
+      f.st = 0;
+      f.timer = 1.2 + rng() * 2.2;
+    }
+  } else if (f.timer <= 0) {
+    f.st = 1;
+    f.timer = 3 + rng() * 6;
+  }
+  const t = back ? 1 - f.k : f.k;
+  f.gx = A[0] + (B[0] - A[0]) * t;
+  f.gy = A[1] + (B[1] - A[1]) * t;
+}
+
+/* --------------------------------- ducks ---------------------------------- */
+
+function seedDucks(wl: Wildlife): void {
+  wl.ducks.length = 0;
+  const lk = wl.cache.lake;
+  if (!lk) return;
+  const rng = wl.rng;
+  const n = 3 + Math.floor(rng() * 2);
+  // Inside the analytic ellipse with a margin, so a duck never drifts onto the
+  // bank however the outline wobbles.
+  const ru = Math.max(1, lk.rx * 0.5);
+  const rv = Math.max(1, lk.ry * 0.5);
+  const lu = lk.gx - lk.gy;
+  const lv = lk.gx + lk.gy;
+  for (let i = 0; i < Math.min(DUCK_MAX, n); i++) {
+    const a = rng() * Math.PI * 2;
+    const r = Math.sqrt(rng());
+    const u = lu + Math.cos(lk.rot) * Math.cos(a) * ru * r - Math.sin(lk.rot) * Math.sin(a) * rv * r;
+    const v = lv + Math.sin(lk.rot) * Math.cos(a) * ru * r + Math.cos(lk.rot) * Math.sin(a) * rv * r;
+    const gx = (u + v) / 2;
+    const gy = (v - u) / 2;
+    wl.ducks.push({
+      bx: gx,
+      by: gy,
+      gx,
+      gy,
+      r: 0.5 + rng() * 0.7,
+      ph: rng() * 12,
+      sp: 0.16 + rng() * 0.14,
+      a: rng() * 6.283,
+      b: rng() * 6.283,
+      face: rng() < 0.5,
+    });
+  }
+}
+
+/** A duck does not swim anywhere; it drifts. Two slow sines, like a firefly
+ * with the speed taken out of it and the height taken off. */
+function stepDucks(wl: Wildlife, dt: number, sky: Sky): void {
+  if (!wl.ducks.length || sky.night > 0.5) return;
+  for (const d of wl.ducks) {
+    d.ph += dt * d.sp;
+    const gx = d.bx + Math.sin(d.ph * 0.83 + d.a) * d.r;
+    const gy = d.by + Math.sin(d.ph * 0.61 + d.b) * d.r;
+    const sdx = gx - d.gx - (gy - d.gy);
+    if (Math.abs(sdx) > 0.0008) d.face = sdx > 0;
+    d.gx = gx;
+    d.gy = gy;
+  }
+}
+
+/* ------------------------- birds on a finished roof ----------------------- */
+
+/**
+ * The calm counterpart to the chop burst. A bird comes down onto a ridge, sits
+ * there for the best part of a minute, hops along it once or twice, and goes —
+ * unless somebody walks under the eaves first, in which case it goes rather
+ * sooner and rather less tidily.
+ */
+function stepPerch(
+  scene: GenesisScene,
+  amb: Ambient,
+  wl: Wildlife,
+  snap: WorldSnapshot,
+  dt: number
+): void {
+  const rng = wl.rng;
+  const roofs = wl.cache.roofs;
+  const daylight = snap.t >= PERCH_FROM && snap.t < PERCH_TO;
+
+  /* ---- landing ---------------------------------------------------------- */
+  wl.perchT -= dt;
+  if (wl.perchT <= 0) {
+    wl.perchT = 6 + rng() * 14;
+    if (daylight && wl.perch.length < PERCH_MAX && roofs.length) {
+      for (let a = 0; a < 6; a++) {
+        const rf = roofs[Math.floor(rng() * roofs.length)];
+        if (snap.buildings.get(rf.bid)?.status !== 'done') continue;
+        if (wl.perch.some((p) => p.roof.bid === rf.bid)) continue;
+        wl.perch.push({
+          roof: rf,
+          u: PERCH_U0 + rng() * (PERCH_U1 - PERCH_U0),
+          face: rng() < 0.5,
+          life: 20 + rng() * 40,
+          hop: 4 + rng() * 9,
+          ph: rng() * 6,
+        });
+        break;
+      }
+    }
+  }
+  if (!wl.perch.length) return;
+
+  /* ---- anybody coming? --------------------------------------------------- */
+  // On a coarse cadence: three birds against a pace-4 crowd every frame would
+  // cost more than the rest of the wildlife put together, and a bird that takes
+  // a third of a second to notice a passing cart is a bird.
+  let flush = -1;
+  wl.perchScan -= dt;
+  if (wl.perchScan <= 0) {
+    wl.perchScan = 0.35;
+    outer: for (let i = 0; i < wl.perch.length; i++) {
+      const rf = wl.perch[i].roof;
+      // Somebody *passing*, not somebody there. A crew stands at a plot for
+      // half the afternoon; if standing about counted, no bird would ever get
+      // to sit down in a town at all.
+      for (const b of amb.bots) {
+        if (b.action !== 'walk') continue;
+        if (Math.abs(b.gx - rf.gx) > PERCH_SPOOK || Math.abs(b.gy - rf.gy) > PERCH_SPOOK) continue;
+        if (rng() < PERCH_FLUSH) {
+          flush = i;
+          break outer;
+        }
+      }
+      for (const w of amb.walkers) {
+        if (Math.abs(w.gx - rf.gx) > PERCH_SPOOK || Math.abs(w.gy - rf.gy) > PERCH_SPOOK) continue;
+        if (rng() < PERCH_FLUSH) {
+          flush = i;
+          break outer;
+        }
+      }
+    }
+  }
+
+  for (let i = wl.perch.length - 1; i >= 0; i--) {
+    const p = wl.perch[i];
+    p.life -= dt;
+    p.hop -= dt;
+    if (p.hop <= 0) {
+      // A hop is a step along the ridge and, half the time, a turn on the spot.
+      const d = (rng() < 0.5 ? -1 : 1) * (0.1 + rng() * 0.18);
+      const u = p.u + d;
+      p.u = u < PERCH_U0 ? PERCH_U0 : u > PERCH_U1 ? PERCH_U1 : u;
+      if (rng() < 0.5) p.face = !p.face;
+      p.hop = 4 + rng() * 9;
+    }
+    if (p.life > 0 && i !== flush && daylight) continue;
+    // Off it goes: the perch becomes an ordinary flying bird, one storey up.
+    const at = perchAt(p);
+    const away = p.face ? 1 : -1;
+    wl.birds.push({
+      x: at[0],
+      y: at[1] - 2,
+      vx: away * (26 + rng() * 30),
+      vy: -(18 + rng() * 14),
+      age: 0,
+      life: 1.8 + rng() * 0.9,
+      ph: p.ph,
+    });
+    wl.perch.splice(i, 1);
+  }
+}
+
+/** World-pixel position of a perched bird's feet. */
+function perchAt(p: WPerch): Vec2 {
+  const r = p.roof;
+  return [
+    isoX(r.gx, r.gy) + r.ax + (r.bx - r.ax) * p.u,
+    isoY(r.gx, r.gy) + r.ay + (r.by - r.ay) * p.u,
+  ];
+}
+
 /* ---------------------------- dogs behind carts --------------------------- */
 
 function stepDogs(scene: GenesisScene, amb: Ambient, wl: Wildlife, dt: number): void {
@@ -4064,6 +4845,89 @@ function pushWildlife(
       s.gx,
       s.gy
     );
+  }
+
+  /* ---- the paddock, and what is standing in it -------------------------- */
+  // The rail is scenery, but scenery the *scene* placed rather than `gen.ts`,
+  // so it rides in with the wildlife instead of the bake. Two or three sprites
+  // is nothing to redraw, and going through the item pass is what keeps a horse
+  // that has walked down-screen of the fence in front of it.
+  const pad = wl.cache.paddock;
+  if (pad) {
+    for (const f of pad.fence) add(scene.pools[f.kind][0], f.gx, f.gy, 0);
+  }
+  for (const h of wl.horses) {
+    add(
+      cached(scene, `wh:${h.head}:${h.face ? 1 : 0}:${h.seed % 3}`, () =>
+        buildHorse(h.head, h.face, h.seed)
+      ),
+      h.gx,
+      h.gy
+    );
+  }
+
+  for (const c of wl.cows) {
+    add(
+      cached(scene, `wc:${c.seed % 4}:${c.face ? 1 : 0}:${c.graze ? 1 : 0}`, () =>
+        buildCattle(c.seed, c.face, c.graze)
+      ),
+      c.gx,
+      c.gy
+    );
+  }
+
+  const fox = wl.fox;
+  if (fox) {
+    add(
+      cached(scene, `wf:${fox.st === 1 ? fox.pose : 0}:${fox.face ? 1 : 0}`, () =>
+        buildFox(fox.st === 1 ? fox.pose : 0, fox.face)
+      ),
+      fox.gx,
+      fox.gy
+    );
+  }
+
+  for (const d of wl.ducks) {
+    const x = isoX(d.gx, d.gy);
+    const y = isoY(d.gx, d.gy);
+    if (!seen(x, y)) continue;
+    // The wake first and a shade behind, so the duck sits inside its own ring.
+    items.push({
+      depth: y - 0.5,
+      bx: Math.round(x - 5),
+      by: Math.round(y - 3),
+      bw: 10,
+      bh: 6,
+      draw: (c) => drawRipple(c, x, y, 4, 0.3),
+    });
+    const frame: 0 | 1 = Math.floor(d.ph * 1.7) % 2 === 0 ? 0 : 1;
+    add(
+      cached(scene, `wk:${frame}:${d.face ? 1 : 0}`, () => buildDuck(frame, d.face)),
+      d.gx,
+      d.gy
+    );
+  }
+
+  /* ---- and the birds that are sitting still ------------------------------
+   * Depth is the *building's* ground line plus a hair, which is the one number
+   * that gets this right: the building itself is an item at exactly that line,
+   * so the bird lands on top of its own roof with nothing to tie-break, and any
+   * trunk genuinely nearer than the house still sorts in front and is repaired
+   * back over it by the pass below. */
+  for (const p of wl.perch) {
+    const at = perchAt(p);
+    if (!seen(at[0], at[1])) continue;
+    const sp = cached(scene, `wp:${p.face ? 1 : 0}`, () => buildPerchedBird(p.face));
+    const bx = Math.round(at[0] - sp.ox);
+    const by = Math.round(at[1] - sp.oy);
+    items.push({
+      depth: isoY(p.roof.gx, p.roof.gy) + 0.5,
+      bx,
+      by,
+      bw: sp.c.width,
+      bh: sp.c.height,
+      draw: (c) => c.drawImage(sp.c, bx, by),
+    });
   }
 
   const h = wl.herder;

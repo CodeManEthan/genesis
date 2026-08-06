@@ -1783,6 +1783,28 @@ const FUR = {
   birdWing: '#5d5675',
   fish: '#8fb9cc',
   fishDark: '#6d95a8',
+  // A paddock horse, in the two coats a valley this size would actually keep:
+  // a bay with a black mane, and a grey. Both are two steps off the deer's
+  // brown so a horse is never mistaken for one at the fitted overview.
+  horse: '#8b5f3d',
+  horseDark: '#66452b',
+  horseMane: '#3d2c22',
+  horseGrey: '#cfc6bb',
+  horseGreyDark: '#9d9488',
+  // Patched cattle: the brown is darker than the deer's and the white is the
+  // sheep's, which is exactly the pair that reads as "cow" at four pixels.
+  cow: '#7a5138',
+  cowDark: '#563727',
+  cowPale: '#f4efe6',
+  // The fox is the only warm orange on the ground, and it only ever appears
+  // against night grass — which is what makes a sighting a sighting.
+  fox: '#c4693a',
+  foxDark: '#9a4a26',
+  foxPale: '#f0e6d8',
+  duck: '#57506e',
+  duckDark: '#3a3450',
+  duckPale: '#e9e3d6',
+  duckBill: '#e0a35a',
 } as const;
 
 /**
@@ -1957,4 +1979,180 @@ export function drawRipple(ctx: Ctx, x: number, y: number, r: number, alpha: num
     ctx.fillRect(Math.round(x + Math.cos(a) * r), Math.round(y + Math.sin(a) * r * 0.5), 1, 1);
   }
   ctx.globalAlpha = prev;
+}
+
+/* --------------------------- more wildlife ------------------------------- *
+ * A second course of animals, on the same terms as the first: additive, keyed
+ * off nothing above this line, and drawn to the same scale ladder —
+ *
+ *   duck 5px · fox 10px · sheep 12px · deer 17px · cattle 17px · horse 21px
+ *
+ * measured as the sprite's anchor height, which is what the eye actually
+ * compares because every one of them stands on the same ground diamond.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A paddock horse. Two poses — 0 head up, 1 head down at the grass — and a
+ * coat rolled off `seed`, so a pair in the same field is a bay and a grey
+ * rather than the same animal twice.
+ */
+export function buildHorse(pose: 0 | 1, faceRight: boolean, seed: number): Sprite {
+  const grey = mulberry32(seed)() < 0.42;
+  const coat = grey ? FUR.horseGrey : FUR.horse;
+  const dark = grey ? FUR.horseGreyDark : FUR.horseDark;
+  const mane = grey ? FUR.horseGreyDark : FUR.horseMane;
+  return makeSprite(30, 30, 15, 26, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(0, 1, 16), PAL.shadowSoft);
+
+    // legs — long, because leg length against barrel depth is the entire
+    // difference between a horse and a cow at this size. The far pair a shade
+    // darker, which is the whole of the depth cue.
+    rect(ctx, -5, -8, 2, 8, dark);
+    rect(ctx, -2, -8, 2, 8, coat);
+    rect(ctx, 2, -8, 2, 8, coat);
+    rect(ctx, 5, -8, 2, 8, dark);
+    rect(ctx, -5, -1, 2, 1, PAL.ink);
+    rect(ctx, 2, -1, 2, 1, PAL.ink);
+
+    // barrel
+    blob(ctx, 0, -14, [10, 13, 13, 12, 10, 8], coat);
+    blob(ctx, -1, -13, [8, 7], shade(coat, 0.13));
+    rect(ctx, -3, -15, 8, 1, shade(coat, 0.18)); // the light along the back
+
+    // tail, hanging off the quarters
+    rect(ctx, -8, -14, 2, 8, mane);
+    rect(ctx, -7, -6, 1, 1, mane);
+
+    if (pose === 0) {
+      rect(ctx, 4, -21, 3, 8, coat); // neck
+      rect(ctx, 3, -21, 2, 8, mane); // mane down the crest
+      rect(ctx, 6, -23, 5, 3, coat); // head
+      rect(ctx, 10, -22, 2, 2, dark); // muzzle
+      rect(ctx, 6, -24, 1, 2, coat); // ears
+      rect(ctx, 8, -24, 1, 2, coat);
+      rect(ctx, 9, -23, 1, 1, PAL.ink); // eye
+    } else {
+      rect(ctx, 5, -15, 3, 8, coat); // neck, dropped
+      rect(ctx, 4, -15, 2, 7, mane);
+      rect(ctx, 7, -8, 4, 3, coat); // head at the grass
+      rect(ctx, 10, -6, 2, 2, dark);
+      rect(ctx, 7, -9, 1, 1, coat); // ear
+      rect(ctx, 9, -7, 1, 1, PAL.ink);
+    }
+  });
+}
+
+/**
+ * A patched cow. Lower and heavier than the horse, and the patches are rolled
+ * so a cluster of three is a herd rather than a row of clones. `grazing` drops
+ * the head; the horns stay on either way, because they are what says cattle.
+ */
+export function buildCattle(seed: number, faceRight: boolean, grazing: boolean): Sprite {
+  const rng = mulberry32(seed);
+  const belted = rng() < 0.35;
+  const p1 = -6 + Math.round(rng() * 4);
+  const p2 = 1 + Math.round(rng() * 3);
+  return makeSprite(28, 24, 14, 20, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(0, 1, 15), PAL.shadowSoft);
+
+    rect(ctx, -5, -5, 2, 5, FUR.cowDark);
+    rect(ctx, -2, -5, 2, 5, FUR.cow);
+    rect(ctx, 2, -5, 2, 5, FUR.cow);
+    rect(ctx, 5, -5, 2, 5, FUR.cowDark);
+    rect(ctx, -5, -1, 2, 1, PAL.ink);
+    rect(ctx, 2, -1, 2, 1, PAL.ink);
+
+    blob(ctx, 0, -12, [10, 13, 14, 14, 12, 9, 7], FUR.cow);
+    // white: a belt round the barrel, or two loose patches on the flank
+    if (belted) {
+      rect(ctx, -3, -11, 4, 6, FUR.cowPale);
+    } else {
+      rect(ctx, p1, -11, 3, 3, FUR.cowPale);
+      rect(ctx, p2, -9, 3, 3, FUR.cowPale);
+    }
+    rect(ctx, -4, -13, 9, 1, shade(FUR.cow, 0.16));
+    rect(ctx, -8, -12, 1, 5, FUR.cowDark); // tail
+    rect(ctx, -8, -7, 1, 1, PAL.ink); // …with a black switch
+
+    if (grazing) {
+      rect(ctx, 5, -11, 3, 5, FUR.cow); // neck, dropped
+      rect(ctx, 7, -7, 4, 3, FUR.cowPale); // white face at the grass
+      rect(ctx, 10, -6, 1, 2, PAL.ink);
+      rect(ctx, 7, -9, 1, 2, FUR.cowPale); // horn
+      rect(ctx, 9, -9, 1, 2, FUR.cowPale);
+    } else {
+      rect(ctx, 5, -16, 3, 5, FUR.cow); // neck
+      rect(ctx, 7, -17, 4, 4, FUR.cowPale); // head
+      rect(ctx, 10, -15, 2, 2, PAL.ink); // muzzle
+      rect(ctx, 6, -18, 1, 1, FUR.cowPale); // horns
+      rect(ctx, 10, -18, 1, 1, FUR.cowPale);
+      rect(ctx, 9, -16, 1, 1, PAL.ink); // eye
+    }
+  });
+}
+
+/**
+ * A fox on the move. Two frames of a trot, and nothing else: it is never
+ * standing still long enough to want a second pose, and the brush is doing
+ * most of the identifying work at this size anyway.
+ */
+export function buildFox(pose: 0 | 1, faceRight: boolean): Sprite {
+  return makeSprite(22, 18, 10, 14, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    poly(ctx, diamond(0, 1, 11), PAL.shadowSoft);
+    const spread = pose === 0 ? 0 : 1;
+    rect(ctx, -3 - spread, -3, 1, 3, FUR.foxDark);
+    rect(ctx, -1, -3, 1, 3, FUR.foxDark);
+    rect(ctx, 2, -3, 1, 3, FUR.foxDark);
+    rect(ctx, 4 + spread, -3, 1, 3, FUR.foxDark);
+
+    blob(ctx, 0, -8, [7, 10, 10, 9, 7], FUR.fox);
+    rect(ctx, -1, -6, 6, 1, shade(FUR.fox, 0.2)); // the pale line along the flank
+    rect(ctx, 4, -11, 4, 3, FUR.fox); // head
+    rect(ctx, 7, -10, 3, 1, FUR.foxDark); // long snout
+    rect(ctx, 4, -12, 1, 1, FUR.foxDark); // ears
+    rect(ctx, 6, -12, 1, 1, FUR.foxDark);
+    rect(ctx, 6, -10, 1, 1, PAL.ink); // eye
+    rect(ctx, 5, -9, 3, 1, FUR.foxPale); // white cheek
+
+    // brush: level with the back and half the animal again in length
+    rect(ctx, -8, -9 - pose, 4, 3, FUR.fox);
+    rect(ctx, -10, -9 - pose, 2, 2, FUR.foxPale);
+  });
+}
+
+/**
+ * The same bird as `buildBird`, sitting down. Wings folded, tail out behind,
+ * three pixels across instead of seven — a flying frame parked on a roof ridge
+ * reads as a bird stuck mid-flap, which is the one thing a perch must not do.
+ */
+export function buildPerchedBird(faceRight: boolean): Sprite {
+  return makeSprite(10, 10, 5, 6, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    rect(ctx, -1, -3, 3, 3, FUR.bird); // body
+    rect(ctx, -1, -3, 2, 2, FUR.birdWing); // folded wing
+    rect(ctx, 1, -5, 2, 2, FUR.bird); // head
+    rect(ctx, 3, -4, 1, 1, FUR.birdWing); // beak
+    rect(ctx, -3, -2, 2, 1, FUR.bird); // tail
+    rect(ctx, 0, -1, 1, 1, PAL.ink); // leg
+  });
+}
+
+/**
+ * A duck on open water. Five pixels of it, so the two frames are a head bob
+ * rather than a wingbeat — at this size the wake behind it is doing more of
+ * the work than the bird is.
+ */
+export function buildDuck(frame: 0 | 1, faceRight: boolean): Sprite {
+  return makeSprite(14, 12, 7, 8, (ctx) => {
+    if (!faceRight) ctx.scale(-1, 1);
+    const bob = frame;
+    blob(ctx, 0, -3 + bob, [5, 6, 4], FUR.duck);
+    rect(ctx, -3, -3 + bob, 2, 1, FUR.duckDark); // tail
+    rect(ctx, 1, -5 + bob, 2, 2, FUR.duckDark); // head
+    rect(ctx, 3, -4 + bob, 2, 1, FUR.duckBill);
+    rect(ctx, 1, -4 + bob, 1, 1, FUR.duckPale); // collar
+  });
 }
