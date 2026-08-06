@@ -42,11 +42,13 @@ import {
   bakeLake,
   drawBridge,
   drawFirefly,
+  drawFord,
   fireflyBlink,
   makePools,
   outcropTint,
   paintRoad,
   skyAt,
+  strip,
 } from './scene';
 import {
   ACCENTS,
@@ -371,6 +373,29 @@ function bridgeCanvas(stage: 1 | 2 | 3): HTMLCanvasElement {
   ];
   return bake(150, 66, 75, 40, (ctx) => {
     drawBridge(ctx, river, 0, 0, 4, stage);
+  });
+}
+
+function fordCanvas(): HTMLCanvasElement {
+  // Same reach of river as the bridge tile, with the track that fords it laid
+  // underneath — a ford is drawn over the road, so drawing it over bare water
+  // would not be the thing the renderer actually produces.
+  const river: Vec2[] = [
+    [-5, -5],
+    [5, 5],
+  ];
+  const road: Vec2[] = [
+    [-3, 3],
+    [0, 0],
+    [3, -3],
+  ];
+  return bake(150, 66, 75, 40, (ctx) => {
+    strip(ctx, river, 0.95 + 0.75, PAL.sand);
+    strip(ctx, river, 0.95, PAL.waterDeep);
+    strip(ctx, river, 0.95 * 0.76, PAL.water);
+    strip(ctx, river, 0.95 * 0.34, PAL.waterLight);
+    paintRoad(ctx, road, 'track', 0.4, 2024);
+    drawFord(ctx, river, 0, 0, 3.4);
   });
 }
 
@@ -1104,11 +1129,16 @@ export default function Catalog() {
 
   const bridges = useMemo(
     () =>
-      ([1, 2, 3] as const).map((s) =>
-        item(`br-${s}`, `bridge stage ${s}`, bridgeCanvas(s), {
-          sub: s === 1 ? 'pilings' : s === 2 ? 'deck' : 'rails / done',
-        })
-      ),
+      [
+        ...([1, 2, 3] as const).map((s) =>
+          item(`br-${s}`, `bridge stage ${s}`, bridgeCanvas(s), {
+            sub: s === 1 ? 'pilings' : s === 2 ? 'deck' : 'rails / done',
+          })
+        ),
+        // What the lightest road class does instead. No stages: it is terrain
+        // plus footfall, and it looks like this from midnight onwards.
+        item('fd-0', 'ford', fordCanvas(), { sub: 'tracks only · no build stages' }),
+      ],
     []
   );
 
@@ -1277,7 +1307,7 @@ export default function Catalog() {
           count={counts.infra}
           blurb="Bridges by stage, one sample of each road kind over meadow, and the biome tints the ground bake blends between."
         >
-          <Row title="Bridges" items={bridges} />
+          <Row title="Crossings" items={bridges} />
           <Row title="Roads" note="Verge, edge, carriageway, centre — a highway alone gets the pale crown." items={roads} />
           <Row title="Biome ground" items={grounds} />
         </Section>

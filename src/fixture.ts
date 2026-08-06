@@ -429,8 +429,30 @@ export function fixtureMap(opts: { lakes?: boolean; quarry?: boolean } = {}): Ge
           P(16, 22),
         ],
       },
+      // The back track, which loops south and takes the river the cheap way.
+      // Having both classes cross the same water is the point of it: the
+      // highway gets a bridge, the track gets a ford, and one frame shows both.
+      {
+        id: 'r1',
+        kind: 'track',
+        width: 0.4,
+        from: 's1',
+        to: 's0',
+        pts: [
+          P(16, 22),
+          P(13, 29),
+          P(10, 35),
+          P(6.5, 39),
+          P(2.93, 41),
+          P(-1, 41.5),
+          P(-6, 39),
+          P(-11, 34),
+          P(-14, 30),
+        ],
+      },
     ],
     bridges: [{ id: 'br0', roadId: 'r0', gx: P(2.6, 24.2)[0], gy: P(2.6, 24.2)[1], span: 4.4 }],
+    fords: [{ id: 'fd0', roadId: 'r1', gx: P(2.93, 41)[0], gy: P(2.93, 41)[1], span: 3.4 }],
     trees: TREES.map(([id, kind, u, v], i) => {
       const [gx, gy] = P(u, v);
       return { id, kind, gx, gy, seed: 5000 + i * 13 } as TreeSpec;
@@ -514,6 +536,20 @@ export function fixtureTimeline(map: GenesisMap): Timeline {
     { t: 18.55, type: 'log', text: 'Moot Hall is raised. A banner goes up.', siteId: 's1' },
     { t: 18.8, type: 'road', roadId: 'r0', frac: 1 },
     { t: 18.9, type: 'log', text: 'The highway between the two towns is finished.' },
+    // the back track, and the ford it does not stop for
+    { t: 16.4, type: 'road', roadId: 'r1', frac: 0.16 },
+    { t: 17.0, type: 'road', roadId: 'r1', frac: 0.31 },
+    { t: 17.6, type: 'road', roadId: 'r1', frac: 0.46 },
+    { t: 17.6, type: 'ford', fordId: 'fd0' },
+    {
+      t: 17.65,
+      type: 'log',
+      text: 'The track walks straight into the water at the shallows and out the other side.',
+    },
+    { t: 18.4, type: 'road', roadId: 'r1', frac: 0.63 },
+    { t: 19.2, type: 'road', roadId: 'r1', frac: 0.81 },
+    { t: 20.0, type: 'road', roadId: 'r1', frac: 1 },
+    { t: 20.05, type: 'log', text: 'The back track is walkable end to end. Nobody built a thing.' },
     { t: 19.2, type: 'arrive', siteId: 's1', n: 3 },
     { t: 19.5, type: 'survey', buildingId: 's1-b1' },
     { t: 19.9, type: 'prop', propId: 's1-well', siteId: 's1' },
@@ -577,6 +613,7 @@ export function fixtureEmptySnapshot(map: GenesisMap): WorldSnapshot {
     buildings,
     roads: new Map(),
     bridges: new Map(),
+    fords: new Set(),
     props: new Set(),
     chests: new Map(),
     founded,
@@ -635,6 +672,9 @@ function applyEvent(snap: WorldSnapshot, ev: GenesisEvent): void {
       break;
     case 'bridge':
       snap.bridges.set(ev.bridgeId, ev.stage);
+      break;
+    case 'ford':
+      snap.fords.add(ev.fordId);
       break;
     case 'prop':
       snap.props.add(ev.propId);

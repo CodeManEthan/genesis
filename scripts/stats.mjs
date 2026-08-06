@@ -243,6 +243,18 @@ function report(seed) {
     say(`  ${b.id} on ${b.roadId} at (${f1(p[0])},${f1(p[1])}) span ${b.span}  river dist ${f1(dr)} ${dr <= 1 ? 'ok' : 'OFF-RIVER'}`);
   }
 
+  const fords = map.fords ?? [];
+  say(`\nFORDS (${fords.length})`);
+  for (const f of fords) {
+    const p = uvOf(f);
+    const dr = polyDist(p, river);
+    const r = map.roads.find((x) => x.id === f.roadId);
+    say(
+      `  ${f.id} on ${f.roadId} (${r ? r.kind : '??'}) at (${f1(p[0])},${f1(p[1])}) span ${f.span}  ` +
+        `river dist ${f1(dr)} ${dr <= 1 ? 'ok' : 'OFF-RIVER'}`
+    );
+  }
+
   const area = (map.bounds.u1 - map.bounds.u0) * (map.bounds.v1 - map.bounds.v0);
   say(`\ntree density ${(map.trees.length / area).toFixed(3)} / u,v unit^2 over ${area} units^2`);
   const clearCounts = map.sites.flatMap((s) => s.buildings.map((b) => b.clears.length));
@@ -349,27 +361,66 @@ function checks(seed, map, scale = 1) {
     check('b  roads connect all sites', roots.size === 1, `${roots.size} component(s)`);
   }
 
-  /* (c) every road/river crossing carries a bridge within 1.5 */
+  /* (c) every road/river crossing is carried, and by the right thing:
+   *     a highway or a lane bridges the water, a track fords it. Exactly one
+   *     of the two per crossing, within 1.5, and nothing left over. */
   {
+    const fords = map.fords ?? [];
     let total = 0;
     let bad = 0;
+    let wrongKind = 0;
     let worst = 0;
+    let nBridged = 0;
+    let nForded = 0;
     for (const r of map.roads) {
+      const wantFord = r.kind === 'track';
       for (const x of crossings(roadUV.get(r.id), river)) {
         total++;
-        let best = Infinity;
+        let bBest = Infinity;
         for (const b of map.bridges) {
           if (b.roadId !== r.id) continue;
-          best = Math.min(best, d2(uvOf(b), x));
+          bBest = Math.min(bBest, d2(uvOf(b), x));
         }
+        let fBest = Infinity;
+        for (const f of fords) {
+          if (f.roadId !== r.id) continue;
+          fBest = Math.min(fBest, d2(uvOf(f), x));
+        }
+        const best = Math.min(bBest, fBest);
         worst = Math.max(worst, best === Infinity ? 99 : best);
         if (!(best <= 1.5)) bad++;
+        else if (wantFord ? fBest <= 1.5 : bBest <= 1.5) {
+          if (wantFord) nForded++;
+          else nBridged++;
+        } else wrongKind++;
       }
     }
     check(
-      'c  every crossing has a bridge',
-      bad === 0 && total === map.bridges.length,
-      `${total} crossings, ${map.bridges.length} bridges, ${bad} unbridged, worst offset ${f1(worst)}`
+      'c  every crossing is carried',
+      bad === 0 && wrongKind === 0 && total === map.bridges.length + fords.length,
+      `${total} crossings = ${nBridged} bridged + ${nForded} forded, ` +
+        `${map.bridges.length} bridges / ${fords.length} fords, ` +
+        `${bad} uncrossed, ${wrongKind} wrong kind, worst offset ${f1(worst)}`
+    );
+
+    // and the converse: nothing is hung off the wrong class of road, and every
+    // ford really is standing in the river rather than beside it
+    let strayBridge = 0;
+    for (const b of map.bridges) {
+      const r = map.roads.find((x) => x.id === b.roadId);
+      if (!r || r.kind === 'track') strayBridge++;
+    }
+    let strayFord = 0;
+    let offRiver = 0;
+    for (const f of fords) {
+      const r = map.roads.find((x) => x.id === f.roadId);
+      if (!r || r.kind !== 'track') strayFord++;
+      if (!(polyDist(uvOf(f), river) <= 1.0)) offRiver++;
+    }
+    check(
+      'c2 bridges on lanes, fords on tracks',
+      strayBridge === 0 && strayFord === 0 && offRiver === 0,
+      `${strayBridge} bridge(s) on a track, ${strayFord} ford(s) off a track, ${offRiver} ford(s) off the river`
     );
   }
 
@@ -467,7 +518,8 @@ function checks(seed, map, scale = 1) {
     check(
       'l  populations in spec range',
       ok,
-      `${map.sites.length} sites, s0 ${s0b} bldg, ${map.trees.length} trees, ${map.scatter.length} scatter, ${map.bridges.length} bridges`
+      `${map.sites.length} sites, s0 ${s0b} bldg, ${map.trees.length} trees, ${map.scatter.length} scatter, ` +
+        `${map.bridges.length} bridges, ${(map.fords ?? []).length} fords`
     );
   }
   {
@@ -930,6 +982,13 @@ function subsetChecks(seed) {
       hi.bridges.length >= lo.bridges.length &&
       lo.bridges.every((b, i) => same(b, hi.bridges[i]));
     check(`${tag}: bridges are a prefix`, bridgePrefix, `${lo.bridges.length} -> ${hi.bridges.length}`);
+
+    // Fords hang off the roads exactly as the bridges do, so they trim the
+    // same way: by road id, from the tail.
+    const loF = lo.fords ?? [];
+    const hiF = hi.fords ?? [];
+    const fordPrefix = hiF.length >= loF.length && loF.every((f, i) => same(f, hiF[i]));
+    check(`${tag}: fords are a prefix`, fordPrefix, `${loF.length} -> ${hiF.length}`);
   }
 
   // The default argument must be exactly scale 1.

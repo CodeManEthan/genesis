@@ -165,19 +165,36 @@ function makeFixture(seed, opts) {
     });
   }
 
-  const bridges = [];
-  if (roads.length) {
-    const pts = roads[0].pts;
-    const at = opts.bridgeAt ?? 0.45;
+  /** a point at arclength-ish fraction `at` along a road polyline */
+  const alongRoad = (pts, at) => {
     const i = Math.min(pts.length - 2, Math.floor(at * (pts.length - 1)));
     const f = at * (pts.length - 1) - i;
-    bridges.push({
-      id: 'br0',
-      roadId: roads[0].id,
-      gx: pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f,
-      gy: pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f,
-      span: 4,
-    });
+    return [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f];
+  };
+
+  const bridges = [];
+  if (roads.length) {
+    const [gx, gy] = alongRoad(roads[0].pts, opts.bridgeAt ?? 0.45);
+    bridges.push({ id: 'br0', roadId: roads[0].id, gx, gy, span: 4 });
+  }
+
+  // Fords, the track's answer to a bridge. `opts.fords` is a list of
+  // {road, at}: which road (by index, or 'loop' for the link road) fords the
+  // water and where along it. The road is forced to `track` kind, because that
+  // is the only class gen.ts ever fords, and (e2) holds the harness to it.
+  // A road may not carry both — a crossing is one thing or the other — so a
+  // ford on road 0 evicts the bridge that was put there above.
+  const fords = [];
+  for (const [i, spec] of (opts.fords ?? []).entries()) {
+    const road = spec.road === 'loop' ? roads.find((r) => r.id === 'r-loop') : roads[spec.road ?? 0];
+    if (!road) continue;
+    road.kind = 'track';
+    road.width = 0.4;
+    for (let k = bridges.length - 1; k >= 0; k--) {
+      if (bridges[k].roadId === road.id) bridges.splice(k, 1);
+    }
+    const [gx, gy] = alongRoad(road.pts, spec.at ?? 0.5);
+    fords.push({ id: `fd${i}`, roadId: road.id, gx, gy, span: 3.4 });
   }
 
   const scatter = [];
@@ -235,6 +252,7 @@ function makeFixture(seed, opts) {
     sites,
     roads,
     bridges,
+    fords,
     trees,
     scatter,
     chests,
@@ -297,6 +315,7 @@ function serialize(snap) {
     buildings: m(snap.buildings),
     roads: m(snap.roads),
     bridges: m(snap.bridges),
+    fords: s(snap.fords ?? []),
     props: s(snap.props),
     chests: m(snap.chests),
     founded: s(snap.founded),
@@ -328,6 +347,7 @@ function run(label, map, pace = 1) {
   const treeIds = new Set(map.trees.map((t) => t.id));
   const roadById = new Map(map.roads.map((r) => [r.id, r]));
   const bridgeById = new Map(map.bridges.map((b) => [b.id, b]));
+  const fordById = new Map((map.fords ?? []).map((f) => [f.id, f]));
   const propIds = new Set();
   for (const s of map.sites) for (const p of s.props) propIds.add(p.id);
   const plotClears = new Set();
@@ -357,6 +377,7 @@ function run(label, map, pace = 1) {
       bad(`(b) unknown buildingId ${e.buildingId}`);
     if (e.type === 'road' && !roadById.has(e.roadId)) bad(`(b) unknown roadId ${e.roadId}`);
     if (e.type === 'bridge' && !bridgeById.has(e.bridgeId)) bad(`(b) unknown bridgeId ${e.bridgeId}`);
+    if (e.type === 'ford' && !fordById.has(e.fordId)) bad(`(b) unknown fordId ${e.fordId}`);
     if (e.type === 'prop' && !propIds.has(e.propId)) bad(`(b) unknown propId ${e.propId}`);
   }
 
@@ -438,7 +459,9 @@ function run(label, map, pace = 1) {
     if (!truncated && Math.abs(prev - 1) > 1e-9) bad(`(d) ${r.id}: last frac ${prev} !== 1`);
   }
 
-  /* (e) bridge stages 1,2,3 in order, stage 3 gates the road */
+  /* (e) bridge stages 1,2,3 in order, stage 3 gates the road.
+   *     This applies to BRIDGES ONLY. A ford has no stages and gates nothing,
+   *     which is checked separately in (e2) below. */
   for (const br of map.bridges) {
     const stages = ev.filter((e) => e.type === 'bridge' && e.bridgeId === br.id);
     const nums = stages.map((s) => s.stage);
@@ -451,6 +474,43 @@ function run(label, map, pace = 1) {
     const past = (roadEv.get(road.id) ?? []).filter((e) => e.frac > bf + 0.05);
     if (past.length && past[0].t < t3 - 1e-9)
       bad(`(e) ${br.id}: road passed frac ${past[0].frac.toFixed(3)} at ${past[0].t.toFixed(2)} before stage 3 at ${t3.toFixed(2)} (bridgeFrac ${bf.toFixed(3)})`);
+  }
+
+  /* (e2) fords: narrated exactly once, on a track, and holding nothing up */
+  for (const fd of map.fords ?? []) {
+    const hits = ev.filter((e) => e.type === 'ford' && e.fordId === fd.id);
+    if (hits.length > 1) bad(`(e2) ${fd.id}: narrated ${hits.length} times, want 1`);
+    else if (!hits.length && !truncated) bad(`(e2) ${fd.id}: never narrated`);
+    const road = roadById.get(fd.roadId);
+    if (!road) {
+      bad(`(e2) ${fd.id}: hangs off unknown road ${fd.roadId}`);
+      continue;
+    }
+    if (road.kind !== 'track') bad(`(e2) ${fd.id}: on a ${road.kind}, fords are for tracks`);
+    // a ford must never emit bridge stages, and no bridge may sit on its road
+    if (ev.some((e) => e.type === 'bridge' && bridgeById.get(e.bridgeId)?.roadId === road.id))
+      bad(`(e2) ${fd.id}: road ${road.id} is a track but carries bridge events`);
+    if (!hits.length) continue;
+    // The road head must already have reached the water when the crossing is
+    // narrated — and, crucially, must NOT have paused for it: the very event
+    // that carries the road to the ford is the one the ford rides on.
+    const ff = fracOf(road.pts, fd.gx, fd.gy);
+    const list = roadEv.get(road.id) ?? [];
+    const reached = list.filter((e) => e.frac >= ff - 0.06 && e.t <= hits[0].t + 1e-9);
+    if (!reached.length)
+      bad(`(e2) ${fd.id}: narrated at ${hits[0].t.toFixed(2)} before the road reached frac ${ff.toFixed(3)}`);
+    // no dead stop at the water: the gap either side of the ford is no worse
+    // than the road's own median step, plus generous slack for felling
+    const after = list.filter((e) => e.frac > ff + 0.02);
+    if (after.length && list.length > 2) {
+      const steps = [];
+      for (let i = 1; i < list.length; i++) steps.push(list[i].t - list[i - 1].t);
+      steps.sort((a, b) => a - b);
+      const med = steps[Math.floor(steps.length / 2)];
+      const gap = after[0].t - hits[0].t;
+      if (gap > Math.max(0.5, med * 6 + 0.5))
+        bad(`(e2) ${fd.id}: road stalled ${gap.toFixed(2)}h at the ford (median step ${med.toFixed(2)}h)`);
+    }
   }
 
   /* (f) non-s0 sites founded after their road arrives, before their buildings */
@@ -509,6 +569,8 @@ function run(label, map, pace = 1) {
       if (end.roads.get(r.id) !== 1) bad(`(i) road ${r.id} frac ${end.roads.get(r.id)} !== 1`);
     for (const b of map.bridges)
       if (end.bridges.get(b.id) !== 3) bad(`(i) bridge ${b.id} stage ${end.bridges.get(b.id)} !== 3`);
+    for (const f of map.fords ?? [])
+      if (!end.fords?.has(f.id)) bad(`(i) ford ${f.id} never crossed`);
     for (const s of map.sites) if (!end.founded.has(s.id)) bad(`(i) site ${s.id} never founded`);
     for (const id of propIds) if (!end.props.has(id)) bad(`(i) prop ${id} never appeared`);
   } else {
@@ -665,7 +727,7 @@ function run(label, map, pace = 1) {
   console.log(`${fails.length ? 'FAIL' : 'PASS'}  ${label}${full ? '' : `   [pace ${pace}]`}`);
   console.log(
     `  sites ${map.sites.length}  buildings ${buildingById.size}  roads ${map.roads.length}  ` +
-      `bridges ${map.bridges.length}  trees ${map.trees.length} ` +
+      `bridges ${map.bridges.length}  fords ${(map.fords ?? []).length}  trees ${map.trees.length} ` +
       `(plot ${plotClears.size} / route ${roadClears.size} / wild ${map.trees.length - clearable.size})`,
   );
   console.log(
@@ -732,6 +794,31 @@ cases.push([
 cases.push([
   'fixture: 3 sites, bridge at the end of the road',
   makeFixture(777, { buildings: [3, 3, 4], trees: 60, bridgeAt: 0.97, roadClears: 8 }),
+]);
+// Fords. The road must NOT stop for these, which is the whole of (e2).
+cases.push([
+  'fixture: 3 sites, a track that fords instead of bridging',
+  makeFixture(31337, { buildings: [3, 3, 3], trees: 60, roadClears: 6, fords: [{ road: 0, at: 0.45 }] }),
+]);
+cases.push([
+  'fixture: ford early on one road, bridge on the next, ford on the loop',
+  makeFixture(2718, {
+    buildings: [3, 4, 3],
+    trees: 80,
+    roadClears: 8,
+    loopRoad: true,
+    bridgeAt: 0.6,
+    fords: [{ road: 0, at: 0.08 }, { road: 'loop', at: 0.9 }],
+  }),
+]);
+cases.push([
+  'fixture: two fords on the same track',
+  makeFixture(161803, {
+    buildings: [4, 3, 3],
+    trees: 70,
+    roadClears: 6,
+    fords: [{ road: 1, at: 0.3 }, { road: 1, at: 0.72 }],
+  }),
 ]);
 cases.push([
   'fixture: dense forest — 12 plot clears, 14 route trees per road',

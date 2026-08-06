@@ -13,7 +13,8 @@
  *
  * GENERATION ORDER (each stage only reads the stages above it):
  *   bounds -> river -> lakes -> outcrops -> town roster -> accents/names ->
- *   road network (append-only tree, A* routed) -> bridges -> chunks/biomes ->
+ *   road network (append-only tree, A* routed) -> crossings (a bridge for a
+ *   highway or a lane, a ford for a track) -> chunks/biomes ->
  *   buildings -> trees -> clears -> wild scatter -> shores and boulder fields
  *   -> site dressing -> trim to scale.
  *
@@ -41,6 +42,7 @@ import {
   type ChestReward,
   type ChestSpec,
   type Chunk,
+  type FordSpec,
   type GenesisMap,
   type LakeSpec,
   type PropSpec,
@@ -1812,6 +1814,7 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const grid = buildRouteGrid(content, river, lakes);
   const roads: RoadSpec[] = [];
   const bridges: BridgeSpec[] = [];
+  const fords: FordSpec[] = [];
   const roadLines: Pt[][] = [];
 
   edges.forEach(([a, b], ei) => {
@@ -1865,14 +1868,17 @@ function buildMap(seed: number, scale: number): GenesisMap {
       to: B.id,
     });
     roadLines.push(line);
+    // Every crossing carries exactly one of the two, and which one is decided
+    // by the road class alone — no rng, so the main stream is untouched. A
+    // highway or a lane has carts on it and gets a bridge; a track is a line
+    // of footfall and a pack pony, and it simply goes through the water.
     for (const p of crossings(line, river)) {
-      bridges.push({
-        id: `br${bridges.length}`,
-        roadId: id,
-        gx: uv(p[0], p[1])[0],
-        gy: uv(p[0], p[1])[1],
-        span: 4.2,
-      });
+      const [cgx, cgy] = uv(p[0], p[1]);
+      if (kind === 'track') {
+        fords.push({ id: `fd${fords.length}`, roadId: id, gx: cgx, gy: cgy, span: 3.4 });
+      } else {
+        bridges.push({ id: `br${bridges.length}`, roadId: id, gx: cgx, gy: cgy, span: 4.2 });
+      }
     }
   });
 
@@ -1883,6 +1889,9 @@ function buildMap(seed: number, scale: number): GenesisMap {
   const activeRoads = roads.slice(0, roadCount);
   const activeRoadIds = new Set(activeRoads.map((r) => r.id));
   const activeBridges = bridges.filter((b) => activeRoadIds.has(b.roadId));
+  // Fords are hung off the roads exactly as the bridges are, and their ids are
+  // handed out in the same edge order, so they are a prefix for the same reason.
+  const activeFords = fords.filter((f) => activeRoadIds.has(f.roadId));
 
   /* ---- chunks / biomes -------------------------------------------------- */
   const chunks: Chunk[] = [];
@@ -2927,6 +2936,7 @@ function buildMap(seed: number, scale: number): GenesisMap {
     sites: siteSpecs,
     roads: activeRoads,
     bridges: activeBridges,
+    fords: activeFords,
     trees: liveTrees,
     scatter,
     chests,

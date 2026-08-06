@@ -190,6 +190,33 @@ export interface BridgeSpec {
   span: number; // tiles, ~3.5..5
 }
 
+/**
+ * A ford: where the LIGHTEST road class meets the river, nobody builds
+ * anything. The bank is trodden down either side, a line of flat stones goes
+ * in, and the track walks through the shallows and out the other side.
+ *
+ * A ford is the counterpart of a BridgeSpec and is derived by exactly the same
+ * pass over road x river crossings — the choice between the two is a pure
+ * function of `RoadSpec.kind` and costs no randomness. Every crossing carries
+ * one or the other and never both:
+ *
+ *   highway | lane  ->  BridgeSpec, three build stages, gates the road
+ *   track           ->  FordSpec,   no stages at all, gates nothing
+ *
+ * Because there is nothing to build there is nothing to track: fords never
+ * enter the build state the way `WorldSnapshot.bridges` does. The one thing
+ * the day records is that the road head walked through, which is a single
+ * `ford` event and one line in the ledger.
+ */
+export interface FordSpec {
+  id: string; // "fd0"
+  roadId: string;
+  gx: number;
+  gy: number;
+  /** tiles — how wide the shallows are trodden, a shade under a bridge span */
+  span: number;
+}
+
 /* --------------------------- buried treasure ----------------------------- */
 
 /**
@@ -298,6 +325,11 @@ export interface GenesisMap {
    * timeline; at t=0 none of them exist visually. */
   roads: RoadSpec[];
   bridges: BridgeSpec[];
+  /** Where a TRACK crosses the river instead of bridging it. Derived from the
+   * same crossing pass as `bridges`, and like them a prefix under the pace
+   * scale. Optional so hand-written fixtures predating fords still typecheck;
+   * absent means the same as empty. */
+  fords?: FordSpec[];
   /** The wild forest at t=0. Timeline events fell some of these. */
   trees: TreeSpec[];
   /** Wild non-tree scenery, present from t=0. */
@@ -321,6 +353,9 @@ export type GenesisEvent =
   | { t: number; type: 'build'; buildingId: string; progress: number } // monotonic per building, 1 = done
   | { t: number; type: 'road'; roadId: string; frac: number } // built up to frac of arclength, monotonic
   | { t: number; type: 'bridge'; bridgeId: string; stage: 0 | 1 | 2 | 3 } // 1 pilings, 2 deck, 3 rails/done
+  /** the road head walked through the shallows. Narration only — a ford has no
+   * stages and gates nothing, so this never holds the road up. */
+  | { t: number; type: 'ford'; fordId: string }
   | { t: number; type: 'prop'; propId: string; siteId: string } // dressing appears
   | { t: number; type: 'log'; text: string; siteId?: string } // ledger line (also emitted alongside milestones)
   | { t: number; type: 'dig'; chestId: string } // somebody's spade hits the lid
@@ -344,6 +379,9 @@ export interface WorldSnapshot {
   buildings: Map<string, { status: BuildingStatus; progress: number }>;
   roads: Map<string, number>; // id -> built frac (missing = 0)
   bridges: Map<string, 0 | 1 | 2 | 3>;
+  /** ford ids the road head has walked through. Nothing is drawn from this —
+   * the stones are terrain — but it is what makes "narrated once" checkable. */
+  fords: Set<string>;
   props: Set<string>; // site-dressing prop ids that exist
   /** chest id -> state (missing = still buried) */
   chests: Map<string, ChestState>;

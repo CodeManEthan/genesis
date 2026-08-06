@@ -2655,6 +2655,15 @@ export function renderGenesis(
     }
   }
 
+  /* ---- fords ------------------------------------------------------------
+   * Terrain, so they are here from midnight whether or not the track has
+   * reached them yet — but they have to be laid over the road rather than
+   * under it, which is why they are not on the terrain bake. There are only
+   * ever a handful, and each is a dozen small polys. */
+  for (const fd of scene.map.fords ?? []) {
+    drawFord(g, scene.map.river, fd.gx, fd.gy, fd.span);
+  }
+
   /* ---- bridges --------------------------------------------------------- */
   for (const br of scene.map.bridges) {
     const stage = snap.bridges.get(br.id) ?? 0;
@@ -3062,6 +3071,104 @@ export function renderGenesis(
      above them) */
   paintWeather(ctx, scene, snap.t, clock, dw, dh, dpr);
   if (P) lap('post');
+}
+
+/**
+ * A ford: what a track does instead of building a bridge.
+ *
+ * There are no stages, because there is nothing to build — the whole thing is
+ * terrain plus footfall, and it looks the same at midnight as it does at noon.
+ * Three parts, in order: the bed comes up so the water goes pale and slack; the
+ * banks are trodden out wide either side where carts and feet turn in; and a
+ * line of flat stones goes across for anyone who would rather stay dry.
+ *
+ * Drawn AFTER the roads, so the track's own surface passes underneath and reads
+ * as a wet bed running on through the shallows rather than as a road that stops
+ * at the water. Exported for the catalog.
+ */
+export function drawFord(ctx: Ctx, river: Vec2[], gx: number, gy: number, span: number): void {
+  // Orient across the local current, exactly as a bridge deck is oriented.
+  let bi = 0;
+  let bd = Infinity;
+  for (let i = 0; i + 1 < river.length; i++) {
+    const d = segDist(gx, gy, river[i], river[i + 1]);
+    if (d < bd) {
+      bd = d;
+      bi = i;
+    }
+  }
+  const tx = river[bi + 1][0] - river[bi][0];
+  const ty = river[bi + 1][1] - river[bi][1];
+  const tl = Math.hypot(tx, ty) || 1;
+  const nx = -ty / tl;
+  const ny = tx / tl;
+  const half = span / 2;
+  /** how far up- and downstream the slack water reads */
+  const depth = 1.5;
+  /** `a` runs across the water along the track, `b` runs with the current */
+  const at = (a: number, b: number): Pt => {
+    const px = gx + nx * a + (tx / tl) * b;
+    const py = gy + ny * a + (ty / tl) * b;
+    return [isoX(px, py), isoY(px, py)];
+  };
+  const quad = (a0: number, a1: number, b: number, col: string) =>
+    poly(ctx, [at(a0, -b), at(a1, -b), at(a1, b), at(a0, b)], col);
+
+  // 1. the shallows — pale, and paler still down the middle where the gravel
+  //    bar is highest. Translucent so the track underneath still shows through.
+  ctx.globalAlpha = 0.55;
+  quad(-half - 1.1, half + 1.1, depth, PAL.waterLight);
+  ctx.globalAlpha = 0.4;
+  quad(-half - 0.7, half + 0.7, depth * 0.55, shade(PAL.waterLight, 0.26));
+  ctx.globalAlpha = 1;
+
+  // 2. the trodden banks either side, where the ground is churned to sand
+  for (const side of [-1, 1]) {
+    poly(
+      ctx,
+      [
+        at(side * (half - 0.2), -depth * 1.15),
+        at(side * (half + 1.15), -depth * 0.72),
+        at(side * (half + 1.15), depth * 0.72),
+        at(side * (half - 0.2), depth * 1.15),
+      ],
+      PAL.sand
+    );
+  }
+
+  // 3. the stones, and the water piling up on the upstream shoulder of each.
+  //    Seeded off the crossing itself, so the jitter never crawls frame to frame.
+  const rr = mulberry32(((Math.round(gx * 733 + gy * 1409) >>> 0) ^ 0xf0d0dabc) >>> 0);
+  const N = Math.max(4, Math.round(span * 2.2));
+  for (let k = 0; k <= N; k++) {
+    const a = -half * 0.92 + (k / N) * half * 1.84;
+    const b = (rr() - 0.5) * 0.5;
+    const [sx, sy] = at(a, b);
+    const w = 3 + Math.round(rr() * 2);
+    poly(
+      ctx,
+      [
+        [sx - w, sy],
+        [sx, sy - w * 0.5],
+        [sx + w, sy],
+        [sx, sy + w * 0.5],
+      ],
+      PAL.stoneDark
+    );
+    poly(
+      ctx,
+      [
+        [sx - w + 1, sy - 1],
+        [sx, sy - w * 0.5 - 1],
+        [sx + w - 1, sy - 1],
+        [sx, sy + w * 0.5 - 1],
+      ],
+      PAL.stone
+    );
+    // foam on the upstream side only — one tick, one pixel high
+    const [fx, fy] = at(a, b - 0.42);
+    rect(ctx, fx - 2, fy - 1, 2 + Math.round(rr() * 3), 1, PAL.waterFoam);
+  }
 }
 
 /** A bridge at one of its three build stages. Exported for the catalog. */

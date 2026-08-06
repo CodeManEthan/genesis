@@ -10,7 +10,8 @@
  *   00:00    one house, two settlers, a wild valley.
  *   morning  the founding site builds up; a road pushes out mid-morning.
  *            a river crossing stops the road dead until the bridge is piled,
- *            decked and railed.
+ *            decked and railed — unless it is a track, which fords the water
+ *            and does not break stride.
  *   midday   the road arrives, the next site is founded, settlers come, plots
  *            are cleared, surveyed, raised. Expansion runs site by site.
  *   ~21:00   the last roof goes on, whatever the size of the map.
@@ -26,6 +27,7 @@
 import type {
   BridgeSpec,
   BuildingSpec,
+  FordSpec,
   GenesisEvent,
   GenesisMap,
   RoadSpec,
@@ -181,6 +183,8 @@ interface Plan {
   /** site ids in founding order */
   order: string[];
   bridgeDone: { t: number; bridgeId: string; siteId: string | null }[];
+  /** fords the road head walked through — one ledger line each, no build */
+  fordCross: { t: number; fordId: string; siteId: string | null }[];
   /** roads that had to be cut through standing forest, worth a ledger line */
   roadCuts: { t: number; roadId: string; kind: string; siteId: string | null; n: number }[];
   lastBuildT: number;
@@ -208,6 +212,7 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
   const runs = new Map<string, SiteRun>();
   const order: string[] = [];
   const bridgeDone: Plan['bridgeDone'] = [];
+  const fordCross: Plan['fordCross'] = [];
   const roadCuts: Plan['roadCuts'] = [];
   const treeIds = new Set(map.trees.map((t) => t.id));
   /** claimed — nobody fells a tree twice */
@@ -226,6 +231,13 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     const list = bridgesByRoad.get(br.roadId);
     if (list) list.push(br);
     else bridgesByRoad.set(br.roadId, [br]);
+  }
+
+  const fordsByRoad = new Map<string, FordSpec[]>();
+  for (const fd of map.fords ?? []) {
+    const list = fordsByRoad.get(fd.roadId);
+    if (list) list.push(fd);
+    else fordsByRoad.set(fd.roadId, [fd]);
   }
 
   /* ---------------------------- one settlement --------------------------- */
@@ -363,32 +375,41 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     const brs = (bridgesByRoad.get(road.id) ?? [])
       .map((b) => ({ spec: b, gate: clamp(nearestFrac(road.pts, b.gx, b.gy), 0.06, 0.9) }))
       .sort((a, b) => a.gate - b.gate);
+    const fds = (fordsByRoad.get(road.id) ?? [])
+      .map((f) => ({ spec: f, gate: clamp(nearestFrac(road.pts, f.gx, f.gy), 0.06, 0.9) }))
+      .sort((a, b) => a.gate - b.gate);
 
-    type Item = { frac: number; br: BridgeSpec | null };
+    // A stop on the way along the road. `br` holds it up until the crossing is
+    // built; `fd` costs it nothing at all — a ford is only a place where the
+    // road event lands exactly on the water, so the ledger can say so.
+    type Item = { frac: number; br: BridgeSpec | null; fd: FordSpec | null };
+    const mark = (it: Item) => it.br !== null || it.fd !== null;
     const nsteps = int(9, 16);
     const raw: Item[] = [];
-    for (let i = 1; i <= nsteps; i++) raw.push({ frac: i / nsteps, br: null });
-    for (const b of brs) raw.push({ frac: b.gate, br: b.spec });
-    raw.sort((a, b) => a.frac - b.frac || (a.br ? 1 : 0) - (b.br ? 1 : 0));
+    for (let i = 1; i <= nsteps; i++) raw.push({ frac: i / nsteps, br: null, fd: null });
+    for (const b of brs) raw.push({ frac: b.gate, br: b.spec, fd: null });
+    for (const f of fds) raw.push({ frac: f.gate, br: null, fd: f.spec });
+    raw.sort((a, b) => a.frac - b.frac || (mark(a) ? 1 : 0) - (mark(b) ? 1 : 0));
 
-    // merge near-coincident stops; a bridge always wins its slot
+    // merge near-coincident stops; a crossing always wins its slot
     const items: Item[] = [];
     for (const it of raw) {
       const prev = items[items.length - 1];
       if (prev && it.frac - prev.frac < 1.5e-3) {
-        if (it.br && !prev.br) {
+        if (mark(it) && !mark(prev)) {
           prev.br = it.br;
+          prev.fd = it.fd;
           prev.frac = it.frac;
-        } else if (it.br) {
-          items.push({ frac: prev.frac + 1.5e-3, br: it.br });
+        } else if (mark(it)) {
+          items.push({ frac: prev.frac + 1.5e-3, br: it.br, fd: it.fd });
         }
         continue;
       }
-      items.push({ frac: it.frac, br: it.br });
+      items.push({ frac: it.frac, br: it.br, fd: it.fd });
     }
     const last = items[items.length - 1];
-    if (!last) items.push({ frac: 1, br: null });
-    else if (last.frac < 1) items.push({ frac: 1, br: null });
+    if (!last) items.push({ frac: 1, br: null, fd: null });
+    else if (last.frac < 1) items.push({ frac: 1, br: null, fd: null });
     else last.frac = 1;
 
     // Walk the construction head. Each stop records when the head arrived, so
@@ -410,6 +431,14 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
       bounds.push({ f: it.frac, t });
       prevF = it.frac;
       endT = t;
+      if (it.fd) {
+        // Nothing to build and nothing to wait for: the road event above has
+        // already carried the surface into the water, and the next stop is
+        // reached on the same clock as if the river were not there. All the
+        // ford costs the day is the line the ledger writes about it.
+        ev.push({ t, type: 'ford', fordId: it.fd.id });
+        fordCross.push({ t, fordId: it.fd.id, siteId });
+      }
       if (it.br) {
         // the road stops dead at the water until the crossing is finished
         const pause = range(32, 48) * MIN * dm;
@@ -472,7 +501,7 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
 
   /* ------------------------------ the day itself -------------------------- */
 
-  if (!map.sites.length) return { events: ev, runs, order, bridgeDone, roadCuts, lastBuildT };
+  if (!map.sites.length) return { events: ev, runs, order, bridgeDone, fordCross, roadCuts, lastBuildT };
 
   const r0 = scheduleSite(map.sites[0], 0.05, true);
 
@@ -537,7 +566,18 @@ function plan(map: GenesisMap, skel: Skeleton, p: number): Plan {
     bridgeDone.push({ t: t + 26 * MIN, bridgeId: br.id, siteId: null });
   }
 
-  return { events: ev, runs, order, bridgeDone, roadCuts, lastBuildT };
+  // …and any ford whose road never got laid still gets its one line. Kept
+  // strictly after the bridge fallback so the draw sequence above it is
+  // untouched, and like that one it depends on the map, never on the tempo.
+  const forded = new Set(fordCross.map((f) => f.fordId));
+  for (const fd of map.fords ?? []) {
+    if (forded.has(fd.id)) continue;
+    const t = 12 + range(0, 6);
+    ev.push({ t, type: 'ford', fordId: fd.id });
+    fordCross.push({ t, fordId: fd.id, siteId: null });
+  }
+
+  return { events: ev, runs, order, bridgeDone, fordCross, roadCuts, lastBuildT };
 }
 
 /** uniform time correction — preserves ordering and every monotonic chain */
@@ -551,6 +591,7 @@ function scalePlan(pl: Plan, s: number): void {
     for (const f of run.finishes) f.t *= s;
   }
   for (const b of pl.bridgeDone) b.t *= s;
+  for (const f of pl.fordCross) f.t *= s;
   for (const c of pl.roadCuts) c.t *= s;
   pl.lastBuildT *= s;
 }
@@ -579,6 +620,13 @@ const FIRST_TREE = [
   'First tree down in {valley}. It takes three of them and most of the morning.',
   'The first oak comes over, and the sound of it carries the length of {valley}.',
   'First axe into first trunk. Everything after this is carpentry.',
+];
+
+const FORD_LOG = [
+  'The track walks straight into the water at the shallows and out the other side.',
+  'No bridge here, and no need of one: flat stones in, banks trodden down, and the track is across.',
+  'They measure the water at the shallows, find it knee-deep, and stop talking about a bridge.',
+  'A ford, then. The track goes through, and whoever wants dry feet can go the long way round.',
 ];
 
 const BRIDGE_LOG = [
@@ -727,6 +775,7 @@ const TYPE_RANK: Record<GenesisEvent['type'], number> = {
   log: 9,
   dig: 10,
   discover: 11,
+  ford: 12,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -901,6 +950,16 @@ function narrate(map: GenesisMap, pl: Plan): GenesisEvent[] {
       text: fill(draw(BRIDGE_LOG), { valley, town: run ? run.site.name : valley }),
     };
     if (b.siteId) line.siteId = b.siteId;
+    key.push(line);
+  }
+
+  for (const f of pl.fordCross) {
+    const run = f.siteId ? pl.runs.get(f.siteId) : undefined;
+    const line: Line = {
+      t: f.t,
+      text: fill(draw(FORD_LOG), { valley, town: run ? run.site.name : valley }),
+    };
+    if (f.siteId) line.siteId = f.siteId;
     key.push(line);
   }
 
@@ -1222,6 +1281,7 @@ export function emptySnapshot(map: GenesisMap): WorldSnapshot {
     buildings,
     roads,
     bridges,
+    fords: new Set(),
     props: new Set(),
     chests: new Map(),
     founded,
@@ -1261,6 +1321,9 @@ function applyEvent(s: Snap, e: GenesisEvent): void {
       break;
     case 'bridge':
       s.bridges.set(e.bridgeId, e.stage);
+      break;
+    case 'ford':
+      s.fords.add(e.fordId);
       break;
     case 'prop':
       s.props.add(e.propId);
