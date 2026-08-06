@@ -88,6 +88,10 @@ import {
   drawCart,
   drawChestGlint,
   drawCraneLoad,
+  /* ---- the prospector (additive) ---- */
+  drawPanner,
+  giltStructure,
+  /* ---- end the prospector (additive) ---- */
   drawWheel,
   isoTile,
   mix,
@@ -107,6 +111,13 @@ import {
   auroraAt,
   eclipseAt,
   festivalFire,
+  /* ---- the prospector (additive) ---- */
+  goldStrike,
+  prospectorAt,
+  prospectorPath,
+  type GoldStrike,
+  type ProspectorPath,
+  /* ---- end the prospector (additive) ---- */
   marketSite,
   marketStalls,
   mistAt,
@@ -569,6 +580,24 @@ export interface GenesisScene {
    * should see.
    */
   fest: number;
+  /* ---- the prospector (additive) ---------------------------------------- *
+   * All four are pure functions of the MAP, decided once at bake time on
+   * exactly the same terms as `stalls`, `market` and `fire` above — which is
+   * the existing precedent for "a presentation fact the day cannot change".
+   * -------------------------------------------------------------------------- */
+  /** The stretch of river today's prospector works, or null in a dry valley. */
+  pan: ProspectorPath | null;
+  /** Today's strike, or null on the nineteen seeds in twenty that have none. */
+  strike: GoldStrike | null;
+  /** The buildings the strike gilds: every roof in the town nearest the bar. */
+  giltIds: Set<string>;
+  /**
+   * Has the hour come round? Set from the clock every frame, so a scrub back to
+   * noon puts it out again and `structFor` rebakes plain roofs on the next
+   * pass. This is the whole of the backward path — there is nothing to undo.
+   */
+  giltOn: boolean;
+  /* ---- end the prospector (additive) ------------------------------------- */
 }
 
 /**
@@ -1238,7 +1267,23 @@ export function* buildGenesisSceneSteps(
     market: day.type === 'market' ? marketSite(map) : null,
     fire: festivalFire(map),
     fest: 0,
+    /* ---- the prospector (additive) ---- */
+    pan: prospectorPath(map),
+    strike: null as GoldStrike | null,
+    giltIds: new Set<string>(),
+    giltOn: false,
+    /* ---- end the prospector (additive) ---- */
   };
+  /* ---- the prospector (additive) ----------------------------------------- *
+   * Rolled here rather than in the object literal because the gilt set is
+   * derived from the answer, and one place that reads "did it happen, and to
+   * whom" is worth more than two lines that each half-say it.
+   * -------------------------------------------------------------------------- */
+  scene.strike = goldStrike(map);
+  if (scene.strike?.site) {
+    for (const b of scene.strike.site.buildings) scene.giltIds.add(b.id);
+  }
+  /* ---- end the prospector (additive) ------------------------------------- */
   scene.veg = yield* buildVeg(scene, W, H);
   yield;
   scene.roads = buildRoadLayer(scene);
@@ -1661,8 +1706,20 @@ function cached(scene: GenesisScene, key: string, make: () => Sprite): Sprite {
 function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): StructureSprite {
   // Only a finished house lights its windows, and only after dark.
   const lit = scene.lit && progress >= 0.999;
+  /* ---- the prospector (additive) ----------------------------------------- *
+   * Gilt is one more dimension of the same cache key, on exactly the terms the
+   * lit flag already had: a finished roof in the struck town, after the hour.
+   * That makes the whole feature a cache miss and nothing else — no bake, no
+   * patch, no reset hook — and it makes a BACKWARD scrub free, because
+   * `giltOn` goes false, the key changes back and the plain roof is rebuilt.
+   * The relight budget below throttles the rebake, so a town does not gild
+   * itself in a single frame; it comes up gold over the next second, which is
+   * about how fast the news would travel anyway.
+   * -------------------------------------------------------------------------- */
+  const gilt = scene.giltOn && progress >= 0.999 && scene.giltIds.has(b.id);
   const stem = `${b.id}:${progress.toFixed(2)}`;
-  const key = `${stem}:${lit ? 1 : 0}`;
+  const key = `${stem}:${lit ? 1 : 0}:${gilt ? 1 : 0}`;
+  /* ---- end the prospector (additive) ------------------------------------- */
   const hit = scene.structs.get(b.id);
   if (hit && hit.key === key) return hit.sp;
   if (hit && hit.key.startsWith(`${stem}:`)) {
@@ -1672,7 +1729,7 @@ function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): Stru
     if (scene.relight <= 0) return hit.sp;
     scene.relight--;
   }
-  const sp = buildStructure({
+  const spec = {
     role: b.role,
     accent: b.accent,
     w: b.w,
@@ -1687,7 +1744,14 @@ function structFor(scene: GenesisScene, b: BuildingSpec, progress: number): Stru
     banner: b.banner,
     lit,
     seed: b.seed,
-  });
+  };
+  const sp = buildStructure(spec);
+  /* ---- the prospector (additive) ---- */
+  // A few dozen gold pixels over the finished canvas. The sprite's box and
+  // anchor are untouched, so every offset the caller already computed still
+  // holds and the occlusion pass never notices.
+  if (gilt) giltStructure(sp, spec);
+  /* ---- end the prospector (additive) ---- */
   // One entry per building: the old progress step is never coming back except
   // on a scrub, where rebuilding it costs a fraction of a millisecond.
   scene.structs.set(b.id, { key, sp });
@@ -3059,6 +3123,12 @@ export function renderGenesis(
   const sky = skyAt(snap.t, scene.day);
   scene.lit = sky.night > 0.5;
   scene.relight = 4;
+  /* ---- the prospector (additive) ---- */
+  // One comparison a frame, both ways. Forwards it turns the town gold at the
+  // hour; backwards — a scrub to noon — it turns it off again, and `structFor`
+  // rebuilds the plain roofs on the same budget it gilded them on.
+  scene.giltOn = !!scene.strike && snap.t >= scene.strike.at;
+  /* ---- end the prospector (additive) ---- */
   if (P) lap('setup');
   syncVeg(scene, snap);
   if (P) lap('veg');
@@ -3505,6 +3575,11 @@ export function renderGenesis(
 
   // WILDLIFE — ground-dwellers, inside the repair pass with the rest of the crowd.
   pushWildlife(scene, wild, items, wx0, wy0, wx1, wy1);
+  /* ---- the prospector (additive) ---- */
+  // One more ground-dweller, on the same terms: inside the repair pass, so the
+  // willow on the bank in front of him is painted back over his hat.
+  pushProspector(scene, snap, clock, items, wx0, wy0, wx1, wy1);
+  /* ---- end the prospector (additive) ---- */
   if (P) lap('wild');
 
   /* ---- occlusion repair ------------------------------------------------
@@ -5762,3 +5837,80 @@ export function drawFirefly(
     ctx.fillRect(Math.round(x), Math.round(y) - px, px, px * 3);
   }
 }
+
+/* ========================================================================== *
+ *                             THE PROSPECTOR                                 *
+ * -------------------------------------------------------------------------- *
+ * One man, every day, in the river. He kneels on a gravel bar and swirls a pan
+ * for the best part of an hour, wades ten yards further up and does it again,
+ * and by dusk he is ten to twenty tiles above where he started. Nobody in the
+ * valley talks to him and he builds nothing. He is here so that the river has
+ * somebody on it in the hours when the crews are all up on the plots.
+ *
+ * ── WHY IT IS NOT THE WILDLIFE PATTERN ────────────────────────────────────
+ * The fox is a good model for "where does he start today" and this borrows it
+ * wholesale: `prospectorPath` is a map-seeded substream, exactly as `foxNight`
+ * is, so the beat is a fact about the VALLEY and a reload or a scrub finds the
+ * same man on the same bank.
+ *
+ * But the wildlife's OTHER half — a WeakMap of mutable state, stepped by `dt`,
+ * thrown away and re-settled by `resetWildlife` — buys nothing here and costs
+ * the one property that matters. The strike has to survive a scrub, which means
+ * the man has to as well: dragging the scrubber back to nine in the morning must
+ * put him back on the bar he was on at nine, not wherever forty settle-steps
+ * happen to land him. So his position is an ANALYTIC function of `snap.t`
+ * (`prospectorAt`, in daytype.ts) and there is no state to keep, no reset hook
+ * to write and no settle loop to sit out. The only per-frame input is the
+ * renderer's clock, and it drives the swirl and nothing else — which is exactly
+ * what it should do, because a paused valley should show a man frozen mid-swirl
+ * over the bar he is actually on.
+ *
+ * The scene's own map-derived fields (`stalls`, `market`, `fire`) are the
+ * precedent this follows: presentation facts decided once at bake time.
+ * ========================================================================== */
+
+/**
+ * The prospector, as one depth-sorted item.
+ *
+ * Pushed with the wildlife and therefore inside the occlusion-repair budget:
+ * he works the bank, and a bank is where the reeds and the willows are.
+ */
+function pushProspector(
+  scene: GenesisScene,
+  snap: WorldSnapshot,
+  clock: number,
+  items: Item[],
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number
+): void {
+  const path = scene.pan;
+  if (!path) return;
+  const pose = prospectorAt(path, snap.t);
+  if (!pose) return;
+  const x = isoX(pose.gx, pose.gy);
+  const y = isoY(pose.gx, pose.gy);
+  if (x <= wx0 || x >= wx1 || y <= wy0 || y >= wy1) return;
+
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const { color } = path;
+  const { work, face } = pose;
+  // There is colour in the pan from the moment he finds it and not before —
+  // the same one comparison the roofs are gilded on, so the two can never
+  // disagree about whether today was the day.
+  const rich = scene.giltOn;
+  items.push({
+    // Half a pixel forward of the water he is standing in, so the ripple the
+    // river bake already put there stays behind his boots.
+    depth: y + 0.5,
+    bx: px - 12,
+    by: py - 20,
+    bw: 24,
+    bh: 22,
+    draw: (c) => drawPanner(c, px, py, color, face, work, clock, rich),
+  });
+}
+
+/* ---- end the prospector -------------------------------------------------- */

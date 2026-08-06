@@ -471,3 +471,221 @@ export function festivalFire(map: GenesisMap): Vec2 | null {
   }
   return best ? [Math.round(best[0] * 4) / 4, Math.round(best[1] * 4) / 4] : null;
 }
+
+/* ========================================================================== *
+ * THE PROSPECTOR, and the one day in twenty he finds something (additive)    *
+ * -------------------------------------------------------------------------- *
+ * Two more pure questions about a seed, on the same terms as everything above
+ * them: derived streams, DOM-free, and answered identically under bare node and
+ * in the browser. Nothing here touches the day-type lottery — a gold-strike day
+ * is orthogonal to the weather and composes with any of it. A market day can be
+ * a gold day; so can a storm.
+ *
+ * They live in this module rather than in the renderer because the TIMELINE
+ * needs one of them: the ledger names the town nearest the strike, and the
+ * ledger is built under bare node with no canvas in sight. `scene.ts` and
+ * `timeline.ts` both import from here already, which is what keeps the two of
+ * them agreeing about which town wakes up rich.
+ *
+ * The prospector's position is an ANALYTIC function of the hour — no
+ * integration, no accumulated state, no reset hook. That is the whole reason a
+ * scrub works: at 11:20 he is where 11:20 puts him, whether the visitor got
+ * there by watching or by dragging the scrubber backwards through the morning.
+ * ========================================================================== */
+
+/** Salts. Distinct from every other salt in the codebase, deliberately. */
+const SALT_PAN = 0x7ba17bed;
+const SALT_GOLD = 0x901dd05e;
+
+/** His working day: on the water a little before the crews, off it at dusk. */
+const PAN_FROM = 6.4;
+const PAN_TO = 19.4;
+/** How much of each bar's slot he spends kneeling rather than wading on. */
+const PAN_DWELL = 0.74;
+/** Tiles of river he works between dawn and dusk. */
+const PAN_MIN = 10;
+const PAN_MAX = 20;
+
+/** One seed in twenty turns up colour. */
+const GOLD_CHANCE = 1 / 20;
+/** …and never before the afternoon, never after the light starts going. */
+export const GOLD_FROM = 13.0;
+export const GOLD_TO = 16.5;
+
+/**
+ * The beat he works: a stretch of one bank, and the arclength table that turns
+ * an hour into a place on it.
+ */
+export interface ProspectorPath {
+  pts: Vec2[];
+  cum: number[];
+  len: number;
+  /** Arclength he starts the day at, and the signed distance he covers. */
+  s0: number;
+  span: number;
+  /** Which bank he kneels on: the sign of the river normal he stands off. */
+  side: 1 | -1;
+  /** How many gravel bars he works between dawn and dusk. */
+  bars: number;
+  /** How far off the centreline he kneels, in tiles. */
+  off: number;
+  /** A colour for his coat, picked once. */
+  color: string;
+}
+
+/** Where he is, and what he is doing about it. */
+export interface ProspectorPose {
+  gx: number;
+  gy: number;
+  /** 1 kneeling at a bar, 0 wading to the next one. */
+  work: 0 | 1;
+  /** Facing right on screen. */
+  face: boolean;
+}
+
+function panCum(pts: Vec2[]): { cum: number[]; len: number } {
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  }
+  return { cum, len: cum[cum.length - 1] || 1 };
+}
+
+/** Point and unit tangent at arclength `s` along a polyline. */
+function panPoint(
+  pts: Vec2[],
+  cum: number[],
+  len: number,
+  s: number
+): [number, number, number, number] {
+  const d = s < 0 ? 0 : s > len ? len : s;
+  let i = 1;
+  while (i < cum.length - 1 && cum[i] < d) i++;
+  const seg = cum[i] - cum[i - 1] || 1;
+  const f = (d - cum[i - 1]) / seg;
+  const ax = pts[i - 1][0];
+  const ay = pts[i - 1][1];
+  const dx = pts[i][0] - ax;
+  const dy = pts[i][1] - ay;
+  const L = Math.hypot(dx, dy) || 1;
+  return [ax + dx * f, ay + dy * f, dx / L, dy / L];
+}
+
+/** Coats, a subset of the crowd's own palette so he reads as one of them. */
+const PAN_COLORS = ['#c8a86a', '#9aa3ad', '#a9743e', '#6cc4d9'];
+
+/**
+ * The stretch of river this valley's prospector works today, or null if there
+ * is no river worth kneeling in.
+ *
+ * "Upstream" is taken to be whichever end of the river sits further UP THE
+ * SCREEN. There is no flow direction in the map data and there does not need to
+ * be one: in an isometric valley the far end reads as the head of the water, so
+ * walking towards it reads as walking upstream, which is the only thing this
+ * has to get right.
+ */
+export function prospectorPath(map: GenesisMap): ProspectorPath | null {
+  const pts = map.river ?? [];
+  if (pts.length < 2) return null;
+  const { cum, len } = panCum(pts);
+  if (len < 6) return null;
+
+  const rng = mulberry32(((map.seed >>> 0) ^ SALT_PAN) >>> 0);
+  // isoY is monotone in (gx + gy), so this comparison is the screen one.
+  const head = pts[0];
+  const tail = pts[pts.length - 1];
+  const up = tail[0] + tail[1] < head[0] + head[1] ? 1 : -1;
+
+  const lo = len * 0.06;
+  const hi = len * 0.94;
+  const room = Math.max(1, hi - lo);
+  const dist = Math.min(PAN_MIN + rng() * (PAN_MAX - PAN_MIN), room);
+  const slack = Math.max(0, room - dist);
+  const s0 = up > 0 ? lo + rng() * slack : lo + dist + rng() * slack;
+
+  return {
+    pts,
+    cum,
+    len,
+    s0,
+    span: up * dist,
+    side: rng() < 0.5 ? 1 : -1,
+    bars: 8 + Math.floor(rng() * 5),
+    // Half the channel plus a boot's width, so he is in the shallows at the
+    // edge of the water rather than out in the middle of the river.
+    off: (map.riverWidth ?? 0.95) * 0.5 + 0.45,
+    color: PAN_COLORS[Math.floor(rng() * PAN_COLORS.length)],
+  };
+}
+
+/**
+ * Where he is at hour `t`, or null when he is not out.
+ *
+ * The day is cut into `bars` equal slots. He spends the first three quarters of
+ * each one kneeling in the same place and the rest of it wading up to the next,
+ * which from across the valley is a man who moves about once an hour and
+ * otherwise does not move at all — which is what panning looks like.
+ */
+export function prospectorAt(path: ProspectorPath, t: number): ProspectorPose | null {
+  if (t < PAN_FROM || t >= PAN_TO) return null;
+  const k = (t - PAN_FROM) / (PAN_TO - PAN_FROM);
+  const u = k * path.bars;
+  const i = Math.min(path.bars - 1, Math.floor(u));
+  const f = u - i;
+  let step = i;
+  if (f > PAN_DWELL) {
+    const e = (f - PAN_DWELL) / (1 - PAN_DWELL);
+    step = i + e * e * (3 - 2 * e); // smoothstep: he sets off and settles again
+  }
+  const s = path.s0 + (path.span * step) / path.bars;
+  const [px, py, tx, ty] = panPoint(path.pts, path.cum, path.len, s);
+  const nx = -ty * path.side;
+  const ny = tx * path.side;
+  // Screen x runs with (gx - gy), so that is the sign that decides which way he
+  // is facing while he wades.
+  const dir = path.span > 0 ? 1 : -1;
+  return {
+    gx: px + nx * path.off,
+    gy: py + ny * path.off,
+    work: f > PAN_DWELL ? 0 : 1,
+    face: (tx - ty) * dir > 0,
+  };
+}
+
+/** The day's strike: when, where, and who is going to hear about it. */
+export interface GoldStrike {
+  at: number;
+  gx: number;
+  gy: number;
+  site: SiteSpec | null;
+}
+
+/**
+ * Is this one of the days? One seed in twenty, off its own stream, so it can
+ * land on a mist day, a market day or an ordinary Tuesday with equal ease and
+ * without moving a single tree, stall or cloud on any of them.
+ */
+export function goldStrike(map: GenesisMap): GoldStrike | null {
+  const rng = mulberry32(((map.seed >>> 0) ^ SALT_GOLD) >>> 0);
+  if (rng() >= GOLD_CHANCE) return null;
+  const at = GOLD_FROM + rng() * (GOLD_TO - GOLD_FROM);
+  const path = prospectorPath(map);
+  if (!path) return null;
+  const pose = prospectorAt(path, at);
+  if (!pose) return null;
+
+  // The nearest town to the gravel bar, with the id as an explicit tie-break so
+  // the answer never depends on array iteration luck.
+  let site: SiteSpec | null = null;
+  let best = Infinity;
+  for (const s of map.sites) {
+    const d = Math.hypot(s.gx - pose.gx, s.gy - pose.gy);
+    if (d < best || (d === best && site && s.id < site.id)) {
+      best = d;
+      site = s;
+    }
+  }
+  return { at, gx: pose.gx, gy: pose.gy, site };
+}
+
+/* ---- end the prospector (additive) --------------------------------------- */
