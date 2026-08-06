@@ -138,6 +138,11 @@ import {
   mistAt,
   stormAt,
   workPace,
+  /* ---- more day types (additive): falling stars, flood, drought ---- */
+  FLOOD_DRIFT,
+  riverMood,
+  starsAt,
+  /* ---- end more day types (additive) ---- */
   type DayInfo,
   type Season,
   type StallSpec,
@@ -1305,21 +1310,79 @@ export function* buildGenesisSceneSteps(
   /* ---- the river ------------------------------------------------------- */
   // Run both ends on past the map edge so the water leaves the frame instead of
   // stopping dead in the middle of the padding.
+  //
+  // FLOOD and DROUGHT live entirely in this block. `riverMood` hands back
+  // (1, 1, 1) on every other day there has ever been, so every line below is
+  // multiplied by one and lays down exactly the pixels it always laid down —
+  // the archive's rivers are safe by arithmetic rather than by branch. The two
+  // rare days change how the water is PAINTED and nothing whatever about where
+  // the map says it is: `map.river` and `map.riverWidth` are read, never
+  // written, so the bridges, fords, jetties, boats and the prospector's
+  // gravel bar all stand exactly where they stood.
   const river = extendEnds(map.river, OVER_V);
+  const mood = riverMood(day);
   const rw = map.riverWidth;
-  strip(ctx, river, rw + 0.75, PAL.sand);
-  strip(ctx, river, rw + 0.34, shade(PAL.sand, -0.12));
-  strip(ctx, river, rw, PAL.waterDeep);
-  strip(ctx, river, rw * 0.76, PAL.water);
-  strip(ctx, river, rw * 0.34, PAL.waterLight);
+  /** Half-width of the water itself, and of the banks it is held between. */
+  const ww = rw * mood.water;
+  const bw = rw * mood.bank;
+  if (mood.kind === 'flood') {
+    // Silt: the meadow the water was on this morning, well outside the banks.
+    strip(ctx, river, bw + 1.8, mix(PAL.dirtEdge, PAL.sand, 0.45));
+  }
+  strip(ctx, river, bw + 0.75, PAL.sand);
+  strip(ctx, river, bw + 0.34, shade(PAL.sand, -0.12));
+  if (mood.kind === 'drought') {
+    // The bed the water has come off, at the full width of the channel it is
+    // not filling any more: pale dry gravel, and a darker damp line down the
+    // middle where it has only just stopped being river.
+    strip(ctx, river, rw, mix(PAL.sand, PAL.dirtPale, 0.5));
+    strip(ctx, river, rw * 0.7, shade(PAL.dirtEdge, 0.26));
+  }
+  strip(ctx, river, ww, PAL.waterDeep);
+  strip(ctx, river, ww * 0.76, PAL.water);
+  strip(ctx, river, ww * 0.34, PAL.waterLight);
   const wrng = mulberry32(808);
+  // Nine flecks a segment on an ordinary day; a flood is white with them and a
+  // drought has barely enough water to make one. `mood.foam` is 1 everywhere
+  // else, so the draw count — and therefore every fleck in the archive — is
+  // untouched.
+  const nFoam = Math.round(9 * mood.foam);
   for (let i = 0; i + 1 < river.length; i++) {
-    for (let k = 0; k < 9; k++) {
-      const t = (k + wrng()) / 9;
+    for (let k = 0; k < nFoam; k++) {
+      const t = (k + wrng()) / nFoam;
       const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
       const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
-      const off = (wrng() - 0.5) * rw * 1.1;
+      const off = (wrng() - 0.5) * ww * 1.1;
       rect(ctx, isoX(gx, gy) + off * 16, isoY(gx, gy) + off * 6, 3 + wrng() * 4, 1, PAL.waterFoam);
+    }
+  }
+  if (mood.kind === 'drought') {
+    // ...and what the water has left behind on the way down: stones standing
+    // proud of the bed, and mud drying round them. Its own stream, appended
+    // after the foam loop, so an ordinary river never asks it a question.
+    const drng = mulberry32(0xd2007);
+    for (let i = 0; i + 1 < river.length; i++) {
+      for (let k = 0; k < 9; k++) {
+        const t = (k + drng()) / 9;
+        const gx = river[i][0] + (river[i + 1][0] - river[i][0]) * t;
+        const gy = river[i][1] + (river[i + 1][1] - river[i][1]) * t;
+        // Out in the exposed ring: past the thread of water, inside the bank.
+        const side = drng() < 0.5 ? -1 : 1;
+        const off = side * (ww * 1.25 + drng() * Math.max(0.12, rw - ww * 1.3));
+        const x = isoX(gx, gy) + off * 16;
+        const y = isoY(gx, gy) + off * 6;
+        if (drng() < 0.62) {
+          // Dark body, lit top, one pixel of shadow under it. Pale grey on pale
+          // sand disappears; a stone has to be a good deal darker than the bed
+          // it is sitting on before it reads as standing proud of it at all.
+          const w = 2 + Math.round(drng() * 3);
+          rect(ctx, x, y + 2, w + 1, 1, shade(PAL.dirtEdge, -0.3));
+          rect(ctx, x, y, w, 2, PAL.stoneDark);
+          rect(ctx, x, y - 1, w, 1, PAL.stone);
+        } else {
+          rect(ctx, x - 1, y, 3 + Math.round(drng() * 4), 1, shade(PAL.dirtEdge, -0.24));
+        }
+      }
     }
   }
 
@@ -3316,6 +3379,111 @@ function paintAurora(ctx: Ctx, a: number, dw: number, dh: number, clock: number)
   ctx.restore();
 }
 
+/* ===================== SHOOTING STARS (additive) ========================= *
+ * A meteor night, drawn the way the aurora is drawn: on the VIEWPORT, in
+ * device pixels, after the sky multiply and after the fireflies. Screen-space
+ * is the cheap currency in this renderer — the frame is content-bound, not
+ * pixel-bound — and a star is a fact about the sky rather than about the
+ * valley, so it has no business in the world buffer where the camera could
+ * pan it out of the way of the ridge it is supposed to be going over.
+ *
+ * Every lane is an ANALYTIC function of the animation clock: phase, period and
+ * flight are laid out once from the seed, and the frame asks each lane where it
+ * is rather than integrating anything. That means no state, no reset hook, and
+ * a paused frame that is identical to itself — which is what `genesis-ab.mjs`
+ * needs and what a visitor who asked for reduced motion gets (their clock does
+ * not run, so the sky simply holds).
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Lanes laid out per seed, and how long each waits between stars. Six lanes on
+ * a nine-to-eighteen second cycle works out at a star every couple of seconds
+ * and a third of a star on screen at any given instant — which is a *shower*
+ * rather than a sky with the occasional meteor in it, and deliberately so: this
+ * is a rare night whose entire content is what is falling out of it, and a
+ * visitor who has to wait ninety seconds for the one event of the day has not
+ * been given a rare night at all.
+ */
+const STAR_LANES = 6;
+/** Seconds between one lane's stars, before its own jitter. */
+const STAR_GAP = 9;
+const SALT_STARS = 0x5a11fa11;
+
+function paintStars(
+  ctx: Ctx,
+  a: number,
+  dw: number,
+  dh: number,
+  clock: number,
+  dpr: number,
+  seed: number
+): void {
+  const rng = mulberry32(((seed >>> 0) ^ SALT_STARS) >>> 0);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  for (let i = 0; i < STAR_LANES; i++) {
+    // The lane, drawn whole before anything is decided, so the layout of every
+    // later lane is the same whether or not this one happens to be alight.
+    const ph = rng();
+    const gap = STAR_GAP + rng() * 9;
+    const life = 0.5 + rng() * 0.45;
+    const x0 = -0.15 + rng() * 1.15;
+    const y0 = rng() * 0.3;
+    const dir = rng() < 0.5 ? -1 : 1;
+    const slope = 0.3 + rng() * 0.45;
+    const tail = (60 + rng() * 90) * dpr;
+    const bright = 0.72 + rng() * 0.28;
+
+    // Where this lane is in its own cycle, and whether that is anywhere at all.
+    const k = ((clock / gap + ph) % 1 + 1) % 1;
+    const f = (k * gap) / life;
+    if (f >= 1) continue;
+
+    // Fades in fast and out slowly, which is what a meteor does.
+    const alpha = a * bright * Math.pow(Math.sin(Math.PI * Math.min(1, f)), 0.7);
+    if (alpha < 0.02) continue;
+
+    const run = dw * 0.5;
+    const hx = x0 * dw + dir * run * f;
+    const hy = y0 * dh + run * slope * f;
+    const L = Math.hypot(dir * run, run * slope) || 1;
+    const ux = (dir * run) / L;
+    const uy = (run * slope) / L;
+    // The tail is short at the start of the flight, so a star arrives rather
+    // than simply being switched on with its whole length already behind it.
+    const len = tail * Math.min(1, f * 3.4);
+    const tx = hx - ux * len;
+    const ty = hy - uy * len;
+    // Two strokes off one gradient: a wide dim one for the bloom and a narrow
+    // bright one for the trail itself. The valley is not black at night — the
+    // sky is a multiply over green ground — so a single hairline of white gets
+    // lost in it, and the bloom is what makes the streak read as *light*
+    // rather than as a scratch on the screen.
+    const g = ctx.createLinearGradient(tx, ty, hx, hy);
+    g.addColorStop(0, 'rgba(186,214,255,0)');
+    g.addColorStop(1, `rgba(244,250,255,${Math.min(1, alpha).toFixed(3)})`);
+    ctx.strokeStyle = g;
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = 5 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(hx, hy);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 2 * dpr;
+    ctx.stroke();
+    // The head, which is the bit the eye actually catches.
+    ctx.globalAlpha = Math.min(1, alpha);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(hx - 1.5 * dpr, hy - 1.5 * dpr, 3 * dpr, 3 * dpr);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+/* ---- end shooting stars (additive) --------------------------------------- */
+
 /** Whatever weather the day has, over the finished frame. */
 function paintWeather(
   ctx: Ctx,
@@ -3334,6 +3502,10 @@ function paintWeather(
   if (r > 0.004) paintRain(ctx, r, dw, dh, clock, dpr, scene.map.seed);
   const a = auroraAt(day, t);
   if (a > 0.004) paintAurora(ctx, a, dw, dh, clock);
+  /* ---- more day types (additive) ---- */
+  const ss = starsAt(day, t);
+  if (ss > 0.004) paintStars(ctx, ss, dw, dh, clock, dpr, scene.map.seed);
+  /* ---- end more day types (additive) ---- */
 }
 
 /* ---------------------------------- sky ---------------------------------- */
@@ -4734,6 +4906,19 @@ interface WFish {
   vx: number;
   vy: number;
 }
+/* ---- more day types (additive): one piece of flood wreckage ---- */
+interface WDrift {
+  /** Arclength along the river, in tiles. Wraps. */
+  s: number;
+  /** How far off the centreline it is riding, in tiles. */
+  off: number;
+  /** Tiles a second, signed: positive is downstream. */
+  sp: number;
+  kind: 0 | 1 | 2;
+  /** Bob phase. The only per-piece animation there is. */
+  ph: number;
+}
+/* ---- end more day types (additive) ---- */
 interface WRing {
   x: number;
   y: number;
@@ -4814,6 +4999,8 @@ interface Wildlife {
   dogs: WDog[];
   fish: WFish[];
   rings: WRing[];
+  /** Flood days only; empty on every other day there has ever been. */
+  debris: WDrift[];
   /** Tree ids already accounted for, so a *transition* into felling is news. */
   seen: Set<string>;
   treeSize: number;
@@ -5224,6 +5411,7 @@ function ensureWild(scene: GenesisScene): Wildlife {
     dogs: [],
     fish: [],
     rings: [],
+    debris: [],
     seen: new Set(),
     treeSize: -1,
     vis: 0,
@@ -5279,7 +5467,10 @@ export function resetWildlife(scene: GenesisScene, amb: Ambient, snap: WorldSnap
   seedFlock(wl);
   seedPaddock(wl);
   seedPasture(wl);
-  seedDucks(wl);
+  seedDucks(scene, wl);
+  /* ---- more day types (additive) ---- */
+  seedDebris(scene, wl);
+  /* ---- end more day types (additive) ---- */
   wl.ready = true;
   // Settle, so a paused arrival or a deep link into an hour never opens on a
   // flock standing to attention in a perfect ring.
@@ -5410,6 +5601,9 @@ function stepWildlife(
   stepDucks(wl, dt, sky);
   stepDogs(scene, amb, wl, dt);
   stepFish(scene, wl, dt, sky);
+  /* ---- more day types (additive): a flood carries things past all day ---- */
+  stepDebris(scene, wl, dt);
+  /* ---- end more day types (additive) ---- */
 }
 
 /* ------------------------- birds out of a felled tree --------------------- */
@@ -5874,9 +6068,43 @@ function stepFox(wl: Wildlife, snap: WorldSnapshot, dt: number): void {
 
 /* --------------------------------- ducks ---------------------------------- */
 
-function seedDucks(wl: Wildlife): void {
+function seedDucks(scene: GenesisScene, wl: Wildlife): void {
   wl.ducks.length = 0;
   const lk = wl.cache.lake;
+  /* ---- more day types (additive): drought ------------------------------- *
+   * On a drought day everything with legs is standing in what is left of the
+   * river, and the ducks are the cheapest way to say so: same birds, same
+   * budget, moved onto the water that shrank and bunched up on it. A tight
+   * cluster on one stretch, with the drift radius taken right down — spread
+   * them out and they read as an ordinary morning on an ordinary river, which
+   * is the one thing this day is not. */
+  const geo = wl.cache.rgeo;
+  if (scene.day.type === 'drought' && geo && scene.map.river.length >= 2) {
+    const rng = wl.rng;
+    const rw = scene.map.riverWidth;
+    // One pool, somewhere down the middle of the reach, and everybody in it.
+    const s0 = geo.len * (0.18 + rng() * 0.64);
+    const n = 4 + Math.floor(rng() * 3);
+    for (let i = 0; i < Math.min(DUCK_MAX, n); i++) {
+      const at = alongPolyline(scene.map.river, geo, s0 + (rng() - 0.5) * 2.6);
+      // Inside the thread of water that is left, not out on the dry bed.
+      const off = (rng() - 0.5) * rw * 0.45;
+      wl.ducks.push({
+        bx: at[0] + off,
+        by: at[1] - off,
+        gx: at[0] + off,
+        gy: at[1] - off,
+        r: 0.14 + rng() * 0.18,
+        ph: rng() * 12,
+        sp: 0.16 + rng() * 0.14,
+        a: rng() * 6.283,
+        b: rng() * 6.283,
+        face: rng() < 0.5,
+      });
+    }
+    return;
+  }
+  /* ---- end more day types (additive) ------------------------------------ */
   if (!lk) return;
   const rng = wl.rng;
   const n = 3 + Math.floor(rng() * 2);
@@ -5922,6 +6150,87 @@ function stepDucks(wl: Wildlife, dt: number, sky: Sky): void {
     d.gy = gy;
   }
 }
+
+/* ================ FLOOD DAY — what the water is carrying ================== *
+ * The river bake makes a flood day look wide; this makes it look FAST, which is
+ * the half the bake cannot do. Eight bits of somebody's fence going past at a
+ * brisk walking pace is the whole feature, and eight items in the depth sort is
+ * nothing beside the fourteen hundred an evening at pace 4 already carries.
+ *
+ * It rides in the wildlife layer rather than the ambient one because it is
+ * exactly the same shape as the ducks: seeded off the map, stepped by the
+ * renderer's clock, pushed as ordinary depth-sorted ground items, thrown away
+ * and re-seeded on a scrub. Nothing about it is in the timeline, and nothing
+ * about it needs to be — flotsam has no consequences.
+ * -------------------------------------------------------------------------- */
+
+/** How much wreckage the water is carrying. Eight reads as a lot; it isn't. */
+const DRIFT_MAX = 8;
+
+function seedDebris(scene: GenesisScene, wl: Wildlife): void {
+  wl.debris.length = 0;
+  if (scene.day.type !== 'flood') return;
+  const geo = wl.cache.rgeo;
+  const river = scene.map.river;
+  if (!geo || river.length < 2 || geo.len < 4) return;
+  const rng = wl.rng;
+  // DOWNSTREAM. There is no flow direction in the map data and there does not
+  // need to be one: isoY is monotone in (gx + gy), so the end further DOWN the
+  // screen is the end the water is going to — the same reading the prospector
+  // makes when he decides which way is up the valley.
+  const head = river[0];
+  const tail = river[river.length - 1];
+  const down = tail[0] + tail[1] > head[0] + head[1] ? 1 : -1;
+  for (let i = 0; i < DRIFT_MAX; i++) {
+    wl.debris.push({
+      s: rng() * geo.len,
+      off: (rng() - 0.5) * scene.map.riverWidth * 1.5,
+      sp: down * FLOOD_DRIFT * (0.72 + rng() * 0.56),
+      kind: Math.floor(rng() * 3) as 0 | 1 | 2,
+      ph: rng() * 6.283,
+    });
+  }
+}
+
+/** Downstream, and round again — the river is a loop as far as this is
+ * concerned, because there is always more of somebody's fence upstream. */
+function stepDebris(scene: GenesisScene, wl: Wildlife, dt: number): void {
+  if (!wl.debris.length) return;
+  const geo = wl.cache.rgeo;
+  if (!geo) return;
+  for (const d of wl.debris) {
+    d.s += d.sp * dt;
+    if (d.s > geo.len) d.s -= geo.len;
+    else if (d.s < 0) d.s += geo.len;
+    d.ph += dt * 1.6;
+  }
+}
+
+/**
+ * One piece of wreckage, in world pixels, on the world buffer. Small on
+ * purpose: a plank the size of a cart reads as a boat, and a boat on a flood
+ * is a different story about the valley than the one being told.
+ */
+function drawFlotsam(ctx: Ctx, x: number, y: number, kind: 0 | 1 | 2, lift: number): void {
+  const yy = y + lift;
+  if (kind === 0) {
+    // A length of board, riding flat.
+    rect(ctx, x - 5, yy - 1, 11, 2, PAL.woodDark);
+    rect(ctx, x - 5, yy - 2, 11, 1, PAL.wood);
+  } else if (kind === 1) {
+    // A branch, still with a bit of green on it.
+    rect(ctx, x - 4, yy - 1, 9, 1, shade(PAL.woodDark, -0.14));
+    rect(ctx, x - 1, yy - 3, 3, 2, PAL.leafDark);
+    rect(ctx, x + 3, yy - 2, 2, 1, shade(PAL.woodDark, -0.14));
+  } else {
+    // A hurdle, or what is left of one.
+    rect(ctx, x - 4, yy - 2, 8, 3, PAL.woodDark);
+    rect(ctx, x - 3, yy - 3, 2, 3, PAL.wood);
+    rect(ctx, x + 1, yy - 3, 2, 3, PAL.wood);
+  }
+}
+
+/* ---- end flood day (additive) -------------------------------------------- */
 
 /* ------------------------- birds on a finished roof ----------------------- */
 
@@ -6252,6 +6561,42 @@ function pushWildlife(
       d.gy
     );
   }
+
+  /* ---- more day types (additive): the flood's wreckage ------------------- *
+   * Drawn rather than blitted from a sprite pool, because there are eight of
+   * them and each is a handful of rects — a pool entry per (kind × bob frame)
+   * would cost more canvas than it saves calls. */
+  const dgeo = wl.cache.rgeo;
+  if (wl.debris.length && dgeo) {
+    const dpts = scene.map.river;
+    for (const d of wl.debris) {
+      const at = alongPolyline(dpts, dgeo, d.s);
+      const gx = at[0] + d.off;
+      const gy = at[1] - d.off;
+      const x = isoX(gx, gy);
+      const y = isoY(gx, gy);
+      if (!seen(x, y)) continue;
+      // Riding the swell: a pixel up, a pixel down, out of phase with itself.
+      const lift = Math.round(Math.sin(d.ph) * 1.2);
+      items.push({
+        depth: y - 0.5,
+        bx: Math.round(x - 7),
+        by: Math.round(y - 4),
+        bw: 14,
+        bh: 8,
+        draw: (c) => drawRipple(c, x, y + lift, 5, 0.26),
+      });
+      items.push({
+        depth: y,
+        bx: Math.round(x - 6),
+        by: Math.round(y - 6),
+        bw: 13,
+        bh: 8,
+        draw: (c) => drawFlotsam(c, Math.round(x), Math.round(y), d.kind, lift),
+      });
+    }
+  }
+  /* ---- end more day types (additive) ------------------------------------ */
 
   /* ---- and the birds that are sitting still ------------------------------
    * Depth is the *building's* ground line plus a hair, which is the one number

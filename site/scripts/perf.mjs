@@ -99,6 +99,9 @@ const heavy = heaviestSeed(50, 4);
 // whole founding crew standing round a fire), so both get a scenario of their
 // own at the pace that builds the most valley.
 const market = findDay('market');
+// MORE DAY TYPES — a meteor night and a river in flood.
+const stars = findDay('stars');
+const flood = findDay('flood');
 const festival = (() => {
   for (let s = 1; s < 500; s++) {
     const map = generateMap(s, 4);
@@ -151,6 +154,26 @@ const SCENARIOS = [
     id: 'festival-p4',
     label: `festival 21:30 seed ${festival} · pace 4`,
     seed: festival,
+    pace: 4,
+    t: 21.5,
+  },
+  // MORE DAY TYPES — the two that cost anything per frame. Stars are pure
+  // screen space (six lanes of gradient stroke, and rarely more than one
+  // alight), and a flood is eight extra items in the depth sort; both are
+  // expected to be free, and this is where that expectation is checked rather
+  // than asserted. Drought has no scenario because it adds no per-frame work
+  // at all — its whole cost is in the bake.
+  {
+    id: 'stars-p1',
+    label: `shooting stars 23:00 seed ${stars.seed} · pace 1`,
+    seed: stars.seed,
+    pace: 1,
+    t: 23.0,
+  },
+  {
+    id: 'flood-p4',
+    label: `flood evening seed ${flood.seed} · pace 4`,
+    seed: flood.seed,
     pace: 4,
     t: 21.5,
   },

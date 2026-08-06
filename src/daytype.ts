@@ -4,13 +4,15 @@
  * Two small pure questions about a seed, kept away from everything that
  * answers them:
  *
- *   what *kind* of day is this?   Most are ordinary. About one in four draws
+ *   what *kind* of day is this?   Most are ordinary. About one in three draws
  *                                 something: mist that burns off by nine, an
  *                                 eclipse at two in the afternoon, a storm that
  *                                 stops the crews for a couple of hours, an
- *                                 aurora after half past nine — or, rarest of
- *                                 the lot, a market, which is the one that is
- *                                 not weather at all.
+ *                                 aurora after half past nine, a night with
+ *                                 stars falling out of it, a river up over its
+ *                                 banks or down to a thread between the stones
+ *                                 — or a market, which is the one that is not
+ *                                 weather at all.
  *   what *season* is it?          Which is a different question entirely — a
  *                                 date-derived world takes the real month, and
  *                                 a browsed seed derives one of its own.
@@ -26,7 +28,18 @@
 
 import { mulberry32, type GenesisMap, type SiteSpec, type Vec2 } from './types.ts';
 
-export type DayType = 'normal' | 'mist' | 'eclipse' | 'storm' | 'aurora' | 'market';
+export type DayType =
+  | 'normal'
+  | 'mist'
+  | 'eclipse'
+  | 'storm'
+  | 'aurora'
+  | 'market'
+  // APPENDED, never inserted — see TABLE. A night with something falling out of
+  // it, and the two days the river is the wrong size.
+  | 'stars'
+  | 'flood'
+  | 'drought';
 export type Season = 'winter' | 'spring' | 'summer' | 'autumn';
 
 export interface DayInfo {
@@ -38,20 +51,33 @@ export interface DayInfo {
 }
 
 /**
- * Frequencies. They sum to 0.20 — one day in five is *something* — and the
- * rarest is still better than one in forty, which is often enough that a week
- * of browsing finds it.
+ * Frequencies. The rarest is still better than one in forty, which is often
+ * enough that a week of browsing finds it.
+ *
+ * THIS TABLE IS APPEND-ONLY, and that is the whole discipline of the module.
+ * It is walked cumulatively from the top, so a row added to the *end* can only
+ * ever claim seeds that used to roll `normal` — every mist day, storm day,
+ * aurora day, eclipse day and market day in the archive is still exactly the
+ * day it was, and always will be. Inserting a row (or changing a probability
+ * anywhere but the last row) re-cuts every boundary below it and silently
+ * rewrites the past. The only free tuning knob is the LAST row's number.
+ *
+ * Running total after the three appended below: 0.334 — one day in three is
+ * something, across nine kinds of something.
  */
 const TABLE: [DayType, number][] = [
   ['mist', 0.06],
   ['storm', 0.06],
   ['aurora', 0.05],
   ['eclipse', 0.03],
-  // MARKET — appended, never inserted. The table is walked cumulatively, so a
-  // type on the end can only ever claim seeds that used to roll `normal`:
-  // every mist day, storm day, aurora day and eclipse day in the archive is
-  // still exactly the day it was.
+  // MARKET — appended, never inserted; the one rare day that is not weather.
   ['market', 0.035],
+  // STARS / FLOOD / DROUGHT — appended in this order and no other. One in
+  // thirty each, which is about eclipse-rare: rare enough to be a find, common
+  // enough that a fortnight of ‹ › turns one up.
+  ['stars', 0.033],
+  ['flood', 0.033],
+  ['drought', 0.033],
 ];
 
 /** Salts. Distinct from every other salt in the codebase, deliberately. */
@@ -73,9 +99,11 @@ const BY_MONTH: Season[] = [
 /**
  * The day type of a seed, and when it happens.
  *
- * The window is drawn from the same stream whatever the type, so the draw count
- * never varies — which keeps the stream re-orderable if a fifth type is ever
- * slotted in above the others.
+ * EXACTLY THREE DRAWS, on every branch, for every type there will ever be: the
+ * roll, and the two numbers `a` and `b` that shape the window. A new type must
+ * take its window out of those two and no others — the moment one branch draws
+ * a third, the stream stops being a fixed-shape stream and the numbers a seed
+ * has always had start depending on which branch it took.
  */
 export function dayTypeOf(seed: number): { type: DayType; from: number; to: number } {
   const r = mulberry32(((seed >>> 0) ^ SALT_TYPE) >>> 0);
@@ -92,7 +120,19 @@ export function dayTypeOf(seed: number): { type: DayType; from: number; to: numb
       break;
     }
   }
+  return windowFor(type, a, b);
+}
 
+/**
+ * When a day of kind `type` happens, given the two window numbers.
+ *
+ * Split out of `dayTypeOf` so that the dev-only `?day=` override can ask for a
+ * *different* kind of day on the same seed without reimplementing any of this —
+ * which is how the flood and drought rivers get photographed at the same bend
+ * of the same valley. The lottery above is the only thing that decides what
+ * kind of day a seed really is.
+ */
+function windowFor(type: DayType, a: number, b: number): { type: DayType; from: number; to: number } {
   switch (type) {
     // Thick before first light, thinning from breakfast, gone by half nine.
     case 'mist':
@@ -114,6 +154,22 @@ export function dayTypeOf(seed: number): { type: DayType; from: number; to: numb
     // and they come down when the light goes rather than when the trade does.
     case 'market':
       return { type, from: 8.7 + a * 0.5, to: 19.3 + b * 0.7 };
+    // STARS — once it is properly dark, and then all the way out, like the
+    // aurora. A shower does not stop; the valley goes to bed.
+    case 'stars':
+      return { type, from: 21.5 + a * 0.6, to: 24 };
+    /* FLOOD and DROUGHT are the odd ones out, and it is worth being exact
+     * about what their window means. The water is the wrong size ALL DAY —
+     * a river is baked into the terrain, and the terrain is baked once at
+     * midnight, so there is no hour at which the flood arrives or the drought
+     * breaks. `from`/`to` are therefore not the phenomenon's window but the
+     * hours the valley TALKS about it: the morning somebody walks down to the
+     * crossing and finds it gone, and the evening they write it up. Nothing
+     * else reads them, and nothing else should. */
+    case 'flood':
+      return { type, from: 5.6 + a * 0.9, to: 16.4 + b * 1.3 };
+    case 'drought':
+      return { type, from: 6.3 + a * 0.9, to: 15.8 + b * 1.5 };
     default:
       return { type: 'normal', from: 0, to: 0 };
   }
@@ -134,6 +190,26 @@ export function seasonOf(seed: number, month: number | null = null): Season {
 export function dayInfo(seed: number, month: number | null = null): DayInfo {
   const d = dayTypeOf(seed);
   return { ...d, season: seasonOf(seed, month) };
+}
+
+/** Every kind of day there is, in lottery order. For the dev override and the
+ * harnesses; nothing in the world reads it. */
+export const DAY_TYPES: DayType[] = ['normal', ...TABLE.map(([k]) => k)];
+
+/**
+ * DEV ONLY — what this seed's day would look like if it were a `type` day.
+ *
+ * The window comes off the seed's own two window draws, so a forced day is the
+ * day this valley would have had rather than an invented one, and it is stable:
+ * the same `?day=flood&seed=47` is the same flood every time. The lottery is
+ * untouched — this is a camera, not a coin.
+ */
+export function dayOfType(seed: number, type: DayType, month: number | null = null): DayInfo {
+  const r = mulberry32(((seed >>> 0) ^ SALT_TYPE) >>> 0);
+  r();
+  const a = r();
+  const b = r();
+  return { ...windowFor(type, a, b), season: seasonOf(seed, month) };
 }
 
 /** An ordinary summer day: the default wherever a caller has no opinion. */
@@ -174,6 +250,74 @@ export function auroraAt(day: DayInfo, t: number): number {
   if (day.type !== 'aurora' || t < day.from) return 0;
   return smooth((t - day.from) / 0.7);
 }
+
+/**
+ * Shooting stars: how much of the shower there is, 0..1. Same shape as the
+ * aurora — it fades up as the sky finishes darkening and then simply stays,
+ * because what varies over a meteor night is not the brightness of the sky but
+ * how recently something went across it, and that is the renderer's clock's
+ * business rather than the hour's.
+ */
+export function starsAt(day: DayInfo, t: number): number {
+  if (day.type !== 'stars' || t < day.from) return 0;
+  return smooth((t - day.from) / 0.8);
+}
+
+/* ============================ FLOOD and DROUGHT ========================== *
+ * The two rare days that are not in the sky, and the one thing they are
+ * allowed to be.
+ *
+ * A flood day and a drought day are PRESENTATION AND NARRATION and nothing
+ * else: a different-looking river baked into the terrain at midnight, some
+ * wreckage going past on it, and a ledger with an opinion. They deliberately do
+ * NOT move a crossing, add a ford, delete a bridge or re-route a road — a map
+ * that changed shape on a flood day would be a *different valley* for that
+ * seed, and the archive's whole promise is that seed 4711 is seed 4711 in
+ * January and in July, in the rain and in the sun.
+ *
+ * So the entire mechanism is the struct below: three multipliers the scene's
+ * river bake reads, and an identity value for every other day there has ever
+ * been. `CALM_RIVER` is the byte-identity proof — on any day that is not one of
+ * these two, the bake multiplies by one, one and one and lays down exactly the
+ * pixels it laid down before this feature existed.
+ * ------------------------------------------------------------------------- */
+
+export interface RiverMood {
+  /** null on every ordinary day, which is what keeps the bake identical. */
+  kind: 'flood' | 'drought' | null;
+  /** Multiplier on the half-width the WATER is painted at. */
+  water: number;
+  /** Multiplier on the half-width the BANKS are painted at. */
+  bank: number;
+  /** Foam flecks per river segment, relative to an ordinary day's nine. */
+  foam: number;
+}
+
+/** An ordinary river. Frozen so a caller cannot make one day's water sticky. */
+export const CALM_RIVER: RiverMood = Object.freeze({
+  kind: null,
+  water: 1,
+  bank: 1,
+  foam: 1,
+});
+
+/**
+ * How today's river is painted.
+ *
+ * Flood: the water goes out well past its own banks and takes a smear of silt
+ * with it, and there is a great deal more of it moving. Drought: the water
+ * pulls back to a thread down the middle of a channel that stays exactly where
+ * it was — which is the point, because the exposed bed either side is the whole
+ * picture, and it can only be exposed if the banks do not move with it.
+ */
+export function riverMood(day: DayInfo): RiverMood {
+  if (day.type === 'flood') return { kind: 'flood', water: 1.6, bank: 1.62, foam: 2.4 };
+  if (day.type === 'drought') return { kind: 'drought', water: 0.4, bank: 1, foam: 0.34 };
+  return CALM_RIVER;
+}
+
+/** Tiles a second the wreckage travels on a flood. A brisk walk. */
+export const FLOOD_DRIFT = 0.55;
 
 /* --------------------------------- storms -------------------------------- */
 

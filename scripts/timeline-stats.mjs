@@ -11,6 +11,7 @@
 
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const gdir = join(root, 'src/components/designs/genesis');
@@ -1073,6 +1074,356 @@ total += shapes.length;
           (n ? `   ${'|'.repeat(n)} ${n} tree${n > 1 ? 's' : ''} felled in this stretch` : ''),
       );
       prev = e;
+    }
+  }
+}
+
+/* ========================================================================== */
+/* THE DAY-TYPE LOTTERY                                                       */
+/* -------------------------------------------------------------------------- *
+ * The lottery is APPEND-ONLY, and that promise is the archive's: a valley
+ * browsed a year ago has to still be the day it was. Nothing else in the
+ * codebase can enforce that, because the failure mode is a *diff* — somebody
+ * inserts a row into TABLE, every boundary below it shifts, and thousands of
+ * days silently become different days with no test going red anywhere.
+ *
+ * So the harness carries its own copy of the table, as a ledger. Two things
+ * come out of it:
+ *
+ *   the CURRENT table must match the ledger    (a row moved, or a probability
+ *                                               changed, and nobody said so)
+ *   EVERY PREFIX of the ledger must agree      (the append-only property
+ *     with the whole ledger about every seed    itself, proved from the table
+ *     that prefix assigns                       rather than from stored data)
+ *
+ * The second is the load-bearing one, and it is why the ledger is written as a
+ * list rather than as a set: walk the first k rows, and every seed that lands
+ * on a type must land on the SAME type under all n. That is true of an appended
+ * row and false of an inserted one, for any k at all.
+ * ========================================================================== */
+
+const {
+  dayTypeOf,
+  dayInfo,
+  mistAt,
+  eclipseAt,
+  stormAt,
+  auroraAt,
+  starsAt,
+  stormWarp,
+  workPace,
+  riverMood,
+  CALM_RIVER,
+} = await import(join(gdir, 'daytype.ts'));
+
+console.log(`\n${'='.repeat(72)}`);
+console.log('day-type lottery');
+
+/**
+ * The ledger. Rows in the order they were appended, ever. ADD TO THE END ONLY;
+ * if you find yourself editing a line above the last one, the thing you are
+ * about to do rewrites days that already happened.
+ */
+const DAY_LEDGER = [
+  ['mist', 0.06],
+  ['storm', 0.06],
+  ['aurora', 0.05],
+  ['eclipse', 0.03],
+  ['market', 0.035],
+  ['stars', 0.033],
+  ['flood', 0.033],
+  ['drought', 0.033],
+];
+/** Every type the module can answer with, plus the one it answers with most. */
+const ALL_DAYS = ['normal', ...DAY_LEDGER.map(([k]) => k)];
+const SALT_TYPE = 0xda7c0de1;
+const DAY_N = 20000;
+
+/** The type a table of `rows` gives a seed, walked exactly as daytype.ts walks it. */
+function typeFrom(rows, seed) {
+  const roll = mulberry32(((seed >>> 0) ^ SALT_TYPE) >>> 0)();
+  let acc = 0;
+  for (const [k, p] of rows) {
+    acc += p;
+    if (roll < acc) return k;
+  }
+  return 'normal';
+}
+
+/* ---- (day-a) the module's table is the ledger's table --------------------- */
+{
+  const bad = [];
+  for (let s = 1; s <= DAY_N && bad.length < 6; s++) {
+    const want = typeFrom(DAY_LEDGER, s);
+    const got = dayTypeOf(s).type;
+    if (want !== got) bad.push(`seed ${s}: ledger says ${want}, daytype.ts says ${got}`);
+  }
+  total++;
+  if (bad.length) {
+    failed++;
+    console.log('\n! (day-a) daytype.ts TABLE does not match the harness ledger');
+    for (const b of bad) console.log(`    ${b}`);
+  } else {
+    console.log(`  (day-a) ok   table matches the ledger over ${DAY_N} seeds`);
+  }
+}
+
+/* ---- (day-b) every prefix agrees: the append-only proof ------------------- */
+{
+  const bad = [];
+  for (let k = 1; k < DAY_LEDGER.length; k++) {
+    const prefix = DAY_LEDGER.slice(0, k);
+    for (let s = 1; s <= DAY_N; s++) {
+      const was = typeFrom(prefix, s);
+      if (was === 'normal') continue; // a `normal` seed is allowed to be claimed
+      const now = dayTypeOf(s).type;
+      if (was !== now) {
+        bad.push(`prefix of ${k}: seed ${s} was ${was}, is now ${now}`);
+        break;
+      }
+    }
+  }
+  total++;
+  if (bad.length) {
+    failed++;
+    console.log('\n! (day-b) the lottery is NOT append-only — a row was inserted or re-weighted');
+    for (const b of bad) console.log(`    ${b}`);
+  } else {
+    console.log(
+      `  (day-b) ok   all ${DAY_LEDGER.length - 1} prefixes agree with the whole table ` +
+        `(append-only, ${DAY_N} seeds each)`
+    );
+  }
+}
+
+/* ---- (day-c) how often each kind of day actually turns up ---------------- */
+{
+  const counts = Object.fromEntries(ALL_DAYS.map((k) => [k, 0]));
+  for (let s = 1; s <= DAY_N; s++) counts[dayTypeOf(s).type]++;
+  const bad = [];
+  for (const [k, p] of DAY_LEDGER) {
+    const rate = counts[k] / DAY_N;
+    // Wide enough that sampling noise never fails it, tight enough that a
+    // mis-typed probability does.
+    if (Math.abs(rate - p) > Math.max(0.006, p * 0.16)) {
+      bad.push(`${k}: ${(rate * 100).toFixed(2)}% over ${DAY_N} seeds, table says ${(p * 100).toFixed(1)}%`);
+    }
+  }
+  const special = DAY_N - counts.normal;
+  console.log(
+    `  (day-c) ${bad.length ? 'BAD ' : 'ok  '} rates over ${DAY_N} seeds: ` +
+      DAY_LEDGER.map(([k]) => `${k} ${((counts[k] / DAY_N) * 100).toFixed(2)}%`).join(', ')
+  );
+  console.log(
+    `           ordinary ${((counts.normal / DAY_N) * 100).toFixed(1)}%, ` +
+      `something ${((special / DAY_N) * 100).toFixed(1)}% (1 day in ${(DAY_N / special).toFixed(1)})`
+  );
+  total++;
+  if (bad.length) {
+    failed++;
+    for (const b of bad) console.log(`    ! ${b}`);
+  }
+}
+
+/* ---- (day-d) three draws, on every branch, for every type ---------------- *
+ * `dayTypeOf` takes exactly three numbers off its stream — the roll, and the
+ * two the window is shaped from — and a new type that reaches for a fourth
+ * would move the windows of every type that follows it in the switch. Proved
+ * functionally rather than by reading the source: if a type's window really is
+ * built out of draws 2 and 3, then `from` is affine in draw 2 and `to` is
+ * affine in (draw 2, draw 3). Fit the coefficients off the first few seeds of
+ * that type and every remaining seed of that type must land on them. */
+{
+  const draws = (seed) => {
+    const r = mulberry32(((seed >>> 0) ^ SALT_TYPE) >>> 0);
+    r();
+    return [r(), r()];
+  };
+  const byType = Object.fromEntries(ALL_DAYS.map((k) => [k, []]));
+  for (let s = 1; s <= DAY_N; s++) {
+    const d = dayTypeOf(s);
+    const [a, b] = draws(s);
+    byType[d.type].push([a, b, d.from, d.to]);
+  }
+  /** Solve for the plane z = c0 + c1*a + c2*b through three samples. */
+  const solve3 = (rows, zi) => {
+    const [p, q, r] = rows;
+    const A = [
+      [1, p[0], p[1], p[zi]],
+      [1, q[0], q[1], q[zi]],
+      [1, r[0], r[1], r[zi]],
+    ];
+    for (let c = 0; c < 3; c++) {
+      let piv = c;
+      for (let i = c + 1; i < 3; i++) if (Math.abs(A[i][c]) > Math.abs(A[piv][c])) piv = i;
+      if (Math.abs(A[piv][c]) < 1e-12) return null;
+      [A[c], A[piv]] = [A[piv], A[c]];
+      for (let i = 0; i < 3; i++) {
+        if (i === c) continue;
+        const f = A[i][c] / A[c][c];
+        for (let j = c; j < 4; j++) A[i][j] -= f * A[c][j];
+      }
+    }
+    return [A[0][3] / A[0][0], A[1][3] / A[1][1], A[2][3] / A[2][2]];
+  };
+  const bad = [];
+  for (const k of ALL_DAYS) {
+    const rows = byType[k];
+    if (k === 'normal' || rows.length < 8) continue;
+    for (const [zi, label] of [
+      [2, 'from'],
+      [3, 'to'],
+    ]) {
+      const c = solve3(rows.slice(0, 3), zi);
+      if (!c) continue; // degenerate sample; the other field still checks it
+      let worst = 0;
+      for (const row of rows) {
+        const want = c[0] + c[1] * row[0] + c[2] * row[1];
+        worst = Math.max(worst, Math.abs(want - row[zi]));
+      }
+      if (worst > 1e-9) bad.push(`${k}.${label} is not affine in the two window draws (off by ${worst})`);
+    }
+  }
+  total++;
+  if (bad.length) {
+    failed++;
+    console.log('\n! (day-d) dayTypeOf does not take exactly three draws on every branch');
+    for (const b of bad) console.log(`    ${b}`);
+  } else {
+    console.log('  (day-d) ok   every window is affine in draws 2 and 3 — the draw count is fixed at 3');
+  }
+}
+
+/* ---- (day-e) one warp, one phenomenon each ------------------------------- *
+ * Storm's `stormWarp` is the ONE time warp in the codebase and there must never
+ * be a second: two warps on one day would compose into a shape the pacing
+ * solver never solved for, and the last roof would stop landing where it was
+ * put. So every other day type — including the three presentation days — must
+ * be the identity on time and on the work rate. And each intensity curve must
+ * answer for its own day and no other, or a flood day would come out foggy. */
+{
+  const bad = [];
+  const seen = new Set();
+  const grid = [];
+  for (let t = 0; t <= 24.0001; t += 0.05) grid.push(Number(t.toFixed(2)));
+  const curves = { mist: mistAt, eclipse: eclipseAt, storm: stormAt, aurora: auroraAt, stars: starsAt };
+  for (let s = 1; s <= DAY_N && seen.size < ALL_DAYS.length; s++) {
+    const day = dayInfo(s, null);
+    if (seen.has(day.type)) continue;
+    seen.add(day.type);
+    for (const t of grid) {
+      if (day.type !== 'storm') {
+        if (stormWarp(day, t) !== t) bad.push(`${day.type} (seed ${s}) warps time at ${t}`);
+        if (workPace(day, t) !== 1) bad.push(`${day.type} (seed ${s}) changes the work rate at ${t}`);
+      }
+      for (const [k, fn] of Object.entries(curves)) {
+        if (k === day.type) continue;
+        if (fn(day, t) !== 0) bad.push(`${day.type} (seed ${s}) makes ${k}At non-zero at ${t}`);
+      }
+      if (bad.length > 5) break;
+    }
+  }
+  total++;
+  if (bad.length) {
+    failed++;
+    console.log('\n! (day-e) a day type reached outside its own lane');
+    for (const b of bad.slice(0, 6)) console.log(`    ${b}`);
+  } else {
+    console.log(
+      `  (day-e) ok   storm is still the only time warp; each curve answers only for its own day ` +
+        `(${seen.size} types × ${grid.length} hours)`
+    );
+  }
+}
+
+/* ---- (day-f) flood and drought are BAKE-TIME AND NARRATION ONLY ---------- *
+ * The whole of their world-visible effect is `riverMood`, which the scene reads
+ * once when it bakes the terrain. On every other day it must hand back exact
+ * ones — that is what makes every river in the archive byte-identical to the
+ * river it was before flood and drought existed, by arithmetic rather than by
+ * anybody remembering to test it. And `gen.ts` must never learn any of this:
+ * a map that knew what kind of day it was would be a different valley on a
+ * flood day, which is precisely the thing that was ruled out. */
+{
+  const bad = [];
+  const seen = new Set();
+  for (let s = 1; s <= DAY_N && seen.size < ALL_DAYS.length; s++) {
+    const day = dayInfo(s, null);
+    if (seen.has(day.type)) continue;
+    seen.add(day.type);
+    const m = riverMood(day);
+    if (day.type === 'flood' || day.type === 'drought') {
+      if (m.kind !== day.type) bad.push(`${day.type} does not ask for its own river treatment`);
+      if (m.water === 1 && m.bank === 1) bad.push(`${day.type} paints an ordinary river`);
+    } else if (m.water !== 1 || m.bank !== 1 || m.foam !== 1 || m.kind !== null) {
+      bad.push(`${day.type} is not the identity river: ${JSON.stringify(m)}`);
+    }
+  }
+  if (CALM_RIVER.water !== 1 || CALM_RIVER.bank !== 1 || CALM_RIVER.foam !== 1 || CALM_RIVER.kind !== null) {
+    bad.push('CALM_RIVER is not the identity');
+  }
+  // ...and the generator has never heard of any of it.
+  const genSrc = readFileSync(join(gdir, 'gen.ts'), 'utf8');
+  if (/daytype|dayTypeOf|riverMood|DayInfo/.test(genSrc)) {
+    bad.push('gen.ts references the day type — the map must not know what kind of day it is');
+  }
+  total++;
+  if (bad.length) {
+    failed++;
+    console.log('\n! (day-f) flood/drought are not presentation-only');
+    for (const b of bad) console.log(`    ${b}`);
+  } else {
+    console.log(
+      '  (day-f) ok   riverMood is the identity on every ordinary day, and gen.ts has never heard of day types'
+    );
+  }
+}
+
+/* ---- (day-g) the three new days on real worlds --------------------------- *
+ * End to end: build the actual timeline of an actual generated valley on each
+ * of the three new days, and check that all that happened is that the ledger
+ * gained lines. The last roof still has to land inside the pacing window — a
+ * day that quietly warped time would miss it — and the lines have to be inside
+ * the hours the day type declared. */
+if (generateMap) {
+  const wanted = ['stars', 'flood', 'drought'];
+  const picks = [];
+  for (let s = 1; s < 400 && picks.length < wanted.length; s++) {
+    const d = dayTypeOf(s);
+    if (wanted.includes(d.type) && !picks.some((p) => p.type === d.type)) picks.push({ seed: s, ...d });
+  }
+  for (const p of picks) {
+    const map = generateMap(p.seed);
+    const tl = buildTimeline(map);
+    const builds = tl.events.filter((e) => e.type === 'build');
+    const last = builds.length ? builds[builds.length - 1].t : 0;
+    // The lines this day type wrote, found by the hours they were placed at.
+    const wantN = p.type === 'stars' ? 1 : 2;
+    const at = p.type === 'stars' ? [p.from + 0.5] : [p.from + 0.22, p.to + 0.18];
+    const lines = tl.events.filter(
+      (e) => e.type === 'log' && at.some((h) => Math.abs(e.t - h) < 1e-9)
+    );
+    const extra = [];
+    if (lines.length !== wantN) extra.push(`${lines.length} ledger lines at the declared hours, expected ${wantN}`);
+    if (!(last >= 20.4 && last <= 22.0)) extra.push(`last roof ${hhmm(last)} — outside the pacing window`);
+    // No new event TYPE: a presentation day writes logs and nothing else.
+    const kinds = new Set(tl.events.map((e) => e.type));
+    for (const k of kinds) {
+      if (!['found', 'arrive', 'chop-start', 'chop-done', 'survey', 'build', 'road', 'bridge', 'ford', 'prop', 'dig', 'discover', 'log'].includes(k)) {
+        extra.push(`unknown event type ${k}`);
+      }
+    }
+    total++;
+    if (extra.length) {
+      failed++;
+      console.log(`\n! (day-g) ${p.type} day, seed ${p.seed}`);
+      for (const e of extra) console.log(`    ${e}`);
+    } else {
+      console.log(
+        `  (day-g) ok   ${p.type.padEnd(7)} seed ${String(p.seed).padEnd(4)} ` +
+          `last roof ${hhmm(last)}, ${lines.length} ledger line${lines.length > 1 ? 's' : ''}`
+      );
+      for (const l of lines) console.log(`             ${hhmm(l.t)}  ${l.text}`);
     }
   }
 }
