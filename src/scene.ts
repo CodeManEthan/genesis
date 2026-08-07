@@ -2660,6 +2660,58 @@ function fishingAt(siteId: string, t: number): boolean {
   return mulberry32((h ^ Math.imul(Math.floor(t / 2.5) + 1, 0x9e3779b1)) >>> 0)() < 0.58;
 }
 
+/** Site dressing you would fetch a load *from*: stacked goods, not furniture. */
+const YARD_KINDS = new Set([
+  'lumber',
+  'crates',
+  'barrels',
+  'shed',
+  'haystack',
+  'cart',
+  'quarry-blocks',
+]);
+
+/** The shortest carry worth watching, in tiles. Below this it is a shuffle. */
+const MIN_CARRY = 2.6;
+
+/**
+ * Where the load for plot `b` comes from.
+ *
+ * A carry only reads as work if it goes somewhere, and it must not go to the
+ * middle of town: the old yard sat a quarter of the way in from every plot, so
+ * every carrier in a town converged on the plaza and paced the same few tiles.
+ *
+ * So: the *farthest* stack the town has actually put out, which sends plots on
+ * opposite sides of a town to opposite yards. Failing that — a young site with
+ * nothing stacked yet — the load waits at the outer edge of the plot, away from
+ * the middle rather than across it.
+ */
+function yardFor(site: SiteSpec, b: BuildingSpec, yards: Vec2[]): Vec2 {
+  let best: Vec2 | null = null;
+  let bestD = MIN_CARRY;
+  for (const y of yards) {
+    const d = Math.hypot(y[0] - b.gx, y[1] - b.gy);
+    if (d > bestD) {
+      bestD = d;
+      best = y;
+    }
+  }
+  if (best) return [best[0], best[1] + 0.6];
+  const dx = b.gx - site.gx;
+  const dy = b.gy - site.gy;
+  const d = Math.hypot(dx, dy);
+  // The one plot that *is* the middle of town gets a bearing off its own
+  // coordinates, so it still has an outside to fetch from and it is still the
+  // same outside on every frame.
+  if (d < 0.5) {
+    const a = b.gx * 1.7 + b.gy * 2.9;
+    return [site.gx + Math.cos(a) * 3.4, site.gy + Math.sin(a) * 3.4];
+  }
+  // Clamped to the edge of the clearing, but never back past a walkable leg.
+  const out = Math.max(Math.min(d + 3.4, site.radius + 1.2), d + 1.8);
+  return [site.gx + (dx / d) * out, site.gy + (dy / d) * out];
+}
+
 /**
  * The jobs going on at one site, in staffing order: a crew of `n` takes the
  * first `n`. So the order *is* the priority, and the errands at the bottom only
@@ -2690,30 +2742,53 @@ function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Ta
       }
     }
   }
+  // Everything the town has to fetch a load from — the stacks it has put out,
+  // and the stump the choppers above just made.
+  const yards: Vec2[] = [];
+  for (const p of site.props) {
+    if (YARD_KINDS.has(p.kind) && snap.props.has(p.id)) yards.push([p.gx, p.gy]);
+  }
+  if (stump) yards.push([stump.gx, stump.gy]);
+
   let plot: BuildingSpec | null = null;
+  let plotYard: Vec2 | null = null;
   for (const b of site.buildings) {
     const st = snap.buildings.get(b.id);
     if (!st || st.status === 'unplanned' || st.status === 'done') continue;
-    if (!plot) plot = b;
+    const yard = yardFor(site, b, yards);
+    if (!plot) {
+      plot = b;
+      plotYard = yard;
+    }
     out.push({ gx: b.gx, gy: b.gy, action: 'work', ygx: b.gx, ygy: b.gy });
-    out.push({
-      gx: b.gx,
-      gy: b.gy,
-      action: 'carry',
-      ygx: site.gx + (b.gx - site.gx) * 0.25,
-      ygy: site.gy + (b.gy - site.gy) * 0.25,
-    });
+    out.push({ gx: b.gx, gy: b.gy, action: 'carry', ygx: yard[0], ygy: yard[1] });
   }
 
   /* ---- errands, only ever staffed by a spare pair of hands -------------- */
-  // Timber off the stumps the site just made, up to whatever is being framed.
-  if (plot && stump) {
+  // Timber off the stumps the site just made, up to whatever is being framed —
+  // unless the first plot is already fetching from that very stump, in which
+  // case this would put a second body on an identical line and undo the point.
+  const onStump =
+    !!plotYard && !!stump && Math.hypot(plotYard[0] - stump.gx, plotYard[1] - stump.gy) <= 1;
+  if (plot && stump && !onStump) {
     out.push({ gx: plot.gx, gy: plot.gy, action: 'carry', ygx: stump.gx, ygy: stump.gy });
   }
-  // Water from the well, once there is a well to draw it from.
+  // Water from the well, once there is a well to draw it from — and water is
+  // carried *to* a door, not set down in the middle of town. The farthest
+  // finished house, so the bucket crosses a lane instead of pacing the plaza.
   for (const p of site.props) {
     if (p.kind !== 'well' || !snap.props.has(p.id)) continue;
-    out.push({ gx: p.gx, gy: p.gy, action: 'carry', ygx: site.gx, ygy: site.gy });
+    let door: Vec2 = [site.gx, site.gy];
+    let far = MIN_CARRY;
+    for (const b of site.buildings) {
+      if (snap.buildings.get(b.id)?.status !== 'done') continue;
+      const d = Math.hypot(b.gx - p.gx, b.gy - p.gy);
+      if (d > far) {
+        far = d;
+        door = [b.gx + 1, b.gy + 1];
+      }
+    }
+    out.push({ gx: p.gx, gy: p.gy, action: 'carry', ygx: door[0], ygy: door[1] });
     break;
   }
   // ADDITIVE — boats and jetties. Bottom of the list, under every errand: a
@@ -2770,15 +2845,34 @@ function arrivalOn(
   return { roadId: best.id, s: atHead ? back : geo.len - back, dir: atHead ? -1 : 1 };
 }
 
-function wanderPoint(site: SiteSpec, snap: WorldSnapshot, rng: () => number): Vec2 {
+/** The shortest stroll worth taking, in tiles. Below this it is a twitch. */
+const MIN_WANDER = 3.2;
+
+/**
+ * Somewhere in `site` worth walking to: a finished doorway most of the time,
+ * open ground the rest.
+ *
+ * Drawn against `from`, because a destination two tiles away is not a walk —
+ * it is a twitch, and a townful of twitching settlers is what "pacing back and
+ * forth" looks like from the outside. Three tries at a proper errand, then take
+ * whatever came up: with one house in a clearing there may be nowhere further
+ * to go, and standing still is better than spinning on the draw.
+ */
+function wanderPoint(site: SiteSpec, snap: WorldSnapshot, rng: () => number, from: Vec2): Vec2 {
   const done = site.buildings.filter((b) => snap.buildings.get(b.id)?.status === 'done');
-  if (done.length && rng() < 0.65) {
-    const b = done[Math.floor(rng() * done.length)];
-    return [b.gx + (rng() - 0.5) * 2.4, b.gy + (rng() - 0.5) * 2.4];
+  let p: Vec2 = from;
+  for (let i = 0; i < 3; i++) {
+    if (done.length && rng() < 0.65) {
+      const b = done[Math.floor(rng() * done.length)];
+      p = [b.gx + (rng() - 0.5) * 2.4, b.gy + (rng() - 0.5) * 2.4];
+    } else {
+      const a = rng() * Math.PI * 2;
+      const r = Math.sqrt(rng()) * site.radius * 0.8;
+      p = [site.gx + Math.cos(a) * r, site.gy + Math.sin(a) * r];
+    }
+    if (Math.hypot(p[0] - from[0], p[1] - from[1]) >= MIN_WANDER) break;
   }
-  const a = rng() * Math.PI * 2;
-  const r = Math.sqrt(rng()) * site.radius * 0.8;
-  return [site.gx + Math.cos(a) * r, site.gy + Math.sin(a) * r];
+  return p;
 }
 
 /** Re-derive bot counts, smoke anchors and mill wheels from the snapshot. */
@@ -3116,7 +3210,13 @@ export function stepAmbient(
         gatherRound(bot, i, crew.length, circle, dt, rate, rng);
         return;
       }
-      const task = tasks.length ? tasks[i % tasks.length] : null;
+      // One body per job, in priority order — the list is the roster, not a
+      // rota to be dealt round. Wrapping with `%` used to double- and
+      // triple-staff every task in a busy town, which put the whole crew on the
+      // same few short errands across the middle of the plaza. Anybody past the
+      // end of the list has no job, and a settler with no job goes about the
+      // town instead.
+      const task = i < tasks.length ? tasks[i] : null;
 
       if (task) {
         const goal: Vec2 = task.exact
@@ -3144,16 +3244,18 @@ export function stepAmbient(
         return;
       }
 
-      // Nothing to build: drift between the finished houses.
+      // No job of their own: go about the town. Walk somewhere, stand there a
+      // while, walk somewhere else. The dwell is generous on purpose — a town
+      // where everybody is always in motion reads as agitated, not busy.
       const moving = moveTo(bot, dt, 'walk', rate);
       if (!moving) {
         bot.action = 'idle';
         bot.timer -= dt;
         if (bot.timer <= 0) {
-          const p = wanderPoint(site, snap, rng);
+          const p = wanderPoint(site, snap, rng, [bot.gx, bot.gy]);
           bot.tx = p[0];
           bot.ty = p[1];
-          bot.timer = 1 + rng() * 3.5;
+          bot.timer = 1.8 + rng() * 5;
           bot.action = 'walk';
         }
       }
