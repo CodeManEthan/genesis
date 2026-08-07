@@ -2751,18 +2751,26 @@ function siteTasks(scene: GenesisScene, site: SiteSpec, snap: WorldSnapshot): Ta
   if (stump) yards.push([stump.gx, stump.gy]);
 
   let plot: BuildingSpec | null = null;
+  let plotYard: Vec2 | null = null;
   for (const b of site.buildings) {
     const st = snap.buildings.get(b.id);
     if (!st || st.status === 'unplanned' || st.status === 'done') continue;
-    if (!plot) plot = b;
-    out.push({ gx: b.gx, gy: b.gy, action: 'work', ygx: b.gx, ygy: b.gy });
     const yard = yardFor(site, b, yards);
+    if (!plot) {
+      plot = b;
+      plotYard = yard;
+    }
+    out.push({ gx: b.gx, gy: b.gy, action: 'work', ygx: b.gx, ygy: b.gy });
     out.push({ gx: b.gx, gy: b.gy, action: 'carry', ygx: yard[0], ygy: yard[1] });
   }
 
   /* ---- errands, only ever staffed by a spare pair of hands -------------- */
-  // Timber off the stumps the site just made, up to whatever is being framed.
-  if (plot && stump) {
+  // Timber off the stumps the site just made, up to whatever is being framed —
+  // unless the first plot is already fetching from that very stump, in which
+  // case this would put a second body on an identical line and undo the point.
+  const onStump =
+    !!plotYard && !!stump && Math.hypot(plotYard[0] - stump.gx, plotYard[1] - stump.gy) <= 1;
+  if (plot && stump && !onStump) {
     out.push({ gx: plot.gx, gy: plot.gy, action: 'carry', ygx: stump.gx, ygy: stump.gy });
   }
   // Water from the well, once there is a well to draw it from — and water is
@@ -2837,6 +2845,9 @@ function arrivalOn(
   return { roadId: best.id, s: atHead ? back : geo.len - back, dir: atHead ? -1 : 1 };
 }
 
+/** The shortest stroll worth taking, in tiles. Below this it is a twitch. */
+const MIN_WANDER = 3.2;
+
 /**
  * Somewhere in `site` worth walking to: a finished doorway most of the time,
  * open ground the rest.
@@ -2847,14 +2858,7 @@ function arrivalOn(
  * whatever came up: with one house in a clearing there may be nowhere further
  * to go, and standing still is better than spinning on the draw.
  */
-const MIN_WANDER = 3.2;
-
-function wanderPoint(
-  site: SiteSpec,
-  snap: WorldSnapshot,
-  rng: () => number,
-  from: Vec2
-): Vec2 {
+function wanderPoint(site: SiteSpec, snap: WorldSnapshot, rng: () => number, from: Vec2): Vec2 {
   const done = site.buildings.filter((b) => snap.buildings.get(b.id)?.status === 'done');
   let p: Vec2 = from;
   for (let i = 0; i < 3; i++) {
