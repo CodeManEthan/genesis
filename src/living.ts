@@ -331,3 +331,39 @@ export function pileStage(reach: string[], felled: Map<string, number>): 0 | 1 |
   if (frac >= 0.5 && hits >= 2) return 1;
   return 0;
 }
+
+/* ========================== grubbed-out stumps ============================ */
+
+/**
+ * Where along which road a road-claimed tree stood: the road that claimed it,
+ * and the fraction of that road's arclength it stood at.
+ *
+ * MAP data on exactly the terms `pileReach` above is — computed once from
+ * `map.roads[*].clears`, never touched again, and never scanned per tree per
+ * frame. What actually takes a stump out of the ground is not this table but
+ * how far `snap.roads` has carried that road at `t`, which is an existing
+ * snapshot field written by an existing event. No new event type, no new
+ * snapshot state: a grubbed stump is a road that has been PAVED past it, and
+ * the day already records every yard of paving.
+ *
+ * `clears` is optional (fixture compatibility), and a tree claimed twice keeps
+ * its first claimant — the same rule `gen.ts` fells by, so the table agrees
+ * with the axe about which road owns which tree.
+ */
+export function roadCuts(map: GenesisMap): Map<string, RoadCut> {
+  const out = new Map<string, RoadCut>();
+  for (const r of map.roads) {
+    for (const c of r.clears ?? []) {
+      if (!out.has(c.tree)) out.set(c.tree, { road: r.id, frac: c.frac });
+    }
+  }
+  return out;
+}
+
+/** One road-claimed tree's place on its road. */
+export interface RoadCut {
+  /** `RoadSpec.id` — the key into `snap.roads`. */
+  road: string;
+  /** 0..1 of that road's arclength. */
+  frac: number;
+}
