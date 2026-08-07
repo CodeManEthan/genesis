@@ -758,11 +758,18 @@ interface RoadLayer {
 /** The cell size of the vegetation index, in world pixels. */
 const VCELL = 96;
 /**
- * How many baked sprites one frame may redraw to repair occlusion. A whole
- * valley of towns at dusk can ask for more than it can see the benefit of; past
- * this the frame simply stops, having already served every mover.
+ * How many baked sprites one frame may redraw to repair occlusion.
+ *
+ * It was 260, on the belief that a frame would have served every mover long
+ * before it got there. Measured, that was never true: a valley of towns at
+ * dusk asks for a thousand, and at 260 the budget ran out partway down the
+ * CROWD, leaving every fixed item — including a tree mid-fall — with nothing
+ * at all. What made 260 defensible was that each repair redrew a whole tree;
+ * now that a repair is confined to the mover that asked for it (see the pass
+ * itself), the same budget buys roughly a tenth of the fill, so the ceiling can
+ * go where the demand actually is and still cost less than it used to.
  */
-const REPAIR_CAP = 260;
+const REPAIR_CAP = 600;
 const vkey = (cx: number, cy: number) => cx * 4096 + cy;
 
 export interface GenesisScene {
@@ -4237,6 +4244,9 @@ export function renderGenesis(
   /* ---- one depth-sorted pass over everything that is changing ---------- */
   const items: Item[] = [];
   const halos: Halo[] = [];
+  /** Indexes in `items` of the trees mid-fall — the occlusion repair's first
+   * call on the budget. See the priority note at the repair pass. */
+  const leaning: number[] = [];
   const push = (sp: Sprite, gx: number, gy: number, dy = 0, dx = 0) => {
     const x = isoX(gx, gy);
     const y = isoY(gx, gy);
@@ -4293,6 +4303,7 @@ export function renderGenesis(
         bh: Math.ceil(squash * (ly1 - ly0)) + 2,
         draw: (c) => drawLeaningTree(c, sp, fx, fy, kk, squash),
       });
+      leaning.push(items.length - 1);
       continue;
     }
     /* ---- end living details II (additive) ------------------------------- */
@@ -4627,18 +4638,65 @@ export function renderGenesis(
    * that should be hidden behind a nearer trunk would walk over it. Redraw the
    * few baked sprites that stand in front of a mover, at the exact pixel the
    * bake used, so the patch is invisible. Below 1× the error is a pixel or two
-   * and the query is not worth its own cost. */
+   * and the query is not worth its own cost.
+   *
+   * A repair is CONFINED to a rectangle — never the whole sprite. The bake is
+   * already a correct depth composite of the standing wood; the only place it
+   * is wrong is where a mover has just painted over it, so that is the only
+   * place a repair has any business touching. Redrawing the whole sprite
+   * instead puts it back on top of everything that stands in FRONT of it as
+   * well, and those neighbours are not redrawn unless they happen to overlap
+   * the same mover — which is how a fir two rows back came to leave fragments
+   * of itself lying across a nearer crown, and how a tree going over came to
+   * smear through the wood it was falling into.
+   *
+   * Each sprite carries ONE rect, grown to hold every box that asked for it,
+   * and the rule that makes it exact is: whatever ground a repair covers, the
+   * things in front of THAT ground are repaired over the same ground. Take a
+   * pixel p inside sprite S's rect and a baked sprite T in front of S covering
+   * p. Either p came from a mover M's box, in which case T is in front of M too
+   * and overlaps M's box, so M asked for T; or p came from S's rect being
+   * widened, in which case S went back on the worklist and asked for T itself.
+   * Either way T's rect holds p and T is drawn after S. Outside every rect the
+   * layer is left alone, which is the one arrangement that cannot be wrong.
+   *
+   * That worklist IS a transitive closure, which is why it is fenced: a rect
+   * never grows past its own sprite's footprint, and every step of the chase
+   * moves strictly forward in depth, so it cannot loop and cannot spread beyond
+   * the wood the movers are actually standing in. */
   if (zoom >= 0.75) {
     const veg = scene.veg;
     const n0 = items.length;
-    const need = new Set<number>();
-    /** @returns false once the repair budget is spent. */
-    const repairsFor = (it: Item): boolean => {
-      const cx0 = Math.floor(it.bx / VCELL);
-      const cx1 = Math.floor((it.bx + it.bw) / VCELL);
-      const cy0 = Math.floor(it.by / VCELL);
-      const cy1 = Math.floor((it.by + it.bh) / VCELL);
-      for (let gy = cy0; gy <= cy1 + 1; gy++) {
+    /** Sprite index -> the one rect it may be repainted inside, as x0,y0,x1,y1. */
+    const need = new Map<number, number[]>();
+    /** Sprites whose rect has just grown and so owe a pass of their own. */
+    const queue: number[] = [];
+    const pending = new Set<number>();
+    let room = true;
+    /**
+     * Mark every baked sprite in front of `depth` that overlaps the rect, to be
+     * repainted inside (at least) that rect.
+     *
+     * Clears `room` once the budget is spent — but the budget is never obeyed
+     * mid-item: whatever the cap says, an item that has been STARTED is
+     * finished and the NEXT one is refused instead. The argument above needs
+     * every sprite in front of a mover that overlaps its box, not most of them,
+     * so a half-served item is the one thing that would make it untrue. The
+     * overshoot is one item's worth, which even for a tree going over is a few
+     * dozen sprites.
+     */
+    const cover = (depth: number, rx0: number, ry0: number, rx1: number, ry1: number): void => {
+      const cx0 = Math.floor(rx0 / VCELL);
+      const cx1 = Math.floor(rx1 / VCELL);
+      const cy0 = Math.floor(ry0 / VCELL);
+      const cy1 = Math.floor(ry1 / VCELL);
+      // Exactly the cells the rect touches, and no spare row: a sprite is
+      // indexed in every cell its own box covers, so a sprite that overlaps the
+      // rect at all shares a cell with it. (This used to sweep one row past the
+      // bottom. Every entry it found there failed the box test below, so it
+      // bought nothing but a second pass over the crowd's own cells — which is
+      // most of the pass, because a walker is shorter than a cell.)
+      for (let gy = cy0; gy <= cy1; gy++) {
         for (let gx = cx0; gx <= cx1; gx++) {
           const arr = veg.grid.get(vkey(gx, gy));
           if (!arr) continue;
@@ -4650,31 +4708,109 @@ export function renderGenesis(
           for (let k = arr.length - 1; k >= 0; k--) {
             const idx = arr[k];
             const s = veg.items[idx];
-            if (s.depth <= it.depth) break;
-            if (!veg.on[idx] || need.has(idx)) continue;
-            if (s.bx > it.bx + it.bw || s.bx + s.bw < it.bx) continue;
-            if (s.by > it.by + it.bh || s.by + s.bh < it.by) continue;
-            need.add(idx);
-            if (need.size >= REPAIR_CAP) return false;
+            if (s.depth <= depth) break;
+            if (!veg.on[idx]) continue;
+            if (s.bx > rx1 || s.bx + s.bw < rx0) continue;
+            if (s.by > ry1 || s.by + s.bh < ry0) continue;
+            const box = need.get(idx);
+            if (box === undefined) {
+              // No follow-up owed: this sprite's rect IS the rect being swept,
+              // and everything standing in front of it over that rect is in
+              // front of `depth` too, so this same sweep is picking it up.
+              need.set(idx, [rx0, ry0, rx1, ry1]);
+              if (need.size >= REPAIR_CAP) room = false;
+              continue;
+            }
+            if (rx0 >= box[0] && ry0 >= box[1] && rx1 <= box[2] && ry1 <= box[3]) continue;
+            if (rx0 < box[0]) box[0] = rx0;
+            if (ry0 < box[1]) box[1] = ry0;
+            if (rx1 > box[2]) box[2] = rx1;
+            if (ry1 > box[3]) box[3] = ry1;
+            // A second asker in a different place: the rect is now the BOX of
+            // two rects, and the corners between them are ground no sweep has
+            // covered. Only that case owes a pass of its own.
+            if (!pending.has(idx)) {
+              pending.add(idx);
+              queue.push(idx);
+            }
           }
         }
       }
-      return true;
     };
-    let room = true;
-    for (let e = moversFrom; e < n0 && room; e++) room = repairsFor(items[e]);
-    for (let e = 0; e < moversFrom && room; e++) room = repairsFor(items[e]);
-    need.forEach((idx) => {
+    /* Repair priority, poorest served last.
+     *
+     * A tree going over comes FIRST — ahead even of the crowd. It is the
+     * largest thing the per-frame pass ever draws (a sheared crown reaches most
+     * of a trunk-height sideways), the only one whose shape changes every frame,
+     * and so the one whose missing repairs read as a brown smear across a
+     * neighbour rather than as a walker's hat clipping a trunk. It also sits in
+     * the scenery half of `items` for no better reason than where the code
+     * happens to be, so until this it was repaired dead LAST: measured, a busy
+     * evening spends the whole budget partway down the crowd and the fall got
+     * nothing at all.
+     *
+     * Then the crowd, then the standing scenery, as before. */
+    const ask = (it: Item) => cover(it.depth, it.bx, it.by, it.bx + it.bw, it.by + it.bh);
+    for (let e = 0; e < leaning.length && room; e++) ask(items[leaning[e]]);
+    for (let e = moversFrom; e < n0 && room; e++) ask(items[e]);
+    for (let e = 0; e < moversFrom && room; e++) {
+      if (leaning.includes(e)) continue;
+      ask(items[e]);
+    }
+    // Drain the worklist. A sprite whose rect has GROWN — two askers in two
+    // places, and the box that holds both — will now be repainted over ground
+    // no sweep has covered, so it owes that ground the same guarantee a mover
+    // does: everything in front of IT there has to be repainted too. Following
+    // that edge always moves to a greater depth, and a rect never grows past
+    // the sprite's own footprint, so the chase terminates. This is the whole of
+    // the transitive closure the confinement needs, and it is a small whole:
+    // measured, the queue is a couple of dozen sprites in a frame that repairs
+    // six hundred.
+    //
+    // The pop count is belt and braces. Termination rests on rects only ever
+    // growing inside a bounded box, which is true but is an argument about real
+    // numbers; a frame is not the place to find out it was wrong. Spending the
+    // whole budget over again is already far more than any measured frame
+    // wants, and the failure it guards is one unrepaired rect, not a hang.
+    let pops = REPAIR_CAP * 8;
+    while (queue.length && room && pops-- > 0) {
+      const idx = queue.pop()!;
+      pending.delete(idx);
       const s = veg.items[idx];
+      const b = need.get(idx)!;
+      // Never past the sprite's own footprint: outside it the sprite paints
+      // nothing, so nothing standing in front of it there can be disturbed.
+      const qx0 = Math.max(b[0], s.bx);
+      const qy0 = Math.max(b[1], s.by);
+      const qx1 = Math.min(b[2], s.bx + s.bw);
+      const qy1 = Math.min(b[3], s.by + s.bh);
+      if (qx1 <= qx0 || qy1 <= qy0) continue;
+      cover(s.depth, qx0, qy0, qx1, qy1);
+    }
+    // Ascending item index, because that is the order the bake painted them and
+    // the final sort is by depth alone: two sprites at exactly the same depth
+    // are separated by nothing but the order they were pushed, and the order a
+    // grid walk happened to reach them is not that order.
+    for (const idx of [...need.keys()].sort((a, b) => a - b)) {
+      const box = need.get(idx)!;
+      const s = veg.items[idx];
+      const sx = Math.round(s.bx);
+      const sy = Math.round(s.by);
+      const x0 = Math.max(sx, Math.floor(box[0]));
+      const y0 = Math.max(sy, Math.floor(box[1]));
+      const x1 = Math.min(sx + s.sprite.c.width, Math.ceil(box[2]));
+      const y1 = Math.min(sy + s.sprite.c.height, Math.ceil(box[3]));
+      if (x1 <= x0 || y1 <= y0) continue;
       items.push({
         depth: s.depth,
-        bx: s.bx,
-        by: s.by,
-        bw: s.bw,
-        bh: s.bh,
-        draw: (c) => paintVeg(c, s),
+        bx: x0,
+        by: y0,
+        bw: x1 - x0,
+        bh: y1 - y0,
+        draw: (c) =>
+          c.drawImage(s.sprite.c, x0 - sx, y0 - sy, x1 - x0, y1 - y0, x0, y0, x1 - x0, y1 - y0),
       });
-    });
+    }
     if (P) P.repairs += need.size;
   }
   if (P) lap('occl');
