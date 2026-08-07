@@ -1059,7 +1059,7 @@ const COVERAGE: { head: string; body: string }[] = [
   {
     head: 'The fall is a transform, not a drawing',
     body:
-      'The ladder runs standing → felling → leaning → stump with its log → stump, and three to five saplings come up on cleared ground in the evening. But the lean is the standing sprite under a shear and a squash, per kind — a fir goes over stiff and late, a willow slumps early — and not art: the crown is the same crown, sheared. A drawn half-fallen trunk, with the hinge splintered and the crown crumpled into the ground, is still missing.',
+      'The ladder runs standing → felling → leaning → stump with its log → stump — and on a road one rung further, → bare paving, because the crew laying the surface grubs the stump out as it comes to it. Three to five saplings come up on cleared ground in the evening, on the verge rather than in the lane. But the lean is the standing sprite under a shear and a squash, per kind — a fir goes over stiff and late, a willow slumps early — and not art: the crown is the same crown, sheared. A drawn half-fallen trunk, with the hinge splintered and the crown crumpled into the ground, is still missing.',
   },
   {
     head: 'Crops, hay and timber ripen; nothing else does',
@@ -2186,7 +2186,7 @@ export default function Catalog() {
           {/* ---- living details (additive) ---- */}
           <Row
             title={`After the axe (${treeAfter.length})`}
-            note="The trunk lies beside its stump for 90 world-minutes and is then hauled off to the yards — one log per tree kind, because the bark is all that tells them apart at this size. Three to five saplings come up on the day's cleared ground after 18:00, each beside a stump the day actually made."
+            note="The trunk lies beside its stump for 90 world-minutes and is then hauled off to the yards — one log per tree kind, because the bark is all that tells them apart at this size. The stump itself outlasts the log only off the roads: a tree a ROAD claimed is grubbed out the moment the paving reaches its own point along that road, so a finished lane ends the day clear instead of carrying a line of stumps drawn over its surface. A plot's stump is nobody's paving job and stands all day. Three to five saplings come up on the day's cleared ground after 18:00, each beside a stump the day actually made — a stride or two off it and so on the verge, never on the paving, which is why the grubbing does not take the regrowth with it."
             items={treeAfter}
           />
           {/* ---- end living details (additive) ---- */}

@@ -203,6 +203,8 @@ import {
   logOffset,
   pileReach,
   pileStage,
+  type RoadCut,
+  roadCuts,
 } from './living.ts';
 /* ---- end living details II (additive) ----------------------------------- */
 
@@ -428,6 +430,36 @@ function logLive(snap: WorldSnapshot, id: string): boolean {
   return ft !== undefined && snap.t >= ft && snap.t - ft < LOG_LIFE;
 }
 
+/**
+ * Is `id`'s stump still in the ground at `snap.t`?
+ *
+ * A tree the road crew felled is standing in the road, and the crew that lays
+ * the surface grubs the stump out as it comes to it — otherwise the valley
+ * ends the day with a line of stumps down the middle of every finished lane,
+ * drawn over the paving that was laid around them.
+ *
+ * Pure in (map table, snapshot), on exactly the terms `logLive` above is: no
+ * event, no cached state, no "the frame I noticed". The only clock it reads is
+ * the road's own built fraction, which is monotone forwards and rewound by the
+ * snapshot on a scrub back, so this answers the same at 13:00 whichever
+ * direction 13:00 was arrived from.
+ *
+ * A stump the roads never claimed — a plot's clearing, where a house is going
+ * — is nobody's paving job and stands all day, which is one failed `Map.get`
+ * for the great majority of the valley.
+ *
+ * The `built === 0` arm is for the handful of trees standing at frac 0, right
+ * at a road's mouth: `snap.roads` carries every road from t=0 at zero built,
+ * and a road with nothing laid has paved over nothing. Past that, reaching the
+ * tree's own frac exactly is enough — the crew is standing on it.
+ */
+function stumpLive(cuts: Map<string, RoadCut>, snap: WorldSnapshot, id: string): boolean {
+  const c = cuts.get(id);
+  if (c === undefined) return true;
+  const built = snap.roads.get(c.road) ?? 0;
+  return built === 0 || built < c.frac;
+}
+
 /** The earliest a sapling breaks ground; each one jitters up from here. */
 const SAPLING_FROM = 18;
 
@@ -650,6 +682,21 @@ export interface VegLayer {
    * every sync. It is short by construction: ninety minutes of felling.
    */
   logOn: number[];
+  /**
+   * Every road-claimed tree's place on its road — the map table `stumpLive`
+   * asks whether a stump has been paved over yet. Built once, at bake time.
+   */
+  cuts: Map<string, RoadCut>;
+  /**
+   * Tree indexes whose stump is painted AND whose stump a road crew is coming
+   * for, i.e. the ones that can still turn OFF. The twin of `logOn`, and for
+   * the same reason: a stump turns ON where the axe finishes, which both tree
+   * paths below already see, but it turns off when the ROAD moves, and nothing
+   * about the road is in either fingerprint. So this list is swept every sync.
+   * It is short by construction — a road crew fells barely ahead of its own
+   * paving — and it only ever shrinks.
+   */
+  stumpOn: number[];
   /** Evening regrowth over the day's cleared ground. */
   saplings: Sapling[];
   /* ---- end living details (additive) ----------------------------------- */
@@ -2130,6 +2177,8 @@ function* buildVeg(
     crops,
     logs,
     logOn: [],
+    cuts: roadCuts(scene.map),
+    stumpOn: [],
     saplings,
     /* ---- end living details (additive) ---- */
     /* ---- living details II (additive) ---- */
@@ -2246,13 +2295,18 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
     const felling: number[] = [];
     /* ---- living details (additive) ---- */
     const logOn: number[] = [];
+    const stumpOn: number[] = [];
     /* ---- end living details (additive) ---- */
     for (let k = 0; k < trees.length; k++) {
       const st = snap.trees.get(trees[k].id);
       if (st === 'felling') felling.push(k);
       want(veg.slots[k * 2], st === undefined || st === 'standing');
-      want(veg.slots[k * 2 + 1], st === 'stump');
       /* ---- living details (additive) ---- */
+      // A stump stands until the paving reaches it; off a road it stands all
+      // day, which is what the predicate says for every tree but a few dozen.
+      const sp = st === 'stump' && stumpLive(veg.cuts, snap, trees[k].id);
+      want(veg.slots[k * 2 + 1], sp);
+      if (sp && veg.cuts.has(trees[k].id)) stumpOn.push(k);
       if (veg.logs[k] >= 0) {
         const lg = st === 'stump' && logLive(snap, trees[k].id);
         want(veg.logs[k], lg);
@@ -2263,6 +2317,7 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
     veg.felling = felling;
     /* ---- living details (additive) ---- */
     veg.logOn = logOn;
+    veg.stumpOn = stumpOn;
     /* ---- end living details (additive) ---- */
   } else if (veg.felling.length) {
     const trees = scene.map.trees;
@@ -2274,11 +2329,15 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
         continue;
       }
       want(veg.slots[k * 2], st === undefined || st === 'standing');
-      want(veg.slots[k * 2 + 1], st === 'stump');
       /* ---- living details (additive) ---- */
-      // The axe just came down: the trunk goes on the ground, and joins the
-      // sweep below that will take it away again in ninety minutes. A tree
-      // leaves `felling` exactly once, so this cannot double-list it.
+      // The axe just came down. The stump joins the sweep below if a road
+      // crew is coming for it — the same "leaves `felling` exactly once"
+      // argument as the trunk makes this safe to push blind.
+      const sp = st === 'stump' && stumpLive(veg.cuts, snap, trees[k].id);
+      want(veg.slots[k * 2 + 1], sp);
+      if (sp && veg.cuts.has(trees[k].id)) veg.stumpOn.push(k);
+      // The trunk goes on the ground, and joins the sweep below that will take
+      // it away again in ninety minutes.
       if (veg.logs[k] >= 0 && st === 'stump' && logLive(snap, trees[k].id)) {
         want(veg.logs[k], true);
         veg.logOn.push(k);
@@ -2302,6 +2361,25 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
       else want(veg.logs[k], false);
     }
     veg.logOn = keep;
+  }
+
+  /* the grubbing ------------------------------------------------------------
+   * The other transition no fingerprint can see, and for a different reason:
+   * the snapshot DOES move when it happens, but it moves in `snap.roads`, and
+   * neither fingerprint above looks at a road. Same shape as the hauling —
+   * a short list, swept, recomputed from the snapshot rather than remembered.
+   *
+   * Both branches above rebuild or extend `stumpOn` with live stumps only, so
+   * nothing here can flip a slot the same sync already flipped.
+   * --------------------------------------------------------------------- */
+  if (veg.stumpOn.length) {
+    const trees = scene.map.trees;
+    const keep: number[] = [];
+    for (const k of veg.stumpOn) {
+      if (stumpLive(veg.cuts, snap, trees[k].id)) keep.push(k);
+      else want(veg.slots[k * 2 + 1], false);
+    }
+    veg.stumpOn = keep;
   }
   /* ---- end living details (additive) ------------------------------------- */
 
@@ -2340,6 +2418,14 @@ export function syncVeg(scene: GenesisScene, snap: WorldSnapshot): void {
   for (const sp of veg.saplings) {
     // Appear-only as the day runs forward — nothing takes a sapling away —
     // but still derived, so a scrub back to noon has the ground bare again.
+    //
+    // Deliberately NOT gated on the stump still being in the ground. A sapling
+    // stands a stride or two off its anchor — `d` is 1 to 1.8 tiles, against a
+    // corridor half-width of 0.9 — so it comes up on the VERGE, never on the
+    // paving, and the crew that grubbed the stump out had no reason to touch
+    // it. Gating it would also have cost the valley almost all its regrowth:
+    // every road gets finished, and the anchors are road clears, so the
+    // evening would end bare on better than four days in five.
     want(sp.slot, snap.t >= sp.t && snap.trees.get(sp.treeId) === 'stump');
   }
   /* ---- end living details (additive) ------------------------------------- */
