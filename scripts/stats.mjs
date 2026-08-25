@@ -39,8 +39,8 @@ const {
   /* ---- standing stones (additive) ---- */
   STONE_NAME_REACH,
   /* ---- end standing stones (additive) ---- */
-} = await import(join(root, 'src/components/designs/genesis/gen.ts'));
-const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'));
+} = await import(join(root, 'src/gen.ts'));
+const { TW } = await import(join(root, 'src/types.ts'));
 
 /* ---------------------------- renderer coverage --------------------------- */
 
@@ -48,7 +48,7 @@ const { TW } = await import(join(root, 'src/components/designs/genesis/types.ts'
 // here renders as NOTHING (or, for a tree, silently as an oak), which is the
 // one failure mode in this generator that leaves no trace in the JSON — so it
 // is checked rather than eyeballed. Keep in step with makePools(), TREE_POOL
-// and the propSprite() switch in src/components/designs/genesis/scene.ts.
+// and the propSprite() switch in src/scene.ts.
 const TREE_SPRITES = new Set(['oak', 'pine', 'blossom', 'hedgerow', 'birch', 'willow', 'fir']);
 const PROP_SPRITES = new Set([
   ...TREE_SPRITES,

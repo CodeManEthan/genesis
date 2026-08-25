@@ -132,7 +132,7 @@ import {
   type Pt,
   type Sprite,
   type StructureSprite,
-} from '../vale/art';
+} from './art.ts';
 import {
   PLAIN_DAY,
   auroraAt,
@@ -186,7 +186,7 @@ import {
   type TreeSpec,
   type Vec2,
   type WorldSnapshot,
-} from './types';
+} from './types.ts';
 /* ---- living details II (additive) --------------------------------------- *
  * The arithmetic of the three new details lives in its own DOM-free module so
  * the harness can check it without a canvas; this file draws what it says.
@@ -5439,7 +5439,7 @@ import {
   buildPerchedBird,
   drawFishJump,
   drawRipple,
-} from '../vale/art';
+} from './art.ts';
 
 interface WBird {
   x: number;

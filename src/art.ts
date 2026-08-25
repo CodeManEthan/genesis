@@ -1,5 +1,9 @@
 /**
- * The Vale — pixel rasteriser and sprite factories.
+ * Genesis's shared pixel vocabulary: the rasteriser and the sprite factories
+ * every design in the family draws with.
+ *
+ * It began life as the Vale's art module, and the Vale and the other portfolio
+ * designs still consume it — now through '@codemanethan/genesis/art'.
  *
  * Every routine here paints into a *world-resolution* buffer where one unit is
  * one art pixel. The camera blits that buffer to the screen at an integer

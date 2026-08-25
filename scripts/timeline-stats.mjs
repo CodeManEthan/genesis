@@ -1,6 +1,6 @@
 // Genesis timeline test harness.
 //
-// Exercises src/components/designs/genesis/timeline.ts against real generated
+// Exercises src/timeline.ts against real generated
 // maps when gen.ts exists, and against hand-written fixtures either way (the
 // fixtures cover shapes the generator may not produce: a road that founds
 // nothing, a site with a single building, a bridge near the start of a road).
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const gdir = join(root, 'src/components/designs/genesis');
+const gdir = join(root, 'src');
 
 const { mulberry32, hashSeed } = await import(join(gdir, 'types.ts'));
 const { buildTimeline, emptySnapshot, snapshotAt, advance, RIVAL_POOLS, RIVAL_LINES_MAX } =

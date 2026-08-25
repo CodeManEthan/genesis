@@ -69,7 +69,7 @@ import {
   type RuinArt,
   type Sprite,
   type StructureSpec,
-} from '../vale/art';
+} from './art.ts';
 import {
   bakeLake,
   /* ---- more day types: the river's three moods, and what rides on one ---- */
@@ -127,7 +127,7 @@ const ROLES: StructureRole[] = [
  * plain house and are told apart only by size, roof and the spec flags
  * (chimney / awning / banner / cupola). Down to one: `house` is the honest
  * default every other role is now a departure from. See the `role ===` branches
- * in src/components/designs/vale/art.ts (`buildStructure`, "role furniture") —
+ * in src/art.ts (`buildStructure`, "role furniture") —
  * homestead, chapel, hall, store, workshop and cottage each have their own,
  * on top of tower, granary, mill, smithy, bakery, brewhouse and gildhall. barn,
  * shed and granary additionally get timber walls (`woody`), and barn alone gets

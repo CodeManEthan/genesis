@@ -335,7 +335,7 @@ export const FLOOD_DRIFT = 0.55;
  * afternoon and not about how hard the settlers are working: at pace 4 the
  * valley is finished long before the first drop and the warp finds nothing.
  */
-export function stormWarp(day: DayInfo, t: number): number {
+export function stormWarp(day: Pick<DayInfo, 'type' | 'from' | 'to'>, t: number): number {
   if (day.type !== 'storm') return t;
   const s = day.from;
   const e = day.to;

@@ -95,7 +95,10 @@ const MONTHS = [
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ];
 
-const DAY_LABEL: Record<DayType, string> = {
+// Partial on purpose: `stars`, `flood` and `drought` have no label yet, so a
+// day of those types renders an empty rare chip. Giving them wording is a
+// product decision, not a typing one — don't paper over it here.
+const DAY_LABEL: Partial<Record<DayType, string>> = {
   normal: '',
   mist: 'Mist morning',
   storm: 'Storm afternoon',

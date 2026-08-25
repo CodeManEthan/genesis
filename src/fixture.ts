@@ -30,7 +30,7 @@ import type {
   TreeSpec,
   Vec2,
   WorldSnapshot,
-} from './types';
+} from './types.ts';
 
 /** Screen-aligned authoring: u runs right, v runs down. */
 const P = (u: number, v: number): Vec2 => [(v + u) / 2, (v - u) / 2];

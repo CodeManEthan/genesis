@@ -33,8 +33,13 @@ import { fileURLToPath } from 'node:url';
 import { writeFileSync } from 'node:fs';
 import puppeteer from 'puppeteer-core';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const gdir = join(root, 'src/components/designs/genesis');
+// Two levels up: this script lives at <repo>/site/scripts.
+const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const gdir = join(root, 'src');
+// What the in-page probe imports. `/@fs` reaches outside the Astro site's root
+// into the package source; site/astro.config.mjs allows it with
+// `vite.server.fs.allow: ['..']`, without which these 403.
+const fsUrl = (name) => '/@fs' + join(gdir, name);
 const { dayTypeOf } = await import(join(gdir, 'daytype.ts'));
 const { generateMap } = await import(join(gdir, 'gen.ts'));
 const { buildTimeline, festivalAt } = await import(join(gdir, 'timeline.ts'));
@@ -313,17 +318,17 @@ function fmtHour(t) {
  * canvases only exist where there is a DOM — so this imports the modules
  * straight out of the dev server's module graph on a page that is already
  * open, times a cold build, and reads the real canvas dimensions back. Dev
- * server only; `/src/...` is not a URL in a built site. */
+ * server only; a `/@fs` path is not a URL in a built site. */
 
 async function probeBuild(browser, cases) {
   const page = await browser.newPage();
   await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
   await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  const rows = await page.evaluate(async (cases) => {
-    const gen = await import('/src/components/designs/genesis/gen.ts');
-    const tl = await import('/src/components/designs/genesis/timeline.ts');
-    const sc = await import('/src/components/designs/genesis/scene.ts');
-    const dt = await import('/src/components/designs/genesis/daytype.ts');
+  const rows = await page.evaluate(async ({ cases, mods }) => {
+    const gen = await import(/* @vite-ignore */ mods.gen);
+    const tl = await import(/* @vite-ignore */ mods.timeline);
+    const sc = await import(/* @vite-ignore */ mods.scene);
+    const dt = await import(/* @vite-ignore */ mods.daytype);
     const out = [];
     // One throwaway build so the JIT has seen every path before the clock runs.
     sc.buildGenesisScene(gen.generateMapUncached(999001, 1), dt.dayInfo(999001, null));
@@ -357,7 +362,15 @@ async function probeBuild(browser, cases) {
       });
     }
     return out;
-  }, cases);
+  }, {
+    cases,
+    mods: {
+      gen: fsUrl('gen.ts'),
+      timeline: fsUrl('timeline.ts'),
+      scene: fsUrl('scene.ts'),
+      daytype: fsUrl('daytype.ts'),
+    },
+  });
   await page.close();
   return rows;
 }

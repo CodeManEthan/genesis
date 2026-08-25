@@ -26,8 +26,9 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import puppeteer from 'puppeteer-core';
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const gdir = join(root, 'src/components/designs/genesis');
+// Two levels up: this script lives at <repo>/site/scripts.
+const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const gdir = join(root, 'src');
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
