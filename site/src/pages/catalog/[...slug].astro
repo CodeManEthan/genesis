@@ -1,0 +1,63 @@
+---
+/**
+ * Genesis artifact catalog — DEV ONLY.
+ *
+ * Fenced off twice over:
+ *
+ *  1. `getStaticPaths` hands back one path under `astro dev` and none at all in
+ *     a build. Zero paths means the page is never emitted.
+ *  2. The React island is mounted by hand from a `import.meta.env.DEV` branch
+ *     rather than with `client:only`. Vite folds that flag to `false` in a
+ *     build and drops the branch, so the catalog bundle is not emitted either —
+ *     a `client:only` import would have left an orphan chunk in dist/_astro.
+ */
+export function getStaticPaths() {
+  return import.meta.env.DEV ? [{ params: { slug: undefined } }] : [];
+}
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Genesis — artifact catalog</title>
+  </head>
+  <body>
+    <div id="catalog-root"></div>
+    <script>
+      if (import.meta.env.DEV) {
+        // Astro installs React Fast Refresh for islands only, and a hand-mounted
+        // component compiled by the same plugin still expects it. Install the
+        // standard preamble first, or the module throws on `$RefreshSig$`.
+        const Refresh = (await import(/* @vite-ignore */ '/@react-refresh')).default;
+        Refresh.injectIntoGlobalHook(window);
+        (window as any).$RefreshReg$ = () => {};
+        (window as any).$RefreshSig$ = () => (t: unknown) => t;
+        (window as any).__vite_plugin_react_preamble_installed__ = true;
+
+        const [{ createRoot }, { createElement }, mod] = await Promise.all([
+          import('react-dom/client'),
+          import('react'),
+          import('@codemanethan/genesis/Catalog'),
+        ]);
+        const root = document.getElementById('catalog-root')!;
+        createRoot(root).render(createElement(mod.default));
+      }
+    </script>
+  </body>
+</html>
+
+<style is:global>
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    background: #fdf8ef;
+  }
+</style>

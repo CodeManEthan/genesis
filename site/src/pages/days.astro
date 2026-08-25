@@ -1,0 +1,78 @@
+---
+/**
+ * The last fortnight of valleys.
+ *
+ * Nothing is stored: each card is rebuilt in the browser from its own date,
+ * which is why the list can only be worked out client-side. See PastDays.tsx.
+ */
+import PastDays from '@codemanethan/genesis/PastDays';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Two weeks of valleys, none of them saved. Every day is generated from its own date."
+    />
+    <title>The days before · Genesis</title>
+  </head>
+  <body>
+    <main>
+      <section class="days" aria-label="The last fourteen days">
+        <PastDays client:only="react" />
+        <noscript>
+          <p class="noscript">
+            The days are generated in the browser, so this list needs
+            JavaScript.
+          </p>
+        </noscript>
+      </section>
+    </main>
+  </body>
+</html>
+
+<style is:global>
+  /* The cards are React markup, so the palette has to be reachable from
+     outside this file's scope. PastDays reads --card, --border, --ink-soft and
+     --mint; --cream and --ink are the page's own. */
+  :root {
+    --cream: #fdf8ef;
+    --card: #ffffff;
+    --ink: #413a55;
+    --ink-soft: #7a7690;
+    --border: #ece3d2;
+    --mint: #63c9a8;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+</style>
+
+<style>
+  body {
+    margin: 0;
+    background: var(--cream);
+    color: var(--ink);
+    font-family:
+      system-ui,
+      -apple-system,
+      'Segoe UI',
+      Roboto,
+      'Helvetica Neue',
+      sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .days {
+    padding: clamp(1rem, 4vw, 2.4rem);
+  }
+
+  .noscript {
+    color: var(--ink-soft);
+  }
+</style>

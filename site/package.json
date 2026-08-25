@@ -1,0 +1,21 @@
+{
+  "name": "genesis-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npm run build --prefix .. && astro dev",
+    "build": "npm run build --prefix .. && astro build",
+    "perf": "node scripts/perf.mjs",
+    "ab": "node scripts/ab.mjs"
+  },
+  "dependencies": {
+    "@codemanethan/genesis": "file:..",
+    "astro": "^7.1.3",
+    "@astrojs/react": "^6.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.3.0"
+  }
+}

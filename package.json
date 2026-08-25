@@ -1,0 +1,42 @@
+{
+  "name": "@codemanethan/genesis",
+  "version": "0.1.0",
+  "description": "A pixel valley that builds itself from a date.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "engines": { "node": ">=22.18.0" },
+  "files": ["dist", "src", "README.md"],
+  "exports": {
+    ".":            { "types": "./dist/index.d.ts",      "default": "./dist/index.js" },
+    "./art":        { "types": "./dist/art.d.ts",        "default": "./dist/art.js" },
+    "./types":      { "types": "./dist/types.d.ts",      "default": "./dist/types.js" },
+    "./daytype":    { "types": "./dist/daytype.d.ts",    "default": "./dist/daytype.js" },
+    "./gen":        { "types": "./dist/gen.d.ts",        "default": "./dist/gen.js" },
+    "./scene":      { "types": "./dist/scene.d.ts",      "default": "./dist/scene.js" },
+    "./timeline":   { "types": "./dist/timeline.d.ts",   "default": "./dist/timeline.js" },
+    "./living":     { "types": "./dist/living.d.ts",     "default": "./dist/living.js" },
+    "./ghost":      { "types": "./dist/ghost.d.ts",      "default": "./dist/ghost.js" },
+    "./names":      { "types": "./dist/names.d.ts",      "default": "./dist/names.js" },
+    "./fixture":    { "types": "./dist/fixture.d.ts",    "default": "./dist/fixture.js" },
+    "./TheGenesis": { "types": "./dist/TheGenesis.d.ts", "default": "./dist/TheGenesis.js" },
+    "./PastDays":   { "types": "./dist/PastDays.d.ts",   "default": "./dist/PastDays.js" },
+    "./Catalog":    { "types": "./dist/Catalog.d.ts",    "default": "./dist/Catalog.js" },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "prepare": "tsup",
+    "typecheck": "tsc --noEmit",
+    "check": "node scripts/stats.mjs && node scripts/timeline-stats.mjs",
+    "sweep": "node scripts/stats.mjs --sweep 200"
+  },
+  "peerDependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" },
+  "devDependencies": {
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3"
+  }
+}
