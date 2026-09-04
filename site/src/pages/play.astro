@@ -1,0 +1,124 @@
+---
+/**
+ * The valley, with somebody standing in it.
+ *
+ * Exactly the homepage's island, exactly the homepage's sized box, and one
+ * prop: `avatar`. The homepage never sets it, so `/` is still the seed-only
+ * world it has always been — same bytes, same paused frame, same everything.
+ *
+ * The founder's position is local to the island for now. The agreed direction
+ * is world = f(seed, input log), and until that log exists a walk changes the
+ * camera and the ledger's attention and nothing else about the day.
+ */
+import TheGenesis from '@codemanethan/genesis/TheGenesis';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="description" content="Walk a pixel valley that builds itself from a date." />
+    <title>Genesis — play</title>
+  </head>
+  <body>
+    <main class="hero">
+      <div class="hero-scene">
+        <TheGenesis client:only="react" avatar={true} />
+      </div>
+      <p class="keys" aria-hidden="true">
+        <b>WASD</b> or the <b>arrows</b> to walk · <b>space</b> holds the day ·
+        <b>drag</b> to look away
+      </p>
+      <noscript>
+        <p class="noscript">
+          The valley is generated in the browser, so it needs JavaScript. The
+          world is a pure function of the date: same date, same river, same
+          towns, same names — and now somebody to walk them.
+        </p>
+      </noscript>
+    </main>
+  </body>
+</html>
+
+<style is:global>
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    height: 100%;
+    margin: 0;
+  }
+</style>
+
+<style>
+  .hero {
+    position: relative;
+    min-height: 100svh;
+    overflow: hidden;
+    background: #3f7f66;
+  }
+
+  .hero-scene {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+  }
+
+  /* Bottom right, opposite the ledger's own column, so the two never argue. */
+  .keys {
+    position: absolute;
+    right: 16px;
+    bottom: 18px;
+    z-index: 2;
+    margin: 0;
+    padding: 5px 11px;
+    border-radius: 8px;
+    background: rgba(253, 248, 239, 0.82);
+    border: 1px solid rgba(65, 58, 85, 0.1);
+    color: #413a55;
+    font-family:
+      system-ui,
+      -apple-system,
+      'Segoe UI',
+      Roboto,
+      sans-serif;
+    font-size: 0.72rem;
+    pointer-events: none;
+  }
+
+  .keys b {
+    font-weight: 700;
+  }
+
+  .noscript {
+    position: relative;
+    z-index: 2;
+    margin: 0;
+    padding: 1.2rem;
+    color: #fdf8ef;
+    font-family:
+      system-ui,
+      -apple-system,
+      'Segoe UI',
+      Roboto,
+      sans-serif;
+    line-height: 1.6;
+  }
+
+  @media (max-width: 820px) {
+    .hero {
+      min-height: 0;
+    }
+
+    .hero-scene {
+      position: relative;
+      inset: auto;
+      height: 48svh;
+      min-height: 330px;
+    }
+  }
+</style>

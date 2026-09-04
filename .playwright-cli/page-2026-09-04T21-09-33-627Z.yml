@@ -1,0 +1,43 @@
+- generic [active] [ref=f1e1]:
+  - main [ref=f1e2]:
+    - generic [ref=f1e5]:
+      - img "A pixel-art valley called Beechcombe Hollow, held at 11:00 of its first day." [ref=f1e6]
+      - generic:
+        - paragraph: "YouTobias's Nether Everbury, all round you: 10 roofs, 14 settlers, and the tools stacked."
+        - paragraph: 10:12The Mill is finished at Cloverwell. It will be the thing people mean by Cloverwell.
+        - paragraph: 10:15They finish the first of it at Cloverwell. Nell is already pointing at the next plot.
+        - paragraph: "10:19Axes go out ahead of the highway: they are cutting a line through the wood toward Nettlewold."
+      - paragraph [ref=f1e7]: "Axes go out ahead of the highway: they are cutting a line through the wood toward Nettlewold."
+      - generic [ref=f1e8]:
+        - generic [ref=f1e9]:
+          - button "Zoom in" [ref=f1e10] [cursor=pointer]: +
+          - button "Zoom out" [ref=f1e11] [cursor=pointer]: −
+          - button "Fit" [ref=f1e12] [cursor=pointer]
+        - group "Which valley" [ref=f1e13]:
+          - button "Beechcombe Hollow, seed 42. Browse other valleys" [expanded] [ref=f1e14] [cursor=pointer]:
+            - generic [ref=f1e15]: Beechcombe Hollow
+            - generic [ref=f1e16]: · seed 42
+            - generic [ref=f1e17]: ▴
+          - generic [ref=f1e18]:
+            - button "New valley" [ref=f1e19] [cursor=pointer]
+            - button "Previous seed" [ref=f1e20] [cursor=pointer]: ‹
+            - button "Next seed" [ref=f1e21] [cursor=pointer]: ›
+            - button "Today" [ref=f1e22] [cursor=pointer]
+      - group "World clock" [ref=f1e23]:
+        - button "Restart the day" [ref=f1e24] [cursor=pointer]: ⏮
+        - button "Play" [ref=f1e25] [cursor=pointer]: ▶
+        - 'button "Speed: 600 times" [ref=f1e26] [cursor=pointer]': ×600
+        - 'button "Ambition: 1× as much valley built today" [ref=f1e27] [cursor=pointer]':
+          - generic [ref=f1e28]: pace
+          - generic [ref=f1e29]: 1×
+        - slider "World time in hours" [ref=f1e33] [cursor=pointer]: "11"
+        - generic [ref=f1e34]:
+          - generic [ref=f1e35]: Day of Beechcombe Hollow
+          - generic [ref=f1e36]: 11:00
+        - button "LIVE" [ref=f1e37] [cursor=pointer]
+    - paragraph: WASD or the arrows to walk · space holds the day ·drag to look away
+  - generic [ref=f1e40]:
+    - button [ref=f1e41]
+    - button [ref=f1e47]
+    - button [ref=f1e51]
+    - button [ref=f1e56]

@@ -37,6 +37,9 @@ import {
   drawCart,
   drawCraneLoad,
   drawFishJump,
+  /* ---- the founder (additive: PLAY only) ---- */
+  drawFounder,
+  /* ---- end the founder (additive) ---- */
   drawRipple,
   drawWheel,
   isoTile,
@@ -996,6 +999,13 @@ function Inhabitants({ anims }: { anims: Anim[] }) {
 /* --------------------------------- notes ---------------------------------- */
 
 const COVERAGE: { head: string; body: string }[] = [
+  /* ---- the founder (additive: PLAY only) ---- */
+  {
+    head: 'The founder is the only sprite no generator emits',
+    body:
+      'drawFounder is the player, and the player only exists on /play, where TheGenesis is mounted with avatar. No GenesisMap, timeline or ambient crowd ever produces one, so nothing on the homepage or in the archive can draw it and no seeded frame changes because it exists. It is separated from a villager by silhouette rather than by colour — 21px against 17, a coat skirt that flares past the belt and swings on the step, an 11px hat brim, and a satchel that swaps hips with the turn — because at the fitted overview colour is the first thing to go. What it has no art for yet: an idle that is not simply the walk with the phase frozen, and any pose for a verb, which is the next slice.',
+  },
+  /* ---- end the founder (additive) ---- */
   {
     head: 'shed is the last role with no art of its own',
     body:
@@ -1523,6 +1533,32 @@ export default function Catalog() {
       oy: 21,
       draw: (ctx, t) => drawBot(ctx, 0, 0, '#f0c75e', false, 'walk', t),
     });
+    /* ---- the founder (additive: PLAY only) --------------------------------
+     * The player's own sprite. Nothing generated ever emits it — it only
+     * exists while somebody is holding the keyboard on /play — so it is here
+     * for the same reason the bridge stages are: this page is the only place
+     * you can look at it next to the crowd it has to belong to. */
+    list.push({
+      key: 'founder',
+      label: 'founder · walk',
+      sub: 'drawFounder — PLAY only',
+      w: 20,
+      h: 28,
+      ox: 10,
+      oy: 25,
+      draw: (ctx, t) => drawFounder(ctx, 0, 0, true, true, t),
+    });
+    list.push({
+      key: 'founder-stand',
+      label: 'founder · standing (left)',
+      sub: 'moving = false',
+      w: 20,
+      h: 28,
+      ox: 10,
+      oy: 25,
+      draw: (ctx) => drawFounder(ctx, 0, 0, false, false, 0),
+    });
+    /* ---- end the founder (additive) ---------------------------------------- */
     list.push({
       key: 'cart',
       label: 'hand cart',
@@ -2231,7 +2267,7 @@ export default function Catalog() {
           id="inhabitants"
           title="Inhabitants"
           count={counts.inhabitants}
-          blurb="The moving parts, drawn straight into the frame each tick: villagers, freight, the crane hook and the mill wheel. ~8fps here; 60 in the world."
+          blurb="The moving parts, drawn straight into the frame each tick: villagers, the founder somebody is driving on /play, freight, the crane hook and the mill wheel. ~8fps here; 60 in the world."
         >
           <Inhabitants anims={anims} />
         </Section>

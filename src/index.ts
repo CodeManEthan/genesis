@@ -12,3 +12,5 @@ export * from './timeline.ts';
 export * from './names.ts';
 export * from './living.ts';
 export * from './ghost.ts';
+/* ---- the founder (additive: PLAY only) ---- */
+export * from './play.ts';

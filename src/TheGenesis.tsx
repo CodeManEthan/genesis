@@ -24,6 +24,8 @@ import {
   TH,
   TW,
   hashSeed,
+  isoX,
+  isoY,
   type GenesisMap,
   /* ---- ruins (additive) ---- */
   type RuinSpec,
@@ -57,6 +59,18 @@ import {
   fixtureSnapshotAt,
   fixtureTimeline,
 } from './fixture';
+/* ---- the founder (additive: PLAY only) ---------------------------------- */
+import {
+  MAX_CATCHUP,
+  TICK_DT,
+  createAvatar,
+  presenceAt,
+  stepAvatar,
+  type AvatarInput,
+  type AvatarState,
+  type Presence,
+} from './play.ts';
+/* ---- end the founder (additive) ----------------------------------------- */
 
 /* ------------------------------ world loading ---------------------------- */
 
@@ -324,9 +338,20 @@ export interface GenesisProps {
    * cannot argue with the page's own copy.
    */
   embed?: boolean;
+  /* ---- the founder (additive: PLAY only) --------------------------------
+   * Put a person in the valley and hand the keyboard to them. OFF by default
+   * and never set by the homepage or by /days, so every world those two build
+   * is the seed-only world it has always been — no avatar, no fixed tick, no
+   * key listeners, and the arrows still seek the transport.
+   *
+   * The avatar's state is deliberately local to this island for now. A future
+   * input log is what makes a walk part of the world (world = f(seed, log));
+   * until that exists, walking is something you do to the camera and to the
+   * ledger's attention, and nothing you do to the day. */
+  avatar?: boolean;
 }
 
-export default function TheGenesis({ embed = false }: GenesisProps) {
+export default function TheGenesis({ embed = false, avatar = false }: GenesisProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -377,6 +402,25 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   const logSigRef = useRef('');
   const seedRef = useRef(0);
   const paceRef = useRef(1);
+
+  /* ---- the founder (additive: PLAY only) --------------------------------
+   * All of it behind `avatar`. With the prop off none of these refs is ever
+   * written and the tick never looks at them. */
+  /** Live, so the effect below never has to re-run to learn the prop. */
+  const avatarOn = useRef(avatar);
+  avatarOn.current = avatar;
+  const avRef = useRef<AvatarState | null>(null);
+  /** Which keys are DOWN right now — read once per fixed tick, never per
+   * keydown event, which is what makes the walk a function of tick number. */
+  const keysRef = useRef<AvatarInput>({ up: false, down: false, left: false, right: false });
+  /** Does the camera belong to the founder? Dragging or wheeling takes it
+   * back; the next step on the keyboard hands it over again. */
+  const followRef = useRef(true);
+  /** Leftover real time owed to the fixed tick. */
+  const accumRef = useRef(0);
+  const [presence, setPresence] = useState<Presence | null>(null);
+  const presenceRef = useRef<string>('');
+  /* ---- end the founder (additive) ---------------------------------------- */
 
   const api = useRef<{
     applyT: (t: number) => void;
@@ -605,6 +649,50 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       return cam;
     };
 
+    /* ---- the founder (additive: PLAY only) ------------------------------
+     * The camera follows with a soft lead: it eases towards the founder plus
+     * a shove in whatever direction they are walking, so the ground they are
+     * walking INTO gets the screen rather than the ground behind them. The
+     * lead is bigger across than down because a screen is, and because an
+     * isometric step covers twice as much x as y.
+     *
+     * `clampCam` still has the last word, so at the edge of the valley the
+     * founder simply walks towards the corner of the frame instead of the
+     * camera sailing off over the surrounding wood. */
+    const LEAD_X = 58;
+    const LEAD_Y = 30;
+    const followCam = (av: AvatarState, dt: number) => {
+      const cam = camRef.current!;
+      const tx = isoX(av.gx, av.gy) + (av.moving ? av.lu * LEAD_X : 0);
+      const ty = isoY(av.gx, av.gy) + (av.moving ? av.lv * LEAD_Y : 0);
+      // Exponential ease, framed off real time so it is the same softness at
+      // any frame rate. Only the camera works this way — the walk itself is
+      // integrated on the fixed tick and never touches `dt`.
+      const k = 1 - Math.exp(-dt * 3.4);
+      cam.cx += (tx - vw / cam.zoom / 2 - cam.cx) * k;
+      cam.cy += (ty - vh / cam.zoom / 2 - cam.cy) * k;
+      clampCam(cam);
+      dirtyRef.current = true;
+    };
+    /** Drop the founder where the first house is and put the camera on them. */
+    const placeAvatar = () => {
+      if (!avatarOn.current) return;
+      avRef.current = createAvatar(world.map, snapRef.current!);
+      accumRef.current = 0;
+      presenceRef.current = '';
+      setPresence(null);
+      // Snapped, not eased: there is nothing to ease from on the first frame.
+      const cam = camRef.current;
+      if (cam) {
+        cam.zoom = ladderRef.current[Math.min(2, ladderRef.current.length - 1)];
+        cam.cx = isoX(avRef.current.gx, avRef.current.gy) - vw / cam.zoom / 2;
+        cam.cy = isoY(avRef.current.gx, avRef.current.gy) - vh / cam.zoom / 2;
+        clampCam(cam);
+      }
+      followRef.current = true;
+    };
+    /* ---- end the founder (additive) -------------------------------------- */
+
     if (!camRef.current) {
       camRef.current = home;
       // Dev-only camera params, used by the screenshot harness to inspect a
@@ -618,6 +706,7 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       if (q.has('cy') && isFinite(qy)) camRef.current.cy = qy - vh / camRef.current.zoom / 2;
     }
     clampCam(camRef.current);
+    if (avatarOn.current && !avRef.current) placeAvatar();
 
     /* ---- clock ---------------------------------------------------------- */
     let clock = 8;
@@ -722,6 +811,10 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       resetAmbient(scene, amb, snapRef.current);
       settleAmbient(scene, amb, snapRef.current);
       camRef.current = clampCam(fitCam());
+      // A different valley is a different set of ground: the founder is put
+      // back on the first doorstep of the new one rather than left standing
+      // in whatever the old coordinates now happen to be.
+      placeAvatar();
       logSigRef.current = LOG_FORCE;
       pushLog();
       setSeed(s);
@@ -756,6 +849,9 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       resetAmbient(scene, amb, snapRef.current);
       settleAmbient(scene, amb, snapRef.current);
       camRef.current = clampCam(fitCam());
+      // Midnight moves the founder too: the valley they were standing in has
+      // gone, and tomorrow's first house is somewhere else entirely.
+      placeAvatar();
 
       // The ledger starts over: yesterday's closing line goes out with the
       // light, and the founding of the new valley fades in with the pre-dawn.
@@ -851,7 +947,17 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     function paintOnce() {
       const cam = camRef.current!;
       const t0 = perf ? performance.now() : 0;
-      renderGenesis(ctx!, scene, amb, snapRef.current!, { ...cam, vw, vh, dpr }, clock);
+      renderGenesis(
+        ctx!,
+        scene,
+        amb,
+        snapRef.current!,
+        { ...cam, vw, vh, dpr },
+        clock,
+        // Undefined on every world that never asked for a player, which is the
+        // whole of what keeps a seed-only frame identical to the byte.
+        avatarOn.current ? avRef.current : null
+      );
       dirtyRef.current = false;
       if (!perf) return;
       const ms = performance.now() - t0;
@@ -931,6 +1037,43 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         dirtyRef.current = true;
       }
       if (perf2) pAmbMs += performance.now() - tAmb0;
+
+      /* ---- the founder (additive: PLAY only) ----------------------------
+       * The one fixed-rate thing in this file. Real time goes into an
+       * accumulator and comes out as whole 1/60s ticks; the key state is read
+       * ONCE per tick, not per event, so the walk is a function of (tick
+       * number, keys held) and of nothing else. Drop a frame, run at 144Hz,
+       * throttle the tab — the founder ends up on the same tile.
+       *
+       * `MAX_CATCHUP` is the fuse: a tab that has been in the background for a
+       * minute owes sixty seconds of walking, and paying that off in one frame
+       * would fire the founder across the valley. It is dropped instead, and
+       * that is the one place this is NOT replayable — which is exactly why a
+       * real input log has to be written by the tick, not reconstructed from
+       * the clock afterwards. */
+      if (avatarOn.current && avRef.current) {
+        accumRef.current = Math.min(accumRef.current + dt, TICK_DT * MAX_CATCHUP);
+        let stepped = 0;
+        while (accumRef.current >= TICK_DT) {
+          accumRef.current -= TICK_DT;
+          stepAvatar(world.map, snapRef.current!, avRef.current, keysRef.current);
+          stepped++;
+        }
+        if (stepped) {
+          if (followRef.current) followCam(avRef.current, stepped * TICK_DT);
+          if (avRef.current.moving) dirtyRef.current = true;
+          // The ledger's attention, re-read every frame: standing still while
+          // the crew tops the roof out beside you should change the line.
+          const p = presenceAt(world.map, snapRef.current!, avRef.current);
+          const k = p ? p.key : '';
+          if (k !== presenceRef.current) {
+            presenceRef.current = k;
+            setPresence(p);
+          }
+        }
+      }
+      /* ---- end the founder (additive) ------------------------------------ */
+
       uiAccum += dt;
       if (uiAccum > 0.12) {
         uiAccum = 0;
@@ -978,6 +1121,10 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
+    // A drag is the visitor taking the camera off the founder. It stays theirs
+    // until the next key on the keyboard, which is what makes "look over there
+    // for a second" and "walk over there" two different gestures.
+    followRef.current = false;
     api.current?.pan(e.clientX - d.x, e.clientY - d.y);
     d.x = e.clientX;
     d.y = e.clientY;
@@ -1093,6 +1240,31 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
     syncMoment();
   }, [syncMoment]);
 
+  /* ---- the founder (additive: PLAY only) ---------------------------------
+   * Which held key means which way. WASD and the arrows are the same four
+   * directions, and both are HELD keys: keydown sets a flag, keyup clears it,
+   * and the simulation tick is the only thing that ever reads them. Nothing
+   * moves on the keydown event itself — a key repeat is not a step.
+   *
+   * On the play route the arrows belong to the founder, so the quarter-hour
+   * seek they do everywhere else is off. The transport keeps space, and the
+   * scrubber and the buttons are all still there.
+   * ------------------------------------------------------------------------ */
+  const AVATAR_KEYS: Record<string, keyof AvatarInput> = {
+    ArrowUp: 'up',
+    ArrowDown: 'down',
+    ArrowLeft: 'left',
+    ArrowRight: 'right',
+    w: 'up',
+    a: 'left',
+    s: 'down',
+    d: 'right',
+    W: 'up',
+    A: 'left',
+    S: 'down',
+    D: 'right',
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -1100,6 +1272,16 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       // On a scrolling page space and the arrows are the page's, right up until
       // the visitor has actually put focus inside the world.
       if (embed && !wrapRef.current?.contains(document.activeElement)) return;
+      if (avatar && tag !== 'INPUT') {
+        const dir = AVATAR_KEYS[e.key];
+        if (dir) {
+          e.preventDefault();
+          keysRef.current[dir] = true;
+          // Any step on the keyboard takes the camera back off the visitor.
+          followRef.current = true;
+          return;
+        }
+      }
       if (e.key === ' ') {
         e.preventDefault();
         togglePlay();
@@ -1111,9 +1293,28 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
         seek(tRef.current + 0.25);
       }
     };
+    const onKeyUp = (e: KeyboardEvent) => {
+      const dir = AVATAR_KEYS[e.key];
+      if (dir) keysRef.current[dir] = false;
+    };
+    // A tab that loses focus mid-stride would otherwise come back still
+    // walking, because the keyup happened somewhere else.
+    const release = () => {
+      keysRef.current.up = false;
+      keysRef.current.down = false;
+      keysRef.current.left = false;
+      keysRef.current.right = false;
+    };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, seek, embed]);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', release);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', release);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [togglePlay, seek, embed, avatar]);
 
   const latest = lines.length ? lines[lines.length - 1].text : '';
   const pct = (clamp(tDisp, 0, 24) / 24) * 100;
@@ -1143,6 +1344,16 @@ export default function TheGenesis({ embed = false }: GenesisProps) {
       />
 
       <div className={`gen-ticker${hush ? ' gen-hush' : ''}`} aria-hidden="true">
+        {/* ---- the founder (additive: PLAY only) ----
+            The ledger noticing you, at the head of the ledger's own column and
+            in the ledger's own voice — inverted, because this is the one line
+            in the stack that is about the reader rather than about the day. */}
+        {avatar && presence ? (
+          <p className="gen-you" key={presence.key}>
+            <span className="gen-stamp">You</span>
+            {presence.text}
+          </p>
+        ) : null}
         {lines.map((l, i) => (
           <p key={`${l.t}-${l.text}`} data-age={lines.length - 1 - i}>
             <span className="gen-stamp">{fmtClock(l.t)}</span>
@@ -1599,6 +1810,15 @@ const CSS = `
   border: 1px solid rgba(65, 58, 85, 0.1);
   animation: gen-in 0.45s ease both;
 }
+/* ---- the founder (additive: PLAY only) ---- */
+.gen-ticker p.gen-you {
+  background: rgba(65, 58, 85, 0.92);
+  border-color: rgba(253, 248, 239, 0.22);
+  color: #fdf8ef;
+}
+.gen-ticker p.gen-you .gen-stamp { color: #7fe0bd; }
+.gen-ticker.gen-hush p.gen-you { opacity: 0.86; }
+/* ---- end the founder (additive) ---- */
 .gen-ticker p[data-age='1'] { opacity: 0.72; }
 .gen-ticker p[data-age='2'] { opacity: 0.48; }
 /* The last hour of a world, and the first minutes of the next one. */

@@ -115,6 +115,9 @@ import {
   drawCart,
   drawChestGlint,
   drawCraneLoad,
+  /* ---- the founder (additive: PLAY only) ---- */
+  drawFounder,
+  /* ---- end the founder (additive) ---- */
   /* ---- the prospector (additive) ---- */
   drawPanner,
   giltStructure,
@@ -4177,13 +4180,33 @@ interface Halo {
   a: number;
 }
 
+/* ---- the founder (additive: PLAY only) ---------------------------------- *
+ * Everything the renderer needs to know about the player, which is as little
+ * as it knows about a walker. The avatar's state, its collision and its
+ * presence lines all live in play.ts and the island; scene.ts is handed a
+ * position and a pose and puts it in the queue with the rest of the crowd.
+ * ------------------------------------------------------------------------- */
+export interface AvatarDraw {
+  /** Tile space, exactly like a walker's. */
+  gx: number;
+  gy: number;
+  faceRight: boolean;
+  moving: boolean;
+  phase: number;
+}
+/* ---- end the founder (additive) ----------------------------------------- */
+
 export function renderGenesis(
   ctx: Ctx,
   scene: GenesisScene,
   amb: Ambient,
   snap: WorldSnapshot,
   view: GView,
-  clock: number
+  clock: number,
+  /* ---- the founder (additive: PLAY only) ----
+   * Absent on every seed-only world, which is what keeps a homepage frame
+   * byte-identical: with no avatar the pass below is one null check. */
+  avatar?: AvatarDraw | null
 ): void {
   const { zoom, vw, vh } = view;
   // `?perf=2` only: a stopwatch that is lapped at each phase boundary below.
@@ -4704,6 +4727,36 @@ export function renderGenesis(
       draw: (c) => drawBot(c, px, py, color, faceRight, 'walk', phase),
     });
   }
+
+  /* ---- the founder (additive: PLAY only) --------------------------------
+   * On exactly the same terms as the walkers above: one entry in the one
+   * depth-sorted list, at the depth of the tile the boots are on. That is the
+   * whole of "walk order" — a founder south of a cottage is painted after it
+   * and stands in front; one north of it is painted before it and goes behind;
+   * and because the entry carries its footprint, the occlusion repair paints
+   * the fir the founder just walked behind back over the hat. Nothing about
+   * this is a special case, which is the point. */
+  if (avatar) {
+    const x = isoX(avatar.gx, avatar.gy);
+    const y = isoY(avatar.gx, avatar.gy);
+    if (inView(x, y)) {
+      const px = Math.round(x);
+      const py = Math.round(y);
+      const { faceRight, moving, phase } = avatar;
+      items.push({
+        depth: y + 1,
+        // The brim is the widest thing on the sprite, the crown the tallest,
+        // and the satchel swaps sides with the turn; the box owns all three or
+        // a repair clips the founder's head or bag off.
+        bx: px - 7,
+        by: py - 22,
+        bw: 16,
+        bh: 24,
+        draw: (c) => drawFounder(c, px, py, faceRight, moving, phase),
+      });
+    }
+  }
+  /* ---- end the founder (additive) --------------------------------------- */
 
   if (P) lap('build');
 

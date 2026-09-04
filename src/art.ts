@@ -2433,6 +2433,145 @@ export function drawBot(
   }
 }
 
+/* ---- the founder (additive: PLAY only) ---------------------------------- *
+ * The one person in the valley who is not a villager, because somebody is
+ * driving them. Nothing in a seed-only world ever calls this.
+ *
+ * The brief for the sprite was "a person of this valley, not a marker", so it
+ * is drawn to drawBot's rules — 1px features, the same skin and ink, the same
+ * two-pixel legs and the same whole-pixel bob — and separated from a villager
+ * by silhouette rather than by colour:
+ *
+ *   taller       21px against a villager's 17, which is as far as it can go
+ *                before it stops belonging to the same crowd
+ *   a long coat  a skirt that flares past the belt and swings on the step;
+ *                every other figure in the valley stops at the hip
+ *   a hat        an 11px brim, the widest horizontal on any figure here, and
+ *                the thing that finds the founder in a busy yard at 1x
+ *   a satchel    a strap across the coat and a bag on the off hip, so the
+ *                back half of the silhouette is not a flat rectangle
+ *
+ * At the fitted overview the coat and the brim are all that survive, and that
+ * is deliberate: they are the two shapes nothing else in the valley makes.
+ * ------------------------------------------------------------------------- */
+
+/** The founder's coat. Deep and cool, so it reads against meadow, road and a
+ * cream town alike — and one of the few things here that is not on the biome's
+ * side of the palette. */
+export const FOUNDER_COAT = '#4a5aa8';
+/** Scarf, cuffs and hat band: the warm note that keeps the coat from reading
+ * as a hole in the picture. */
+export const FOUNDER_TRIM = '#e0a35a';
+
+/**
+ * The founder, ~21px tall, drawn straight into the frame buffer like a bot.
+ *
+ * `moving` picks the walk cycle; a standing founder gets a still pose rather
+ * than marching on the spot, which is what `AvatarState.phase` freezing on a
+ * stopped tick is for.
+ */
+export function drawFounder(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  faceRight: boolean,
+  moving: boolean,
+  phase: number
+): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const s = faceRight ? 1 : -1;
+  const coat = FOUNDER_COAT;
+  const dark = shade(coat, -0.3);
+  const light = shade(coat, 0.26);
+
+  // A shade more shadow than a villager's, because there is a shade more of
+  // them standing on it.
+  ctx.fillStyle = PAL.shadow;
+  ctx.fillRect(px - 4, py - 1, 9, 2);
+  ctx.fillRect(px - 5, py, 11, 1);
+
+  const step = moving ? Math.sin(phase * 9) : 0;
+  const bob = step !== 0 && Math.abs(step) > 0.6 ? -1 : 0;
+  const top = py + bob;
+
+  /* legs and boots — two pixels wide, same as everybody else's */
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px - 2, top - 3, 2, 3 + (step > 0 ? -1 : 0));
+  ctx.fillRect(px + 1, top - 3, 2, 3 + (step < 0 ? -1 : 0));
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(px - 2, top - 3, 2, 1);
+  ctx.fillRect(px + 1, top - 3, 2, 1);
+
+  /* the coat skirt — flared past the hip, and it swings a pixel on the step */
+  const sway = step > 0.5 ? 1 : step < -0.5 ? -1 : 0;
+  ctx.fillStyle = dark;
+  ctx.fillRect(px - 4 + sway, top - 5, 9, 2);
+  ctx.fillStyle = coat;
+  ctx.fillRect(px - 3, top - 6, 7, 1);
+  // The split up the skirt, on the side turned away from the camera.
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + (faceRight ? -4 : 3) + sway, top - 5, 1, 2);
+
+  /* the belt */
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(px - 3, top - 7, 7, 1);
+  ctx.fillStyle = FOUNDER_TRIM;
+  ctx.fillRect(px + (faceRight ? 0 : -1), top - 7, 1, 1);
+
+  /* the body of the coat */
+  ctx.fillStyle = coat;
+  ctx.fillRect(px - 3, top - 12, 7, 5);
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + (faceRight ? 3 : -3), top - 12, 1, 5);
+  ctx.fillStyle = light;
+  ctx.fillRect(px + (faceRight ? -3 : 3), top - 12, 1, 3);
+
+  /* the bag on the hip behind, then the strap that carries it */
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(px - s * 5, top - 9, 3, 4);
+  ctx.fillStyle = PAL.wood;
+  ctx.fillRect(px - s * 5, top - 9, 3, 1);
+  for (let i = 0; i < 4; i++) ctx.fillRect(px + s * 2 - s * i, top - 12 + i, 1, 1);
+
+  /* arms — one swings forward while the other goes back, cuffs in the trim */
+  ctx.fillStyle = shade(coat, -0.16);
+  ctx.fillRect(px - 4, top - 12 + (step > 0 ? 1 : 0), 1, 4);
+  ctx.fillRect(px + 4, top - 12 + (step < 0 ? 1 : 0), 1, 4);
+  ctx.fillStyle = FOUNDER_TRIM;
+  ctx.fillRect(px - 4, top - 9 + (step > 0 ? 1 : 0), 1, 1);
+  ctx.fillRect(px + 4, top - 9 + (step < 0 ? 1 : 0), 1, 1);
+
+  /* the scarf, over the collar */
+  ctx.fillStyle = FOUNDER_TRIM;
+  ctx.fillRect(px - 3, top - 13, 7, 1);
+  ctx.fillStyle = shade(FOUNDER_TRIM, -0.24);
+  ctx.fillRect(px - s * 3, top - 12, 1, 2);
+
+  /* the head */
+  ctx.fillStyle = '#f7e2c8';
+  ctx.fillRect(px - 2, top - 18, 5, 5);
+  ctx.fillStyle = '#e8cba9';
+  ctx.fillRect(px + (faceRight ? 2 : -2), top - 18, 1, 5);
+  ctx.fillStyle = PAL.ink;
+  ctx.fillRect(px + (faceRight ? 1 : -2), top - 16, 1, 1);
+  ctx.fillRect(px + (faceRight ? -1 : 0), top - 16, 1, 1);
+
+  /* the hat: an 11px brim and a low crown — the widest horizontal on any
+     figure in the valley, and what finds the founder in a busy yard */
+  ctx.fillStyle = shade(coat, -0.44);
+  ctx.fillRect(px - 5, top - 19, 11, 1);
+  ctx.fillStyle = shade(coat, -0.36);
+  ctx.fillRect(px - 3, top - 21, 6, 2);
+  ctx.fillStyle = FOUNDER_TRIM;
+  ctx.fillRect(px - 3, top - 20, 6, 1);
+  // A pinch of light on the crown, on the side the sun is on in every other
+  // sprite in this file.
+  ctx.fillStyle = shade(coat, -0.08);
+  ctx.fillRect(px - 3, top - 21, 2, 1);
+}
+/* ---- end the founder (additive) ----------------------------------------- */
+
 /** A hand cart being pulled along a road, with its carter in front. */
 export function drawCart(
   ctx: Ctx,

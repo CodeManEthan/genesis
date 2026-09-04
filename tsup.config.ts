@@ -5,7 +5,7 @@ export default defineConfig({
     'src/index.ts',
     'src/art.ts', 'src/types.ts', 'src/daytype.ts', 'src/gen.ts',
     'src/scene.ts', 'src/timeline.ts', 'src/living.ts', 'src/ghost.ts',
-    'src/names.ts', 'src/fixture.ts',
+    'src/names.ts', 'src/fixture.ts', 'src/play.ts',
     'src/TheGenesis.tsx', 'src/PastDays.tsx', 'src/Catalog.tsx',
   ],
   format: ['esm'],

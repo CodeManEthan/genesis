@@ -18,6 +18,7 @@
     "./living":     { "types": "./dist/living.d.ts",     "default": "./dist/living.js" },
     "./ghost":      { "types": "./dist/ghost.d.ts",      "default": "./dist/ghost.js" },
     "./names":      { "types": "./dist/names.d.ts",      "default": "./dist/names.js" },
+    "./play":       { "types": "./dist/play.d.ts",       "default": "./dist/play.js" },
     "./fixture":    { "types": "./dist/fixture.d.ts",    "default": "./dist/fixture.js" },
     "./TheGenesis": { "types": "./dist/TheGenesis.d.ts", "default": "./dist/TheGenesis.js" },
     "./PastDays":   { "types": "./dist/PastDays.d.ts",   "default": "./dist/PastDays.js" },
