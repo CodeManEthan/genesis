@@ -661,10 +661,24 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
      * camera sailing off over the surrounding wood. */
     const LEAD_X = 58;
     const LEAD_Y = 30;
+    /**
+     * How much of the lead is currently applied, 0..1.
+     *
+     * It has to be its own eased quantity rather than a flag off `av.moving`.
+     * Take the lead away the instant a key comes up and the camera snaps the
+     * whole 58px back on a single frame, which reads as a shove every time the
+     * founder stops — and a founder stops constantly. Fading it out instead,
+     * over a beat and a half, means letting go of the key simply lets the view
+     * settle back around them.
+     */
+    let leadK = 0;
     const followCam = (av: AvatarState, dt: number) => {
       const cam = camRef.current!;
-      const tx = isoX(av.gx, av.gy) + (av.moving ? av.lu * LEAD_X : 0);
-      const ty = isoY(av.gx, av.gy) + (av.moving ? av.lv * LEAD_Y : 0);
+      // `av.lu/lv` keep the LAST heading through a stop, so the lead decays
+      // along the way the founder was going rather than collapsing sideways.
+      leadK += ((av.moving ? 1 : 0) - leadK) * (1 - Math.exp(-dt * 2.2));
+      const tx = isoX(av.gx, av.gy) + av.lu * LEAD_X * leadK;
+      const ty = isoY(av.gx, av.gy) + av.lv * LEAD_Y * leadK;
       // Exponential ease, framed off real time so it is the same softness at
       // any frame rate. Only the camera works this way — the walk itself is
       // integrated on the fixed tick and never touches `dt`.
@@ -681,10 +695,16 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       accumRef.current = 0;
       presenceRef.current = '';
       setPresence(null);
+      leadK = 0;
       // Snapped, not eased: there is nothing to ease from on the first frame.
       const cam = camRef.current;
       if (cam) {
-        cam.zoom = ladderRef.current[Math.min(2, ladderRef.current.length - 1)];
+        // A walking distance rather than a fitted overview: you cannot read a
+        // face, a plot or your own hat from the top of the valley. `?zoom=` in
+        // the address bar still wins, because the screenshot harness sets it.
+        if (!new URLSearchParams(window.location.search).has('zoom')) {
+          cam.zoom = ladderRef.current[Math.min(2, ladderRef.current.length - 1)];
+        }
         cam.cx = isoX(avRef.current.gx, avRef.current.gy) - vw / cam.zoom / 2;
         cam.cy = isoY(avRef.current.gx, avRef.current.gy) - vh / cam.zoom / 2;
         clampCam(cam);

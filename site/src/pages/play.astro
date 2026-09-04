@@ -68,11 +68,13 @@ import TheGenesis from '@codemanethan/genesis/TheGenesis';
     z-index: 1;
   }
 
-  /* Bottom right, opposite the ledger's own column, so the two never argue. */
+  /* TOP left. The bottom right belongs to the transport bar's LIVE button,
+     which the hint was sitting on top of; the top left is the one corner the
+     island deliberately leaves clear for whatever page it is embedded in. */
   .keys {
     position: absolute;
-    right: 16px;
-    bottom: 18px;
+    left: 16px;
+    top: 16px;
     z-index: 2;
     margin: 0;
     padding: 5px 11px;

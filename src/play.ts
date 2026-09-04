@@ -133,10 +133,18 @@ export interface Footing {
   fordId?: string;
 }
 
-/** Half-width, in tiles, of the block a building of art width `w` puts down.
- * gen.ts calls the same quantity `fpR` and quotes it in u/v; a tile is 1/√2 of
- * a u/v unit, and the constant on the end is the eaves. */
-const buildingHalf = (w: number) => (w / TW) * 0.72 + 0.34;
+/**
+ * Half-extent, in SCREEN-ALIGNED u/v, of the block a building of art width `w`
+ * puts down, plus a little for the eaves.
+ *
+ * A building's base is a diamond in tile space and a square in u/v — screen x
+ * is u·TW/2, so a sprite `w` art pixels wide reaches w/TW either side of its
+ * anchor in u, and the same again in v because the footprint is square. Test
+ * that box in TILE space instead and you get the same square rotated 45°,
+ * which is how the founder came to be wedged in a town square with three of
+ * the four ways out closed by houses that were nowhere near them.
+ */
+const buildingHalf = (w: number) => w / TW + 0.25;
 
 /** A building is only in the way once somebody has raised a wall on it. */
 function blocking(map: GenesisMap, snap: WorldSnapshot): BuildingSpec[] {
@@ -182,9 +190,13 @@ export function footingAt(map: GenesisMap, snap: WorldSnapshot, gx: number, gy: 
   }
 
   /* ---- walls ----------------------------------------------------------- */
+  const u = gx - gy;
+  const v = gx + gy;
   for (const b of blocking(map, snap)) {
     const r = buildingHalf(b.w);
-    if (Math.abs(gx - b.gx) < r && Math.abs(gy - b.gy) < r) return { walkable: false, speed: 0 };
+    if (Math.abs(u - (b.gx - b.gy)) < r && Math.abs(v - (b.gx + b.gy)) < r) {
+      return { walkable: false, speed: 0 };
+    }
   }
 
   /* ---- made road ------------------------------------------------------- */
@@ -248,8 +260,8 @@ export interface AvatarState {
  */
 export function createAvatar(map: GenesisMap, snap: WorldSnapshot): AvatarState {
   const s0 = map.sites[0];
-  let gx = s0.gx + 1.6;
-  let gy = s0.gy + 1.6;
+  let gx = s0.gx + 2.2;
+  let gy = s0.gy + 2.2;
   for (let k = 0; k < 12 && !footingAt(map, snap, gx, gy).walkable; k++) {
     gx += 0.8;
     gy += 0.8;
