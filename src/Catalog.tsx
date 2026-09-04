@@ -1542,20 +1542,20 @@ export default function Catalog() {
       key: 'founder',
       label: 'founder · walk',
       sub: 'drawFounder — PLAY only',
-      w: 20,
-      h: 28,
-      ox: 10,
-      oy: 25,
+      w: 22,
+      h: 31,
+      ox: 11,
+      oy: 27,
       draw: (ctx, t) => drawFounder(ctx, 0, 0, true, true, t),
     });
     list.push({
       key: 'founder-stand',
       label: 'founder · standing (left)',
       sub: 'moving = false',
-      w: 20,
-      h: 28,
-      ox: 10,
-      oy: 25,
+      w: 22,
+      h: 31,
+      ox: 11,
+      oy: 27,
       draw: (ctx) => drawFounder(ctx, 0, 0, false, false, 0),
     });
     /* ---- end the founder (additive) ---------------------------------------- */

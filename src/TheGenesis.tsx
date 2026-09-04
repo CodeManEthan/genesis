@@ -1830,13 +1830,26 @@ const CSS = `
   border: 1px solid rgba(65, 58, 85, 0.1);
   animation: gen-in 0.45s ease both;
 }
-/* ---- the founder (additive: PLAY only) ---- */
+/* ---- the founder (additive: PLAY only) ------------------------------------
+ * The ledger is what the day is doing; this line is what the day is doing
+ * AROUND YOU. Flush against the stack at the same 4px gap the two read as one
+ * list and the eye takes the top line for the oldest entry, which is backwards.
+ * So: inverted, held off the stack by a gap of its own, and standing on a mint
+ * rule that nothing else in the ticker has. */
 .gen-ticker p.gen-you {
-  background: rgba(65, 58, 85, 0.92);
+  background: rgba(65, 58, 85, 0.93);
   border-color: rgba(253, 248, 239, 0.22);
+  border-left: 3px solid #4fd0a4;
   color: #fdf8ef;
+  margin-bottom: 9px;
+  max-width: 330px;
 }
-.gen-ticker p.gen-you .gen-stamp { color: #7fe0bd; }
+.gen-ticker p.gen-you .gen-stamp {
+  color: #7fe0bd;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+}
 .gen-ticker.gen-hush p.gen-you { opacity: 0.86; }
 /* ---- end the founder (additive) ---- */
 .gen-ticker p[data-age='1'] { opacity: 0.72; }

@@ -3,3 +3,4 @@ node_modules/
 site/dist/
 site/.astro/
 site/node_modules/
+.playwright-cli/

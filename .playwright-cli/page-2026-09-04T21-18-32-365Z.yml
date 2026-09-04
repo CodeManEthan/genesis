@@ -1,8 +1,0 @@
-- generic [active] [ref=f3e1]:
-  - main [ref=f3e2]:
-    - paragraph: WASD or the arrows to walk · space holds the day ·drag to look away
-  - generic [ref=f3e6]:
-    - button [ref=f3e7]
-    - button [ref=f3e13]
-    - button [ref=f3e17]
-    - button [ref=f3e22]

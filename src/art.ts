@@ -2503,14 +2503,19 @@ export function drawFounder(
   ctx.fillRect(px - 2, top - 3, 2, 1);
   ctx.fillRect(px + 1, top - 3, 2, 1);
 
-  /* the coat skirt — flared past the hip, and it swings a pixel on the step */
+  /* the coat skirt — flared past the hip, and it swings a pixel on the step.
+     Three rows, three values: the fold catching the light where it leaves the
+     belt, the cloth, and a dark hem. Flat, it read as a slab of navy bolted to
+     the waist; the hem is what makes it hang. */
   const sway = step > 0.5 ? 1 : step < -0.5 ? -1 : 0;
+  ctx.fillStyle = shade(coat, -0.44);
+  ctx.fillRect(px - 4 + sway, top - 4, 9, 1);
   ctx.fillStyle = dark;
-  ctx.fillRect(px - 4 + sway, top - 5, 9, 2);
+  ctx.fillRect(px - 4 + sway, top - 5, 9, 1);
   ctx.fillStyle = coat;
   ctx.fillRect(px - 3, top - 6, 7, 1);
   // The split up the skirt, on the side turned away from the camera.
-  ctx.fillStyle = dark;
+  ctx.fillStyle = shade(coat, -0.44);
   ctx.fillRect(px + (faceRight ? -4 : 3) + sway, top - 5, 1, 2);
 
   /* the belt */
