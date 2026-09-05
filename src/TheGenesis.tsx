@@ -64,11 +64,16 @@ import {
   MAX_CATCHUP,
   TICK_DT,
   createAvatar,
+  decodePlayLog,
+  encodePlayLog,
   presenceAt,
+  recordInput,
+  replayWalk,
   stepAvatar,
   type AvatarInput,
   type AvatarState,
   type Presence,
+  type WalkEntry,
 } from './play.ts';
 /* ---- end the founder (additive) ----------------------------------------- */
 
@@ -344,10 +349,10 @@ export interface GenesisProps {
    * is the seed-only world it has always been — no avatar, no fixed tick, no
    * key listeners, and the arrows still seek the transport.
    *
-   * The avatar's state is deliberately local to this island for now. A future
-   * input log is what makes a walk part of the world (world = f(seed, log));
-   * until that exists, walking is something you do to the camera and to the
-   * ledger's attention, and nothing you do to the day. */
+   * The walk is written to `?log=` as it happens — every change of held keys
+   * against the tick it landed on — and a page that opens with one replays it
+   * from the doorstep before the first frame. So the link is the save, the
+   * same way `?seed=` and `?t=` are the save for the day itself. */
   avatar?: boolean;
 }
 
@@ -418,6 +423,11 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
   const followRef = useRef(true);
   /** Leftover real time owed to the fixed tick. */
   const accumRef = useRef(0);
+  /** The walk so far: every change of held keys, by tick. `?log=` is this. */
+  const walkRef = useRef<WalkEntry[]>([]);
+  /** Address-bar writes are coalesced: a hand on WASD changes keys several
+   * times a second, and the bar needs the walk, not every keystroke. */
+  const walkTimerRef = useRef(0);
   const [presence, setPresence] = useState<Presence | null>(null);
   const presenceRef = useRef<string>('');
   /* ---- end the founder (additive) ---------------------------------------- */
@@ -453,11 +463,13 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       else q.set('seed', String(nextSeed >>> 0));
       if (nextPace === 1) q.delete('pace');
       else q.set('pace', String(nextPace));
-      // A different valley invalidates any hand-set camera in the URL.
+      // A different valley invalidates any hand-set camera in the URL, and
+      // any walk: the doorstep it started from is not in this valley.
       if (newMap) {
         q.delete('zoom');
         q.delete('cx');
         q.delete('cy');
+        q.delete('log');
       }
       const s = q.toString();
       window.history.replaceState(null, '', `${url.pathname}${s ? `?${s}` : ''}${url.hash}`);
@@ -688,10 +700,42 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       clampCam(cam);
       dirtyRef.current = true;
     };
-    /** Drop the founder where the first house is and put the camera on them. */
-    const placeAvatar = () => {
+    /**
+     * The walk into the address bar. Written on every change of keys and, so
+     * a link copied mid-stride has its end, a few times a second while the
+     * founder is moving; coalesced so the bar sees the walk rather than the
+     * keystrokes. Empty walk, no param.
+     */
+    const syncWalk = () => {
+      if (walkTimerRef.current) return;
+      walkTimerRef.current = window.setTimeout(() => {
+        walkTimerRef.current = 0;
+        const av = avRef.current;
+        if (!av) return;
+        const url = new URL(window.location.href);
+        const s = encodePlayLog({ walk: { log: walkRef.current, end: av.tick } });
+        if (s) url.searchParams.set('log', s);
+        else url.searchParams.delete('log');
+        window.history.replaceState(null, '', url.toString());
+      }, 150);
+    };
+    /**
+     * Drop the founder where the first house is and put the camera on them.
+     * On the page's first world, and only then, a `?log=` in the address bar
+     * is replayed first, so the founder is where the link left them before
+     * the first frame is painted.
+     */
+    const placeAvatar = (fromUrl = false) => {
       if (!avatarOn.current) return;
-      avRef.current = createAvatar(world.map, snapRef.current!);
+      const snap = snapRef.current!;
+      if (fromUrl) {
+        const walk = decodePlayLog(new URLSearchParams(window.location.search).get('log')).walk;
+        walkRef.current = walk.log;
+        avRef.current = replayWalk(world.map, snap, walk.log, walk.end);
+      } else {
+        walkRef.current = [];
+        avRef.current = createAvatar(world.map, snap);
+      }
       accumRef.current = 0;
       presenceRef.current = '';
       setPresence(null);
@@ -726,7 +770,7 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       if (q.has('cy') && isFinite(qy)) camRef.current.cy = qy - vh / camRef.current.zoom / 2;
     }
     clampCam(camRef.current);
-    if (avatarOn.current && !avRef.current) placeAvatar();
+    if (avatarOn.current && !avRef.current) placeAvatar(true);
 
     /* ---- clock ---------------------------------------------------------- */
     let clock = 8;
@@ -1074,14 +1118,21 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       if (avatarOn.current && avRef.current) {
         accumRef.current = Math.min(accumRef.current + dt, TICK_DT * MAX_CATCHUP);
         let stepped = 0;
+        let changed = false;
         while (accumRef.current >= TICK_DT) {
           accumRef.current -= TICK_DT;
+          // The log is written by the tick that consumes the keys, before it
+          // does, so what the link says was held is what the walk used.
+          if (recordInput(walkRef.current, avRef.current.tick + 1, keysRef.current)) changed = true;
           stepAvatar(world.map, snapRef.current!, avRef.current, keysRef.current);
           stepped++;
         }
         if (stepped) {
           if (followRef.current) followCam(avRef.current, stepped * TICK_DT);
           if (avRef.current.moving) dirtyRef.current = true;
+          // A change of keys, or a founder still on the move: the address bar
+          // is owed the walk's end. Standing still owes it nothing.
+          if (changed || (avRef.current.moving && avRef.current.tick % 30 === 0)) syncWalk();
           // The ledger's attention, re-read every frame: standing still while
           // the crew tops the roof out beside you should change the line.
           const p = presenceAt(world.map, snapRef.current!, avRef.current);
@@ -1127,6 +1178,10 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       if (raf) cancelAnimationFrame(raf);
       if (timer) window.clearInterval(timer);
       if (phases) setPerfSink(null);
+      if (walkTimerRef.current) {
+        window.clearTimeout(walkTimerRef.current);
+        walkTimerRef.current = 0;
+      }
     };
   }, [size]);
 

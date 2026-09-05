@@ -464,3 +464,211 @@ export function presenceAt(
 
   return null;
 }
+
+/* -------------------------------- the log -------------------------------- */
+
+/*
+ * The walk, written down.
+ *
+ * `stepAvatar` is a pure function of (map, snapshot, state, held keys), and it
+ * runs on a fixed tick. So the whole of a walk is the sequence of key states
+ * per tick — and since a hand changes what it is holding a few times a second
+ * at most, that sequence is almost entirely runs. The log keeps only the
+ * changes: "from tick N, these keys". Replaying it from the doorstep lands
+ * the founder on the same tile to the last bit, which is what makes a link
+ * the save file.
+ *
+ * What the log is NOT: a record of the world. It says which keys were held at
+ * which tick, and nothing about the hour of the day those ticks fell in. A
+ * walk is replayed against the snapshot the page opens on — the `?t=` in the
+ * same link, or the visitor's own clock — so a wall raised or a bridge decked
+ * between the walk and the reload can put a different edge under the boots.
+ * A held moment (`?t=`) is exact. A live one is honest to within the day's
+ * building. The verbs, when they come, are the part of the log that carries a
+ * world hour, and they belong in the same `?log=` as their own entries.
+ *
+ * Nothing here throws. A log that has been truncated by an address bar,
+ * edited by hand or written by a later version that knows more verbs decodes
+ * to whatever prefix still parses, because a blank valley with no reason is
+ * the worse failure.
+ */
+
+/** The key state as four bits: up, down, left, right. */
+export const MASK_UP = 1;
+export const MASK_DOWN = 2;
+export const MASK_LEFT = 4;
+export const MASK_RIGHT = 8;
+
+export const packInput = (k: AvatarInput): number =>
+  (k.up ? MASK_UP : 0) | (k.down ? MASK_DOWN : 0) | (k.left ? MASK_LEFT : 0) | (k.right ? MASK_RIGHT : 0);
+
+export const unpackInput = (mask: number): AvatarInput => ({
+  up: (mask & MASK_UP) !== 0,
+  down: (mask & MASK_DOWN) !== 0,
+  left: (mask & MASK_LEFT) !== 0,
+  right: (mask & MASK_RIGHT) !== 0,
+});
+
+/** From tick `tick` (inclusive) the held keys are `mask`, until the next entry. */
+export interface WalkEntry {
+  tick: number;
+  mask: number;
+}
+
+/** A walk, in order. Ticks strictly increase; the first is at least 1. */
+export type WalkLog = readonly WalkEntry[];
+
+/**
+ * How many key changes a link may carry. A guard against the address bar,
+ * not a rule of the game: at four characters an entry this is a little under
+ * 4KB of query string, which every browser and every proxy still passes.
+ * Past it the encoder keeps the first WALK_LOG_MAX changes and stops, so the
+ * link still replays — to where the founder was when the log filled.
+ */
+export const WALK_LOG_MAX = 1024;
+
+/**
+ * Note a tick's key state, if it is news. Returns true when an entry went in.
+ *
+ * Called by the island once per tick, BEFORE the step that consumes the keys,
+ * with the tick number that step is about to have. Comparing against the last
+ * entry rather than the last tick is what keeps a held key to one entry.
+ */
+export function recordInput(log: WalkEntry[], tick: number, input: AvatarInput): boolean {
+  const mask = packInput(input);
+  const last = log.length ? log[log.length - 1] : null;
+  if (last ? last.mask === mask : mask === 0) return false;
+  if (last && tick <= last.tick) return false;
+  log.push({ tick, mask });
+  return true;
+}
+
+/**
+ * Walk the founder from the doorstep through a log, for `end` ticks.
+ *
+ * The end is its own number because the last change is not where the walk
+ * stopped: a link copied with a key still held has the founder some way past
+ * its last entry, and only the tick count says how far. Left out, the walk
+ * runs to its last change, which is exact whenever that change was a release.
+ * With an empty log and no end the result is `createAvatar` to the byte.
+ *
+ * Every tick between changes is stepped, not skipped, because a tick is the
+ * unit the collision was resolved in: a wall met on tick 40 of a 90-tick run
+ * is a slide, and integrating the run in one go would be a different walk.
+ */
+export function replayWalk(
+  map: GenesisMap,
+  snap: WorldSnapshot,
+  log: WalkLog,
+  end = log.length ? log[log.length - 1].tick : 0
+): AvatarState {
+  const av = createAvatar(map, snap);
+  let input = NO_INPUT;
+  let i = 0;
+  for (let tick = 1; tick <= end; tick++) {
+    while (i < log.length && log[i].tick <= tick) input = unpackInput(log[i++].mask);
+    stepAvatar(map, snap, av, input);
+  }
+  return av;
+}
+
+/* ---- codec --------------------------------------------------------------- *
+ * `?log=` holds entries joined by `*`, each a one-letter code and a payload in
+ * the characters `application/x-www-form-urlencoded` leaves alone, so a link
+ * copied out of the address bar by hand is the link. The walk is ONE entry,
+ * code `w`, and its payload is the changes run together: the tick as a gap
+ * from the previous change in base 36, then the mask as a letter A..P.
+ *
+ *   w1I2kA      tick 1: right (I = 8); 92 ticks later: nothing held (A = 0)
+ *   w1I.2k      tick 1: right, and still held 92 ticks on, where the walk ends
+ *
+ * The `.gap` tail is the end tick as a gap from the last change, written only
+ * when the walk ran past its last change — a release is its own end.
+ *
+ * Verbs get their own codes and their own payloads beside it. An entry whose
+ * code this version does not know is skipped, not fatal.
+ * -------------------------------------------------------------------------- */
+
+const WALK_CODE = 'w';
+const MASK_CHARS = 'ABCDEFGHIJKLMNOP';
+
+/** The walk, decoded: its changes and the tick it ran to. */
+export interface Walk {
+  log: WalkEntry[];
+  end: number;
+}
+
+/**
+ * The walk alone, packed. Empty for an empty walk. Only the first
+ * WALK_LOG_MAX changes go in, and a walk cut short that way ends at its last
+ * kept change rather than pretending to a tail it cannot replay.
+ */
+export function encodeWalk(log: WalkLog, end = log.length ? log[log.length - 1].tick : 0): string {
+  let out = '';
+  let prev = 0;
+  const n = Math.min(log.length, WALK_LOG_MAX);
+  for (let i = 0; i < n; i++) {
+    const e = log[i];
+    const gap = e.tick - prev;
+    if (!(gap >= 1) || e.mask < 0 || e.mask > 15) break;
+    out += gap.toString(36) + MASK_CHARS[e.mask];
+    prev = e.tick;
+  }
+  if (n === log.length && end > prev) out += '.' + (end - prev).toString(36);
+  return out;
+}
+
+/** The walk back out of its payload: whatever prefix parses, never a throw. */
+export function decodeWalk(s: string | null | undefined): Walk {
+  const log: WalkEntry[] = [];
+  if (!s) return { log, end: 0 };
+  const rx = /([0-9a-z]+)([A-P])/y;
+  let tick = 0;
+  // A sticky regex forgets where it was the moment it fails to match, so the
+  // position is kept by hand for the tail to pick up from.
+  let pos = 0;
+  let m: RegExpExecArray | null;
+  while (log.length < WALK_LOG_MAX && ((rx.lastIndex = pos), (m = rx.exec(s)))) {
+    const gap = parseInt(m[1], 36);
+    if (!(gap >= 1)) break;
+    tick += gap;
+    log.push({ tick, mask: MASK_CHARS.indexOf(m[2]) });
+    pos = rx.lastIndex;
+  }
+  let end = tick;
+  const tail = /\.([0-9a-z]+)/y;
+  tail.lastIndex = pos;
+  const t = log.length < WALK_LOG_MAX ? tail.exec(s) : null;
+  if (t) {
+    const gap = parseInt(t[1], 36);
+    if (gap >= 1) end += gap;
+  }
+  return { log, end };
+}
+
+/** What a day of play is, as far as the link knows. One kind of entry so far. */
+export interface PlayLog {
+  walk: Walk;
+}
+
+/** `?log=`. Empty string when there is nothing to say, so the param can go. */
+export function encodePlayLog(log: PlayLog): string {
+  const parts: string[] = [];
+  const walk = encodeWalk(log.walk.log, log.walk.end);
+  if (walk) parts.push(WALK_CODE + walk);
+  return parts.join('*');
+}
+
+export function decodePlayLog(s: string | null | undefined): PlayLog {
+  const log: PlayLog = { walk: { log: [], end: 0 } };
+  if (!s) return log;
+  let seen = false;
+  for (const part of s.split('*')) {
+    if (part[0] === WALK_CODE && !seen) {
+      log.walk = decodeWalk(part.slice(1));
+      seen = true;
+    }
+    // Any other code is a later version's business, or a stranger's.
+  }
+  return log;
+}

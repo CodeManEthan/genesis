@@ -30,7 +30,7 @@
     "dev": "tsup --watch",
     "prepare": "tsup",
     "typecheck": "tsc --noEmit",
-    "check": "node scripts/stats.mjs && node scripts/timeline-stats.mjs",
+    "check": "node scripts/stats.mjs && node scripts/timeline-stats.mjs && node scripts/play-stats.mjs",
     "sweep": "node scripts/stats.mjs --sweep 200"
   },
   "peerDependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" },

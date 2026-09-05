@@ -68,9 +68,20 @@ The contract `ab.mjs` and `perf.mjs` drive, on any page mounting `TheGenesis`:
 | `?autoplay=1` | Start running rather than paused |
 | `?zoom=` | Camera magnification |
 | `?perf=` | Show the perf overlay |
+| `?log=` | A played day: the founder's walk, replayed from the doorstep on load (only on a page mounting `TheGenesis` with `avatar`) |
 
 `?seed` plus `?t` plus no autoplay is a paused, reproducible frame, which is
 what the pixel A/B capture depends on.
+
+`?log=` is the save file for a played day: `world = f(seed, log)`. It holds
+entries joined by `*`, each a one-letter code and a payload. The walk is the
+entry `w`, and its payload is every change of held keys against the tick it
+landed on (`1I2kA`: from tick 1 hold right, 92 ticks later hold nothing),
+plus an optional `.gap` tail marking where the walk ended. The walk is
+replayed against the snapshot the page opens on, so with `?t=` it is exact and
+on a live page it is honest to within the day's building. A truncated or
+hand-edited log decodes to whatever prefix parses; it never throws. Entries
+with a code the engine does not know are skipped, which is where the verbs go.
 
 ## Host page contract
 
@@ -93,7 +104,7 @@ from outside, so don't rename them.
 There is no separate test runner. The harnesses are the test suite.
 
 ```sh
-npm run check    # map and timeline generation: reports, invariants, fixtures
+npm run check    # map, timeline and play harness: reports, invariants, fixtures, the walk
 npm run sweep    # invariants only, across 200 seeds
 npm run typecheck
 npm run build    # tsup: ESM + declarations into dist/

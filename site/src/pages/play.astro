@@ -6,9 +6,9 @@
  * prop: `avatar`. The homepage never sets it, so `/` is still the seed-only
  * world it has always been — same bytes, same paused frame, same everything.
  *
- * The founder's position is local to the island for now. The agreed direction
- * is world = f(seed, input log), and until that log exists a walk changes the
- * camera and the ledger's attention and nothing else about the day.
+ * The walk is the first entry in the input log: every change of held keys,
+ * by tick, written to `?log=` as it happens and replayed from the doorstep
+ * when a page opens with one. world = f(seed, log); the link is the save.
  */
 import TheGenesis from '@codemanethan/genesis/TheGenesis';
 ---
