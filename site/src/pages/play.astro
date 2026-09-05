@@ -6,9 +6,11 @@
  * prop: `avatar`. The homepage never sets it, so `/` is still the seed-only
  * world it has always been — same bytes, same paused frame, same everything.
  *
- * The walk is the first entry in the input log: every change of held keys,
- * by tick, written to `?log=` as it happens and replayed from the doorstep
- * when a page opens with one. world = f(seed, log); the link is the save.
+ * The input log is `?log=`: the walk (every change of held keys, by tick,
+ * replayed from the doorstep when a page opens with one) and the verbs (one
+ * entry per act, at the world hour it landed). world = f(seed, log); the
+ * link is the save. One verb so far — F fells the tree in reach — and the
+ * day is rebuilt from the log every time, never patched.
  */
 import TheGenesis from '@codemanethan/genesis/TheGenesis';
 ---
@@ -28,8 +30,8 @@ import TheGenesis from '@codemanethan/genesis/TheGenesis';
         <TheGenesis client:only="react" avatar={true} />
       </div>
       <p class="keys" aria-hidden="true">
-        <b>WASD</b> or the <b>arrows</b> to walk · <b>space</b> holds the day ·
-        <b>drag</b> to look away
+        <b>WASD</b> or the <b>arrows</b> to walk · <b>F</b> takes the offer ·
+        <b>space</b> holds the day · <b>drag</b> to look away
       </p>
       <noscript>
         <p class="noscript">

@@ -606,6 +606,41 @@ export interface Timeline {
   events: GenesisEvent[];
 }
 
+/* ---- the input log (additive) -------------------------------------------- *
+ * The player, expressed the only way this engine can hold one: as data the
+ * generator reads, never as state the generator keeps.
+ *
+ * The contract is `world = f(seed, input log)`. A day with no log is the day
+ * the seed alone describes, byte for byte, which is what keeps the homepage
+ * and every archived day on `/days` exactly as they were. A day WITH a log is
+ * still a pure function — of one more argument — so it survives a reload, a
+ * scrub in either direction and a link sent to somebody else, none of which a
+ * mutable world would.
+ *
+ * One verb so far. `kind` is a union rather than a string so that adding
+ * `plant`, `dig` or `wall` is a compile error everywhere it has to be handled
+ * rather than a silent no-op in the solver.
+ * -------------------------------------------------------------------------- */
+
+/** What a player can do to the valley. One verb today; the union is the seam. */
+export type PlayerVerb = 'fell';
+
+/** One thing the player did, and the hour of the world they did it in. */
+export interface PlayerInput {
+  /** World hour, 0 <= t < 24 — the same clock the events use. */
+  t: number;
+  kind: PlayerVerb;
+  /** What it was done to. For `fell`, a `TreeSpec.id`. */
+  target: string;
+}
+
+/** A day's play, in order. Read-only: the log is appended to, never edited.
+ * The URL codec lives with the walk in play.ts (`encodePlayLog`): one `?log=`
+ * carries both, and this leaf file only has to know what an input IS. */
+export type InputLog = readonly PlayerInput[];
+
+/* ---- end the input log (additive) ---------------------------------------- */
+
 /* ----------------------------- derived state ----------------------------- */
 
 export type TreeState = 'standing' | 'felling' | 'stump';

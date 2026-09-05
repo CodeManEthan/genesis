@@ -27,8 +27,11 @@ import {
   isoY,
   type BuildingSpec,
   type GenesisMap,
+  type PlayerInput,
   type SiteSpec,
   type StoneSpec,
+  type TreeKind,
+  type TreeSpec,
   type Vec2,
   type WorldSnapshot,
 } from './types.ts';
@@ -319,6 +322,10 @@ export interface AvatarState {
    * after a while. Zero the moment a step is taken. Tick-derived, so a replay
    * stands exactly as long as the walk did. */
   still: number;
+  /** Ticks left of the axe swing, 0 when not swinging. While it runs the keys
+   * are ignored, and the island records that as no keys held, so the walk log
+   * stays the truth about where the boots went. */
+  act: number;
   /** Ticks since the avatar was made — the index a future input log keys on. */
   tick: number;
   /** Last heading in screen-aligned u/v, for the camera's lead. */
@@ -348,6 +355,7 @@ export function createAvatar(map: GenesisMap, snap: WorldSnapshot): AvatarState 
     phase: 0,
     moving: false,
     still: 0,
+    act: 0,
     tick: 0,
     lu: 0,
     lv: 1,
@@ -374,6 +382,13 @@ export function stepAvatar(
   input: AvatarInput
 ): void {
   av.tick++;
+  if (av.act > 0) {
+    // Mid-swing: the founder is busy, and the keys can wait.
+    av.act--;
+    av.moving = false;
+    av.footing = footingAt(map, snap, av.gx, av.gy);
+    return;
+  }
   let u = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   let v = (input.down ? 1 : 0) - (input.up ? 1 : 0);
   if (u === 0 && v === 0) {
@@ -783,9 +798,39 @@ export function decodeWalk(s: string | null | undefined): Walk {
   return { log, end };
 }
 
-/** What a day of play is, as far as the link knows. One kind of entry so far. */
+/* ---- the verbs ----------------------------------------------------------- *
+ * A verb is one entry per act: its code, the world hour it landed at to two
+ * places, a dash, and the id of what it was done to — `f9.50-tr412`. The
+ * hour is the world's clock and not a tick, because that is the clock the
+ * day's solver reads (see `applyInputs` in timeline.ts); the walk is the only
+ * part of the log that is in ticks.
+ * -------------------------------------------------------------------------- */
+
+/** How many verbs a link may carry. A guard, not a game rule. */
+export const INPUT_LOG_MAX = 64;
+
+const VERB_CODE: Record<PlayerInput['kind'], string> = { fell: 'f' };
+const CODE_VERB: Record<string, PlayerInput['kind']> = { f: 'fell' };
+
+function encodeInput(e: PlayerInput): string | null {
+  const code = VERB_CODE[e.kind];
+  if (!code || !/^[A-Za-z0-9_.]+$/.test(e.target)) return null;
+  return `${code}${e.t.toFixed(2)}-${e.target}`;
+}
+
+function decodeInput(part: string): PlayerInput | null {
+  const m = /^([a-z])(\d+(?:\.\d+)?)-([A-Za-z0-9_.]+)$/.exec(part);
+  if (!m) return null;
+  const kind = CODE_VERB[m[1]];
+  const t = Number(m[2]);
+  if (!kind || !isFinite(t) || t < 0 || t >= 24) return null;
+  return { t, kind, target: m[3] };
+}
+
+/** What a day of play is, as far as the link knows: the walk, and the verbs. */
 export interface PlayLog {
   walk: Walk;
+  inputs: PlayerInput[];
 }
 
 /** `?log=`. Empty string when there is nothing to say, so the param can go. */
@@ -793,19 +838,96 @@ export function encodePlayLog(log: PlayLog): string {
   const parts: string[] = [];
   const walk = encodeWalk(log.walk.log, log.walk.end);
   if (walk) parts.push(WALK_CODE + walk);
+  for (const e of log.inputs.slice(0, INPUT_LOG_MAX)) {
+    const s = encodeInput(e);
+    if (s) parts.push(s);
+  }
   return parts.join('*');
 }
 
 export function decodePlayLog(s: string | null | undefined): PlayLog {
-  const log: PlayLog = { walk: { log: [], end: 0 } };
+  const log: PlayLog = { walk: { log: [], end: 0 }, inputs: [] };
   if (!s) return log;
   let seen = false;
   for (const part of s.split('*')) {
-    if (part[0] === WALK_CODE && !seen) {
-      log.walk = decodeWalk(part.slice(1));
-      seen = true;
+    if (part[0] === WALK_CODE) {
+      if (!seen) {
+        log.walk = decodeWalk(part.slice(1));
+        seen = true;
+      }
+      continue;
     }
-    // Any other code is a later version's business, or a stranger's.
+    const inp = decodeInput(part);
+    if (inp && log.inputs.length < INPUT_LOG_MAX) log.inputs.push(inp);
+    // Anything else is a later version's business, or a stranger's.
   }
   return log;
+}
+
+/* -------------------------------- the offer ------------------------------- */
+
+/*
+ * What the founder could do from where they stand.
+ *
+ * One verb so far: fell a standing tree within reach. The offer is a pure
+ * function of the map, the snapshot and the founder's tile — it is recomputed
+ * every tick and never stored, so there is nothing to get out of step with
+ * the world. Whether to take it is the player's, and taking it is a swing
+ * (`SWING_TICKS` of `AvatarState.act`) and then one `PlayerInput` at the hour
+ * on the clock, which the island appends and the day is rebuilt from.
+ *
+ * Reach is a few tiles, the same order as the presence lines above, so an
+ * offer and the line about the ground agree on what "here" means.
+ */
+
+/** Tiles from the boots to the trunk within which the axe is offered. */
+export const REACH = 1.8;
+/** How long the swing takes, in ticks. Under a second; it is one tree. */
+export const SWING_TICKS = 48;
+
+export interface Offer {
+  kind: 'fell';
+  /** `TreeSpec.id`. */
+  target: string;
+  /** Where it stands, tile space, for the mark on the ground. */
+  gx: number;
+  gy: number;
+  /** The key that takes it. */
+  key: string;
+  /** The offer in the ledger's voice: the verb, the noun, and what it costs. */
+  text: string;
+}
+
+const TREE_WORD: Record<TreeKind, string> = {
+  oak: 'oak',
+  pine: 'pine',
+  blossom: 'blossom tree',
+  hedgerow: 'thorn',
+  birch: 'birch',
+  willow: 'willow',
+  fir: 'fir',
+};
+
+/** The nearest standing tree in reach, or null. */
+export function offerAt(map: GenesisMap, snap: WorldSnapshot, av: AvatarState): Offer | null {
+  let best: TreeSpec | null = null;
+  let bd = REACH;
+  for (const tr of map.trees) {
+    if (snap.trees.get(tr.id)) continue; // felling, or a stump
+    const d = Math.hypot(tr.gx - av.gx, tr.gy - av.gy);
+    if (d < bd) {
+      bd = d;
+      best = tr;
+    }
+  }
+  if (!best) return null;
+  const word = TREE_WORD[best.kind] ?? 'tree';
+  return {
+    kind: 'fell',
+    target: best.id,
+    gx: best.gx,
+    gy: best.gy,
+    key: 'F',
+    text: `Fell the ${word}. An axe, ten minutes of the day, and a stump nobody ordered.`,
+  };
 }

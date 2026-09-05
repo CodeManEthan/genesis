@@ -77,11 +77,15 @@ what the pixel A/B capture depends on.
 entries joined by `*`, each a one-letter code and a payload. The walk is the
 entry `w`, and its payload is every change of held keys against the tick it
 landed on (`1I2kA`: from tick 1 hold right, 92 ticks later hold nothing),
-plus an optional `.gap` tail marking where the walk ended. The walk is
-replayed against the snapshot the page opens on, so with `?t=` it is exact and
-on a live page it is honest to within the day's building. A truncated or
-hand-edited log decodes to whatever prefix parses; it never throws. Entries
-with a code the engine does not know are skipped, which is where the verbs go.
+plus an optional `.gap` tail marking where the walk ended. A verb is one entry
+per act: the code, the world hour to two places, a dash and the target's id
+(`f9.50-tr412` fells that tree at half past nine). Verbs are folded into the
+day by `buildTimeline(map, pace, inputs)` as a post-pass over the finished
+event list, so a day with no verbs is the same array down the same code path.
+The walk is replayed against the snapshot the page opens on, so with `?t=` it
+is exact and on a live page it is honest to within the day's building. A
+truncated or hand-edited log decodes to whatever prefix parses; it never
+throws. Entries with a code the engine does not know are skipped.
 
 ## Host page contract
 

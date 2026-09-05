@@ -39,6 +39,7 @@ import {
   drawFishJump,
   /* ---- the founder (additive: PLAY only) ---- */
   drawFounder,
+  drawOfferMark,
   /* ---- end the founder (additive) ---- */
   drawRipple,
   drawWheel,
@@ -1003,7 +1004,7 @@ const COVERAGE: { head: string; body: string }[] = [
   {
     head: 'The founder is the only sprite no generator emits',
     body:
-      'drawFounder is the player, and the player only exists on /play, where TheGenesis is mounted with avatar. No GenesisMap, timeline or ambient crowd ever produces one, so nothing on the homepage or in the archive can draw it and no seeded frame changes because it exists. It is separated from a villager by silhouette rather than by colour — 21px against 17, a coat skirt that flares past the belt and swings on the step, an 11px hat brim, and a satchel that swaps hips with the turn — because at the fitted overview colour is the first thing to go. Standing, it is not the walk with the phase frozen: the torso lifts a pixel on a slow breath while the boots stay planted, and after two and a half seconds the weight goes onto one hip, the rear boot steps out and the near hand drops to the belt — all keyed on seconds stood still, which is tick-derived, so a replayed founder breathes on the same frames. What it has no art for yet: any pose for a verb, which is the next slice.',
+      'drawFounder is the player, and the player only exists on /play, where TheGenesis is mounted with avatar. No GenesisMap, timeline or ambient crowd ever produces one, so nothing on the homepage or in the archive can draw it and no seeded frame changes because it exists. It is separated from a villager by silhouette rather than by colour — 21px against 17, a coat skirt that flares past the belt and swings on the step, an 11px hat brim, and a satchel that swaps hips with the turn — because at the fitted overview colour is the first thing to go. Standing, it is not the walk with the phase frozen: the torso lifts a pixel on a slow breath while the boots stay planted, and after two and a half seconds the weight goes onto one hip, the rear boot steps out and the near hand drops to the belt — all keyed on seconds stood still, which is tick-derived, so a replayed founder breathes on the same frames. The first verb has its pose: two frames of axe, raised over the far shoulder and then down into the trunk, with the head drawn last so it crosses the coat. drawOfferMark is the offer surface — a faint dashed diamond of reach under the boots, and a cream-cased solid one with a stake beside whatever is on offer — cased because a thin mint line on its own vanishes into the wood.',
   },
   /* ---- end the founder (additive) ---- */
   {
@@ -1567,6 +1568,46 @@ export default function Catalog() {
       ox: 11,
       oy: 27,
       draw: (ctx) => drawFounder(ctx, 0, 0, true, false, 0, 3),
+    });
+    list.push({
+      key: 'founder-swing',
+      label: 'founder · the swing',
+      sub: 'act = 48 → 0: the axe up, then into the trunk',
+      w: 30,
+      h: 34,
+      ox: 13,
+      oy: 30,
+      draw: (ctx, t) => drawFounder(ctx, 0, 0, true, false, 0, 0, 48 - (Math.floor(t * 60) % 48)),
+    });
+    list.push({
+      key: 'founder-struck',
+      label: 'founder · struck (left)',
+      sub: 'act = 8: the last third of the swing',
+      w: 30,
+      h: 34,
+      ox: 17,
+      oy: 30,
+      draw: (ctx) => drawFounder(ctx, 0, 0, false, false, 0, 0, 8),
+    });
+    list.push({
+      key: 'offer-target',
+      label: 'offer · the stake',
+      sub: 'drawOfferMark target — on the tile of the thing on offer',
+      w: 40,
+      h: 30,
+      ox: 20,
+      oy: 20,
+      draw: (ctx) => drawOfferMark(ctx, 0, 0, 18, 9, 'target'),
+    });
+    list.push({
+      key: 'offer-reach',
+      label: 'offer · the reach',
+      sub: 'drawOfferMark reach — dashed and faint, under the boots',
+      w: 60,
+      h: 34,
+      ox: 30,
+      oy: 17,
+      draw: (ctx) => drawOfferMark(ctx, 0, 0, 28, 14, 'reach'),
     });
     /* ---- end the founder (additive) ---------------------------------------- */
     list.push({
@@ -2232,7 +2273,7 @@ export default function Catalog() {
           {/* ---- living details (additive) ---- */}
           <Row
             title={`After the axe (${treeAfter.length})`}
-            note="The trunk lies beside its stump for 90 world-minutes and is then hauled off to the yards — one log per tree kind, because the bark is all that tells them apart at this size. The stump itself outlasts the log only off the roads: a tree a ROAD claimed is grubbed out the moment the paving reaches its own point along that road, so a finished lane ends the day clear instead of carrying a line of stumps drawn over its surface. A plot's stump is nobody's paving job and stands all day. Three to five saplings come up on the day's cleared ground after 18:00, each beside a stump the day actually made — a stride or two off it and so on the verge, never on the paving, which is why the grubbing does not take the regrowth with it."
+            note="The trunk lies beside its stump for 90 world-minutes and is then hauled off to the yards — one log per tree kind, because the bark is all that tells them apart at this size. The stump itself outlasts the log only off the roads: a tree a ROAD claimed is grubbed out the moment the paving reaches its own point along that road, so a finished lane ends the day clear instead of carrying a line of stumps drawn over its surface. A plot's stump is nobody's paving job and stands all day. Three to five saplings come up on the day's cleared ground after 18:00, each beside a stump the day actually made — a stride or two off it and so on the verge, never on the paving, which is why the grubbing does not take the regrowth with it. No new art on /play: a tree the FOUNDER fells (`?log=`) borrows this whole ladder — the same lean, the same stump, the same log lying beside it — and the only thing that marks it out is that it stands where the seed had no crew going. It gets no sapling: regrowth is anchored to the lanes the day cut, and a founder's tree was on nobody's route."
             items={treeAfter}
           />
           {/* ---- end living details (additive) ---- */}

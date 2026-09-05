@@ -21,8 +21,15 @@ const gdir = join(root, 'src');
 
 const { hashSeed } = await import(join(gdir, 'types.ts'));
 const { generateMap } = await import(join(gdir, 'gen.ts'));
-const { buildTimeline, snapshotAt } = await import(join(gdir, 'timeline.ts'));
+const { advance, buildTimeline, emptySnapshot, playedFells, snapshotAt } = await import(
+  join(gdir, 'timeline.ts')
+);
+const { doomedTrees, pileReach, pileStage } = await import(join(gdir, 'living.ts'));
 const {
+  INPUT_LOG_MAX,
+  REACH,
+  SWING_TICKS,
+  offerAt,
   AVATAR_ROAD_SPEED,
   AVATAR_SPEED,
   MASK_DOWN,
@@ -137,7 +144,7 @@ for (const [label, seed] of SEEDS) {
   if (live.log.length !== changes) fails.push(`log has ${live.log.length} entries, expected ${changes}`);
 
   // Through the link and back.
-  const url = encodePlayLog({ walk: { log: live.log, end: live.av.tick } });
+  const url = encodePlayLog({ walk: { log: live.log, end: live.av.tick }, inputs: [] });
   if (!/^[0-9A-Za-z*.]*$/.test(url)) fails.push(`encoded log is not address-bar safe: ${url}`);
   const back = decodePlayLog(url);
   if (JSON.stringify(back.walk.log) !== JSON.stringify(live.log)) fails.push('log did not survive the codec');
@@ -339,6 +346,198 @@ function axisAt(map, gx, gy) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* the first verb — world = f(seed, log)                                      */
+/* -------------------------------------------------------------------------- */
+/**
+ * Each case fells a WILD tree — one on nobody's list, which no seeded day
+ * would ever take — and asks what matters: is the seed-only day untouched, is
+ * the tree a stump from the founder's minute on, did the ledger say so once,
+ * and is the played day still a pure function of its two arguments. Ported
+ * from the seam branch's harness onto the generated valleys.
+ */
+const hhmm = (t) => {
+  const h = Math.floor(t);
+  const m = Math.round((t - h) * 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+};
+function serialize(snap) {
+  const m = (x) => [...x.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  const s = (x) => [...x].sort();
+  return JSON.stringify({
+    t: snap.t,
+    trees: m(snap.trees),
+    felled: m(snap.felled ?? new Map()),
+    buildings: m(snap.buildings),
+    roads: m(snap.roads),
+    bridges: m(snap.bridges),
+    fords: s(snap.fords ?? []),
+    props: s(snap.props),
+    chests: m(snap.chests),
+    founded: s(snap.founded),
+    population: m(snap.population),
+    log: snap.log,
+  });
+}
+/** Every tree the map has already promised to an axe. */
+const promised = (map) => {
+  const out = new Set();
+  for (const s of map.sites) for (const b of s.buildings) for (const id of b.clears) out.add(id);
+  for (const r of map.roads) for (const c of r.clears ?? []) out.add(c.tree);
+  return out;
+};
+const wildTree = (map) => {
+  const d = promised(map);
+  return map.trees.find((t) => !d.has(t.id)) ?? null;
+};
+const treeState = (snap, id) => snap.trees.get(id) ?? 'standing';
+
+console.log('play — the first verb');
+for (const [label, seed] of [...SEEDS, ['1', 1]]) {
+  const map = generateMap(seed);
+  const fails = [];
+  const bad = (m) => fails.push(m);
+  const base = buildTimeline(map);
+  const T = 9.0;
+  const CHOP = 10 / 60;
+
+  /* (p0) no log at all is the day the baseline describes */
+  if (JSON.stringify(buildTimeline(map, 1, []).events) !== JSON.stringify(base.events))
+    bad('(p0) an EMPTY log changed the day');
+  if (buildTimeline(map, 1, undefined).events.length !== base.events.length)
+    bad('(p0) an undefined log changed the day');
+
+  const tree = wildTree(map);
+  if (!tree) {
+    console.log(`  skip seed ${label} — every tree is already promised`);
+    continue;
+  }
+  const log = [{ t: T, kind: 'fell', target: tree.id }];
+  const tl = buildTimeline(map, 1, log);
+  const ev = tl.events;
+
+  /* (p1) pure */
+  if (JSON.stringify(buildTimeline(map, 1, log).events) !== JSON.stringify(ev))
+    bad('(p1) the same log built two different days');
+
+  /* (p2) the verb survives the link, beside a walk */
+  const url = encodePlayLog({ walk: { log: [{ tick: 1, mask: 8 }], end: 30 }, inputs: log });
+  const back = decodePlayLog(url);
+  if (JSON.stringify(back.inputs) !== JSON.stringify(log)) bad(`(p2) ?log=${url} lost the verb`);
+  if (back.walk.end !== 30 || back.walk.log.length !== 1) bad(`(p2) ?log=${url} lost the walk`);
+  if (JSON.stringify(buildTimeline(map, 1, back.inputs).events) !== JSON.stringify(ev))
+    bad('(p2) the decoded verb does not reproduce the day');
+
+  /* (p3) sorted, paired, on the click */
+  for (let i = 1; i < ev.length; i++) if (ev[i - 1].t > ev[i].t + 1e-12) bad(`(p3) not sorted at ${i}`);
+  const starts = ev.filter((e) => e.type === 'chop-start' && e.treeId === tree.id);
+  const dones = ev.filter((e) => e.type === 'chop-done' && e.treeId === tree.id);
+  if (starts.length !== 1 || dones.length !== 1) bad(`(p3) ${starts.length} starts / ${dones.length} dones`);
+  else {
+    if (Math.abs(dones[0].t - T) > 1e-9) bad(`(p3) down at ${hhmm(dones[0].t)}, not ${hhmm(T)}`);
+    if (Math.abs(starts[0].t - (T - CHOP)) > 1e-9) bad('(p3) the axe work does not end on the click');
+  }
+
+  /* (p4) the seed's day is INSIDE the played day */
+  const seedJSON = new Set(base.events.map((e) => JSON.stringify(e)));
+  const added = ev.map((e) => JSON.stringify(e)).filter((e) => !seedJSON.has(e));
+  if (added.length !== 3) bad(`(p4) one fell added ${added.length} events, expected 3`);
+  const playSet = new Set(ev.map((e) => JSON.stringify(e)));
+  const lost = [...seedJSON].filter((e) => !playSet.has(e));
+  if (lost.length) bad(`(p4) the fell removed ${lost.length} of the seed's events`);
+
+  /* (p5) a stump from that minute on */
+  if (treeState(snapshotAt(map, tl, T - CHOP - 0.01), tree.id) !== 'standing') bad('(p5) down before the axe');
+  if (treeState(snapshotAt(map, tl, T - CHOP / 2), tree.id) !== 'felling') bad('(p5) not going over mid-chop');
+  const after = snapshotAt(map, tl, T + 0.01);
+  if (treeState(after, tree.id) !== 'stump') bad('(p5) not a stump after the click');
+  if (treeState(snapshotAt(map, tl, 21), tree.id) !== 'stump') bad('(p5) the stump did not last the day');
+  if (treeState(snapshotAt(map, base, 23.9), tree.id) !== 'standing') bad('(p5) the seed felled it by itself');
+
+  /* (p6) the ledger said so, once, at the hour */
+  const seedLog = snapshotAt(map, base, T + 0.01).log.map((l) => `${l.t}|${l.text}`);
+  const newLines = after.log.map((l) => `${l.t}|${l.text}`).filter((l) => !seedLog.includes(l));
+  if (newLines.length !== 1) bad(`(p6) the ledger wrote ${newLines.length} lines about one tree`);
+  else if (Math.abs(Number(newLines[0].split('|')[0]) - T) > 1e-9) bad('(p6) the line is not at the hour');
+
+  /* (p7) scrubbed == walked on the played day */
+  const walk = emptySnapshot(map);
+  for (let t = 0; t <= 24.0001; t += 1) {
+    const now = Math.min(t, 24);
+    advance(walk, tl, now);
+    if (serialize(snapshotAt(map, tl, now)) !== serialize(walk)) bad(`(p7) ${hhmm(now)}: scrubbed != walked`);
+  }
+
+  /* (p8) the yards count the founder's wood, and never shrink */
+  const doomed = doomedTrees(map, playedFells(map, log));
+  if (!doomed.has(tree.id)) bad('(p8) doomedTrees ignored the log');
+  const reachById = pileReach(map, doomed);
+  const prev = new Map();
+  for (let t = 0; t <= 24.0001; t += 1) {
+    const snap = snapshotAt(map, tl, Math.min(t, 24));
+    for (const [id, reach] of reachById) {
+      const st = pileStage(reach, snap.felled);
+      if (st < (prev.get(id) ?? 0)) bad(`(p8) yard ${id} shrank at ${hhmm(t)}`);
+      prev.set(id, st);
+    }
+  }
+
+  /* (p9) the day beat them to it, or they beat the day */
+  const race = base.events.find((x) => x.type === 'chop-done' && x.t > 1 && promised(map).has(x.treeId));
+  if (race) {
+    const late = buildTimeline(map, 1, [{ t: race.t + 1, kind: 'fell', target: race.treeId }]);
+    if (JSON.stringify(late.events) !== JSON.stringify(base.events)) bad('(p9) felling a stump changed the day');
+    const mine = Math.max(0.2, race.t - 1);
+    const early = buildTimeline(map, 1, [{ t: mine, kind: 'fell', target: race.treeId }]);
+    const chops = early.events.filter((e) => (e.type === 'chop-start' || e.type === 'chop-done') && e.treeId === race.treeId);
+    if (chops.length !== 2) bad(`(p9) the crew still swung at a stump: ${chops.length} chop events`);
+    if (treeState(snapshotAt(map, early, (mine + race.t) / 2), race.treeId) !== 'stump') bad('(p9) not down between the axe and the crew');
+  }
+
+  /* (p10) a stranger's target is dropped, not thrown */
+  if (JSON.stringify(buildTimeline(map, 1, [{ t: 9, kind: 'fell', target: 'trNotHere' }]).events) !== JSON.stringify(base.events))
+    bad('(p10) an unknown target changed the day');
+
+  /* (p11) the offer: standing beside the tree offers it; felled, it is not offered */
+  const snapBefore = snapshotAt(map, base, T);
+  const av = createAvatar(map, snapBefore);
+  av.gx = tree.gx + 0.6;
+  av.gy = tree.gy + 0.4;
+  const o = offerAt(map, snapBefore, av);
+  if (!o) bad('(p11) no offer beside a standing tree');
+  else if (o.kind !== 'fell' || o.key !== 'F') bad(`(p11) offer is ${o.kind} on ${o.key}`);
+  const nearest = map.trees
+    .filter((x) => !snapBefore.trees.get(x.id))
+    .map((x) => [Math.hypot(x.gx - av.gx, x.gy - av.gy), x.id])
+    .sort((a, b) => a[0] - b[0])[0];
+  if (o && nearest && nearest[0] < REACH && o.target !== nearest[1]) bad(`(p11) offered ${o.target}, nearest is ${nearest[1]}`);
+  const oAfter = offerAt(map, after, av);
+  if (oAfter && oAfter.target === tree.id) bad('(p11) a stump is still on offer');
+  // Out of reach of everything: nothing offered.
+  av.gx = -1e6;
+  av.gy = -1e6;
+  if (offerAt(map, snapBefore, av)) bad('(p11) an offer with nothing in reach');
+
+  /* (p12) the swing holds the founder: keys held mid-swing move nothing, and the log says nothing was held */
+  const sw = createAvatar(map, snapBefore);
+  sw.act = SWING_TICKS;
+  const g0 = [sw.gx, sw.gy];
+  const swLog = [];
+  for (let k = 0; k < SWING_TICKS; k++) {
+    const keys = sw.act > 0 ? NO_INPUT : unpackInput(MASK_RIGHT);
+    recordInput(swLog, sw.tick + 1, keys);
+    stepAvatar(map, snapBefore, sw, keys);
+  }
+  if (sw.gx !== g0[0] || sw.gy !== g0[1]) bad('(p12) the founder walked mid-swing');
+  if (sw.act !== 0) bad(`(p12) act is ${sw.act} after SWING_TICKS ticks`);
+  if (swLog.length) bad('(p12) the swing wrote to the walk log');
+
+  const oText = o ? o.text : '';
+  console.log(`  seed ${label}: felled ${tree.id} (${tree.kind}) at ${hhmm(T)} · ?log=${encodePlayLog({ walk: { log: [], end: 0 }, inputs: log })} · offer: ${oText}`);
+  console.log(`    ledger: ${newLines.length ? newLines[0].split('|')[1] : '—'}`);
+  check(`seed ${label}: the first verb is honest`, fails);
+}
+
+/* -------------------------------------------------------------------------- */
 /* the codec's edges                                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -353,7 +552,7 @@ function axisAt(map, gx, gy) {
 
   const none = { log: [], end: 0 };
   eq(encodeWalk([]), '', 'empty walk encodes empty');
-  eq(encodePlayLog({ walk: none }), '', 'empty log encodes empty');
+  eq(encodePlayLog({ walk: none, inputs: [] }), '', 'empty log encodes empty');
   eq(decodeWalk(''), none, 'empty decodes empty');
   eq(decodeWalk(null), none, 'null decodes empty');
   eq(decodePlayLog(undefined).walk, none, 'undefined log decodes empty');
@@ -372,7 +571,17 @@ function axisAt(map, gx, gy) {
   eq(encodeWalk(walk, 100), '1I2kA7P', 'an end at the last change is not written');
   eq(encodeWalk(walk, 192), '1I2kA7P.2k', 'an end past it is');
   eq(decodeWalk('1I2kA7P.2k'), W(3, 192), 'and comes back');
-  eq(encodePlayLog({ walk: W(3, 192) }), 'w1I2kA7P.2k', 'the log is the walk entry alone');
+  eq(encodePlayLog({ walk: W(3, 192), inputs: [] }), 'w1I2kA7P.2k', 'the log is the walk entry alone');
+  const fell = { t: 9.5, kind: 'fell', target: 'tr412' };
+  eq(encodePlayLog({ walk: W(3, 192), inputs: [fell] }), 'w1I2kA7P.2k*f9.50-tr412', 'a verb rides beside the walk');
+  eq(decodePlayLog('w1I2kA7P.2k*f9.50-tr412').inputs, [fell], 'and comes back');
+  eq(decodePlayLog('f9.50-tr412').walk, none, 'a verb alone is no walk');
+  eq(decodePlayLog('f9.50-tr412').inputs, [fell], 'but is the verb');
+  eq(decodePlayLog('f24.00-tr1*f9.5-tr2*x9.5-tr3*f9.50-tr 4').inputs, [{ t: 9.5, kind: 'fell', target: 'tr2' }], 'an hour past 24, an unknown code and a bad id are dropped');
+  eq(encodePlayLog({ walk: none, inputs: [{ t: 1, kind: 'fell', target: 'bad id' }] }), '', 'an unsafe id is not written');
+  const many = [];
+  for (let i = 0; i < INPUT_LOG_MAX + 5; i++) many.push({ t: 1 + i * 0.01, kind: 'fell', target: `tr${i}` });
+  eq(decodePlayLog(encodePlayLog({ walk: none, inputs: many })).inputs.length, INPUT_LOG_MAX, 'verbs are capped at INPUT_LOG_MAX');
 
   // Truncated by an address bar: the prefix that parses.
   eq(decodeWalk('1I2kA7'), W(2), 'truncated mid-entry keeps the prefix');
@@ -385,8 +594,8 @@ function axisAt(map, gx, gy) {
   eq(decodeWalk('1I1Q'), W(1), 'a mask past P stops the parse');
   eq(decodeWalk('1I.0'), W(1), 'a zero end gap is no end');
   // A stranger's verbs beside the walk, and a walk beside a stranger's verbs.
-  eq(decodePlayLog('f9.50-tr412*w1I2kA7P').walk, W(3), 'foreign entry first is skipped');
-  eq(decodePlayLog('w1I2kA7P*f9.50-tr412').walk, W(3), 'foreign entry last is skipped');
+  eq(decodePlayLog('z9.50-tr412*w1I2kA7P').walk, W(3), 'foreign entry first is skipped');
+  eq(decodePlayLog('w1I2kA7P*z9.50-tr412').walk, W(3), 'foreign entry last is skipped');
   eq(decodePlayLog('w1I*w2A').walk, W(1), 'a second walk entry is ignored');
   eq(decodePlayLog('*').walk, none, 'a bare separator is nothing');
 

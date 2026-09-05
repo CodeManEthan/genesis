@@ -260,13 +260,23 @@ export function hayStage(t: number, at: number): -1 | 0 | 1 | 2 {
  */
 export const PILE_REACH = 10;
 
-/** Every tree the map has promised to somebody's axe — a plot's or a road's. */
-export function doomedTrees(map: GenesisMap): Set<string> {
+/**
+ * Every tree the map has promised to somebody's axe — a plot's or a road's.
+ *
+ * `played` is the input log's half of the same question (see `PlayerInput` in
+ * types.ts). The map cannot know about it: a tree the player fells was on
+ * nobody's list, which is the entire point of the verb, so the two callers that
+ * ask this set what can ever become a stump — the felled-log slots and the
+ * timber yards' reach — have to be told separately. Omitted, this is the same
+ * set it has always returned, from the same two lists, in the same order.
+ */
+export function doomedTrees(map: GenesisMap, played?: Iterable<string>): Set<string> {
   const doomed = new Set<string>();
   for (const s of map.sites) {
     for (const b of s.buildings) for (const id of b.clears) doomed.add(id);
   }
   for (const r of map.roads) for (const c of r.clears ?? []) doomed.add(c.tree);
+  if (played) for (const id of played) doomed.add(id);
   return doomed;
 }
 

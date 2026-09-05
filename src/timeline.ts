@@ -30,13 +30,14 @@ import type {
   FordSpec,
   GenesisEvent,
   GenesisMap,
+  InputLog,
   RoadSpec,
   SiteSpec,
   Timeline,
   Vec2,
   WorldSnapshot,
 } from './types.ts';
-import { mulberry32 } from './types.ts';
+import { hashSeed, mulberry32 } from './types.ts';
 import {
   dayTypeOf,
   marketSite,
@@ -2300,6 +2301,169 @@ function festival(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* the input log — the player's half of `world = f(seed, log)`                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * WHERE THE SEAM GOES, AND WHY.
+ *
+ * The player's `t` is a wall-clock hour of the day they are watching. There is
+ * exactly one place in this file where an event's `t` means the same thing: the
+ * finished list. Everything upstream of that is in a different clock.
+ *
+ *   `plan()` lays the day out at a tempo knob `p`, and `buildTimeline` bisects
+ *   it forty times looking for the tempo that puts the last roof in the target
+ *   window. Its times are then multiplied by a uniform correction, divided by
+ *   `pace`, and — on a storm day — warped. A t of 09:00 inside `plan` is not
+ *   09:00 on the clock, and which hour it IS depends on the solve.
+ *
+ * So felling inside `plan` would cost two things. First, the inverse map: the
+ * player's hour would have to be pushed back through the warp, the division and
+ * the correction to find the pre-solve hour to insert at — and the correction
+ * is only known once the solve has finished. Second, and worse, `lastBuildT`
+ * would move: one click would re-solve the tempo and shift every other event in
+ * the valley by a few minutes. A player who fells one tree would change the
+ * hour the mill tops out, which is not a consequence, it is a bug wearing one.
+ *
+ * The seam is therefore a post-pass over the finished, sorted, narrated list —
+ * the last thing `buildTimeline` does. At that point the pass is:
+ *
+ *   honest    every event is in the player's own clock, so "at t" means at t.
+ *   total     it can see everything the seed decided and edit the parts the
+ *             player has contradicted, which is the whole job: the crew that
+ *             was coming for this tree tomorrow morning must not swing at a
+ *             stump.
+ *   free      with no log it returns the array it was handed, unchanged, so a
+ *             seed-only world is not merely equal to today's — it is the same
+ *             object, down the same code path.
+ *
+ * What it deliberately does NOT do is re-time the work that was waiting on the
+ * tree. A plot whose last tree the player took at dawn is clear hours early,
+ * and the crew still surveys it when the seed said they would. That is a
+ * pacing decision, and pacing is the solver's, not the log's: bring the survey
+ * forward here and the day's whole arc drifts off one click. The valley reads
+ * it the way a valley would — the plot stood clear a while before anyone got
+ * to it.
+ */
+
+/** How long the player's own axe work takes, ending on the click. */
+const PLAYER_CHOP = 10 * MIN;
+
+/** What the ledger calls each kind of tree. `hedgerow` is not a noun. */
+const KIND_WORD: Record<string, string> = {
+  oak: 'oak',
+  pine: 'pine',
+  blossom: 'blossom tree',
+  hedgerow: 'thorn',
+  birch: 'birch',
+  willow: 'willow',
+  fir: 'fir',
+};
+
+/**
+ * The ledger's line for a tree nobody sent a crew for.
+ *
+ * The valley writes its own ledger and has no word for "the player", so it
+ * does not reach for one: it records a tree down, a stump nobody ordered, and
+ * work it cannot account for. That is what the day would actually look like
+ * from inside it.
+ */
+const FELL_LOG = [
+  'A {kind} goes over near {town}. Nobody in {valley} sent a crew for it.',
+  'Somebody takes an axe to a {kind} outside {town} and leaves the trunk lying where it fell.',
+  'A {kind} that was on nobody’s list comes down in {valley}. The chips are still wet.',
+  'The {kind} above {town} is a stump by the time the crew walks past it, and no one owns up to the work.',
+  'One more stump in {valley} than the day accounts for. The {kind} that stood there is beside it.',
+];
+
+/** The nearest town's name — whose ledger this is, as far as the reader knows. */
+function nearestTown(map: GenesisMap, gx: number, gy: number): string {
+  let best = map.valleyName;
+  let bd = Infinity;
+  for (const s of map.sites) {
+    const d = (s.gx - gx) * (s.gx - gx) + (s.gy - gy) * (s.gy - gy);
+    if (d < bd) {
+      bd = d;
+      best = s.name;
+    }
+  }
+  return best;
+}
+
+/**
+ * Fold the player's day into the seed's.
+ *
+ * Returns the array it was handed when there is nothing to fold, which is the
+ * determinism guarantee expressed as code rather than as a promise.
+ */
+function applyInputs(
+  map: GenesisMap,
+  events: GenesisEvent[],
+  inputs: InputLog | undefined
+): GenesisEvent[] {
+  if (!inputs || !inputs.length) return events;
+
+  const treeById = new Map(map.trees.map((t) => [t.id, t]));
+  /** the seed's own felling clock, before the player touched anything */
+  const seedChop = new Map<string, number>();
+  for (const e of events) {
+    if (e.type === 'chop-done' && !seedChop.has(e.treeId)) seedChop.set(e.treeId, e.t);
+  }
+
+  const add: GenesisEvent[] = [];
+  const done = new Set<string>();
+  const dropped = new Set<string>();
+
+  for (const inp of inputs) {
+    if (inp.kind !== 'fell') continue;
+    const tree = treeById.get(inp.target);
+    // a log pasted in from another valley: the target simply is not here
+    if (!tree || done.has(tree.id)) continue;
+    const t = clamp(inp.t, 0.02, 23.97);
+    const seedT = seedChop.get(tree.id);
+    // the day beat them to it — the tree was already a stump when they swung
+    if (seedT !== undefined && seedT <= t) continue;
+    done.add(tree.id);
+    // …and if the day was GOING to take it, that crew now finds a stump. Their
+    // chop is the one event the player's has actually contradicted.
+    if (seedT !== undefined) dropped.add(tree.id);
+
+    const word = KIND_WORD[tree.kind] ?? 'tree';
+    const town = nearestTown(map, tree.gx, tree.gy);
+    const rng = mulberry32((((map.seed >>> 0) ^ hashSeed(tree.id)) >>> 0) ^ 0x0f411e2);
+    const tpl = FELL_LOG[Math.floor(rng() * FELL_LOG.length) % FELL_LOG.length];
+
+    add.push({ t: Math.max(0.01, t - PLAYER_CHOP), type: 'chop-start', treeId: tree.id });
+    add.push({ t, type: 'chop-done', treeId: tree.id });
+    add.push({ t, type: 'log', text: fill(tpl, { kind: word, town, valley: map.valleyName }) });
+  }
+
+  if (!add.length) return events;
+
+  const kept = dropped.size
+    ? events.filter(
+        (e) => !((e.type === 'chop-start' || e.type === 'chop-done') && dropped.has(e.treeId))
+      )
+    : events;
+  const out = kept.concat(add);
+  out.sort((a, b) => a.t - b.t || TYPE_RANK[a.type] - TYPE_RANK[b.type]);
+  return out;
+}
+
+/**
+ * Every tree the player's log takes down, for the callers that hold map data
+ * about felling and have to be told the map is not the whole story: the timber
+ * yards' reach, and the renderer's felled-log slots. Both key off `TreeSpec.id`.
+ */
+export function playedFells(map: GenesisMap, inputs: InputLog | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!inputs) return out;
+  const treeIds = new Set(map.trees.map((t) => t.id));
+  for (const e of inputs) if (e.kind === 'fell' && treeIds.has(e.target)) out.add(e.target);
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
 /* public API                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -2310,8 +2474,12 @@ function festival(map: GenesisMap, events: GenesisEvent[]): GenesisEvent[] {
  *   the day is simply truncated at midnight, which is the intended result,
  *   not a failure. Clamped to [0.25, 4]; at exactly 1 the output is identical
  *   to the single-argument call.
+ * @param inputs What the player did, in order — see `applyInputs` above for
+ *   where in the day it is folded in and why it is folded in there. Omitted or
+ *   empty, the day is the seed's alone and the returned events are the exact
+ *   array the two-argument call has always returned.
  */
-export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
+export function buildTimeline(map: GenesisMap, pace = 1, inputs?: InputLog): Timeline {
   const skel = expansionOrder(map);
   const target = 20.4 + mulberry32(((map.seed >>> 0) ^ 0x7a11c0de) >>> 0)() * 1.6;
 
@@ -2342,7 +2510,7 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
     gold(map, festival(map, marketDay(map, rivalry(map, weather(map, evs)))));
 
   const k = Number.isFinite(pace) ? clamp(pace, 0.25, 4) : 1;
-  if (k === 1) return { events: rare(events) };
+  if (k === 1) return { events: applyInputs(map, rare(events), inputs) };
 
   // work rate k => everything happens 1/k as far into the day. Events pushed
   // past midnight simply never happen; the array is sorted, so the tail just
@@ -2356,7 +2524,7 @@ export function buildTimeline(map: GenesisMap, pace = 1): Timeline {
     c.t = t;
     scaled.push(c);
   }
-  return { events: rare(scaled) };
+  return { events: applyInputs(map, rare(scaled), inputs) };
 }
 
 /** WorldSnapshot is structural; we hang a private cursor off it so that

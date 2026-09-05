@@ -2478,7 +2478,9 @@ export function drawFounder(
   moving: boolean,
   phase: number,
   /** Seconds stood still. Drives the idle; ignored while moving. */
-  still = 0
+  still = 0,
+  /** Ticks left of the axe swing, 0 for none. See `SWING_TICKS` in play.ts. */
+  act = 0
 ): void {
   const px = Math.round(x);
   const py = Math.round(y);
@@ -2503,7 +2505,13 @@ export function drawFounder(
      lifts a pixel on a slow breath while the boots stay planted. Everything
      is keyed on `still`, which is tick-derived, so a replayed founder breathes
      on the same frames the live one did. */
-  const idle = !moving;
+  /* the swing. Two frames over the whole of it: the axe up over the far
+     shoulder for the first two thirds, then down into the trunk, both hands
+     on the haft. The head is drawn last so it crosses the body rather than
+     vanishing behind the coat. No breath, no settling — this is work. */
+  const swinging = act > 0;
+  const raised = swinging && act > 16;
+  const idle = !moving && !swinging;
   const breath = idle && Math.sin(still * 1.9) > 0.72 ? -1 : 0;
   const settled = idle && still > 2.4;
   /** The rear boot steps out on the side away from the camera. */
@@ -2564,11 +2572,22 @@ export function drawFounder(
      once the weight has settled, and the far one stays on the satchel strap. */
   const nearDrop = settled ? 1 : 0;
   ctx.fillStyle = shade(coat, -0.16);
-  ctx.fillRect(px - 4, tor - 12 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 4);
-  ctx.fillRect(px + 4, tor - 12 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 4);
-  ctx.fillStyle = FOUNDER_TRIM;
-  ctx.fillRect(px - 4, tor - 9 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 1);
-  ctx.fillRect(px + 4, tor - 9 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 1);
+  if (swinging) {
+    // Both arms on the facing side: up and back for the raise, straight out
+    // and down for the strike.
+    const ay = raised ? tor - 16 : tor - 9;
+    ctx.fillRect(px + s * 3, ay, 1, 3);
+    ctx.fillRect(px + s * 4, ay + (raised ? -1 : 0), 1, 3);
+    ctx.fillStyle = FOUNDER_TRIM;
+    ctx.fillRect(px + s * 3, ay + 2, 1, 1);
+    ctx.fillRect(px + s * 4, ay + 2 + (raised ? -1 : 0), 1, 1);
+  } else {
+    ctx.fillRect(px - 4, tor - 12 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 4);
+    ctx.fillRect(px + 4, tor - 12 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 4);
+    ctx.fillStyle = FOUNDER_TRIM;
+    ctx.fillRect(px - 4, tor - 9 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 1);
+    ctx.fillRect(px + 4, tor - 9 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 1);
+  }
 
   /* the scarf, over the collar */
   ctx.fillStyle = FOUNDER_TRIM;
@@ -2597,6 +2616,74 @@ export function drawFounder(
   // sprite in this file.
   ctx.fillStyle = shade(coat, -0.08);
   ctx.fillRect(px - 3, tor - 21, 2, 1);
+
+  /* the axe, over everything: a haft the length of a forearm and a head the
+     colour of every other iron in the valley */
+  if (swinging) {
+    ctx.fillStyle = PAL.wood;
+    if (raised) {
+      for (let i = 0; i < 6; i++) ctx.fillRect(px + s * (4 + i), tor - 14 - i, 1, 1);
+      ctx.fillStyle = PAL.stoneDark;
+      ctx.fillRect(px + s * 9 - (faceRight ? 0 : 2), tor - 22, 3, 3);
+    } else {
+      for (let i = 0; i < 6; i++) ctx.fillRect(px + s * (4 + i), tor - 7 + Math.floor(i / 2), 1, 1);
+      ctx.fillStyle = PAL.stoneDark;
+      ctx.fillRect(px + s * 10 - (faceRight ? 0 : 2), tor - 5, 3, 3);
+    }
+  }
+}
+
+/** The mint of the ledger's you-line, and the cream it is cased in. */
+const OFFER_MINT = '#4fd0a4';
+const OFFER_CREAM = '#fdf8ef';
+
+/**
+ * A diamond on the ground, `w` px to either side and `h` px above and below.
+ *
+ *   reach    dashed and faint: how far the founder can act from here. Drawn
+ *            under the boots so the visitor can see WHY an offer came and went.
+ *   target   solid, cased in cream so it reads over pixel art, with a stake
+ *            driven in at the top vertex: the thing on offer stands on this.
+ *
+ * A thin mint line on its own vanishes into the wood; the casing is the
+ * lesson of the first round's offer surface, and it is one pixel each side.
+ */
+export function drawOfferMark(
+  ctx: Ctx,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  style: 'reach' | 'target'
+): void {
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const plot = (color: string, pad: number, dashed: boolean) => {
+    ctx.fillStyle = color;
+    let i = 0;
+    for (let dx = -w; dx <= w; dx++, i++) {
+      if (dashed && (i >> 2) & 1) continue;
+      const dy = Math.round(h * (1 - Math.abs(dx) / w));
+      ctx.fillRect(px + dx - pad, py - dy - pad, 1 + pad * 2, 1 + pad * 2);
+      ctx.fillRect(px + dx - pad, py + dy - pad, 1 + pad * 2, 1 + pad * 2);
+    }
+  };
+  if (style === 'reach') {
+    ctx.globalAlpha = 0.8;
+    plot(OFFER_CREAM, 1, true);
+    plot(OFFER_MINT, 0, true);
+    ctx.globalAlpha = 1;
+    return;
+  }
+  plot(OFFER_CREAM, 1, false);
+  plot(OFFER_MINT, 0, false);
+  // The stake: a post at the top vertex with a mint pennant off it.
+  ctx.fillStyle = PAL.woodDark;
+  ctx.fillRect(px, py - h - 7, 1, 8);
+  ctx.fillStyle = OFFER_CREAM;
+  ctx.fillRect(px + 1, py - h - 8, 5, 4);
+  ctx.fillStyle = OFFER_MINT;
+  ctx.fillRect(px + 1, py - h - 7, 4, 2);
 }
 /* ---- end the founder (additive) ----------------------------------------- */
 

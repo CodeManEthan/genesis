@@ -61,20 +61,27 @@ import {
 } from './fixture';
 /* ---- the founder (additive: PLAY only) ---------------------------------- */
 import {
+  INPUT_LOG_MAX,
   MAX_CATCHUP,
+  NO_INPUT,
+  REACH,
+  SWING_TICKS,
   TICK_DT,
   createAvatar,
   decodePlayLog,
   encodePlayLog,
+  offerAt,
   presenceAt,
   recordInput,
   replayWalk,
   stepAvatar,
   type AvatarInput,
   type AvatarState,
+  type Offer,
   type Presence,
   type WalkEntry,
 } from './play.ts';
+import type { PlayerInput } from './types';
 /* ---- end the founder (additive) ----------------------------------------- */
 
 /* ------------------------------ world loading ---------------------------- */
@@ -104,7 +111,16 @@ import { generateMap } from './gen';
 /* ---- ruins (additive) ---- */
 import { ghostFor } from './ghost';
 /* ---- end ruins (additive) ---- */
-import { advance, buildTimeline, emptySnapshot, festivalAt, snapshotAt } from './timeline';
+import {
+  advance,
+  buildTimeline,
+  emptySnapshot,
+  festivalAt,
+  /* ---- the founder (additive: PLAY only) ---- */
+  playedFells,
+  /* ---- end the founder (additive) ---- */
+  snapshotAt,
+} from './timeline';
 
 const USE_GENERATED = true;
 
@@ -123,9 +139,14 @@ function loadMap(seed: number, pace = 1): GenesisMap {
 
 /** The other half of `loadWorld`, split out so the pre-generator that runs
  * before midnight can pay for the map and the timeline on separate frames. */
-function worldFor(map: GenesisMap): World {
+/**
+ * `inputs` is the play route's verbs and nothing else ever passes any, so
+ * every world the homepage, `/days` and the world waiting past midnight build
+ * is a seed-only world, on the identical code path it has always taken.
+ */
+function worldFor(map: GenesisMap, inputs?: readonly PlayerInput[]): World {
   return USE_GENERATED
-    ? { map, timeline: buildTimeline(map), emptySnapshot, snapshotAt, advance }
+    ? { map, timeline: buildTimeline(map, 1, inputs), emptySnapshot, snapshotAt, advance }
     : {
         map,
         timeline: fixtureTimeline(map),
@@ -135,7 +156,8 @@ function worldFor(map: GenesisMap): World {
       };
 }
 
-const loadWorld = (seed: number, pace = 1): World => worldFor(loadMap(seed, pace));
+const loadWorld = (seed: number, pace = 1, inputs?: readonly PlayerInput[]): World =>
+  worldFor(loadMap(seed, pace), inputs);
 
 /**
  * The facts about the day that the bake cannot work out for itself.
@@ -428,12 +450,21 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
   /** Address-bar writes are coalesced: a hand on WASD changes keys several
    * times a second, and the bar needs the walk, not every keystroke. */
   const walkTimerRef = useRef(0);
+  /** The verbs, in order: the other half of `?log=`. Empty off the play route. */
+  const inputsRef = useRef<PlayerInput[]>([]);
+  /** What the founder could do from here, recomputed every tick; the card and
+   * the mark on the ground both read it. */
+  const offerRef = useRef<Offer | null>(null);
+  const [offer, setOffer] = useState<Offer | null>(null);
+  /** The tree the swing in progress is for. Applied when the swing lands. */
+  const swingAtRef = useRef<string | null>(null);
   const [presence, setPresence] = useState<Presence | null>(null);
   const presenceRef = useRef<string>('');
   /* ---- end the founder (additive) ---------------------------------------- */
 
   const api = useRef<{
     applyT: (t: number) => void;
+    fell: () => void;
     paint: () => void;
     fit: () => void;
     stepZoom: (dir: 1 | -1, ax?: number, ay?: number) => void;
@@ -543,7 +574,10 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       paceRef.current = pace0;
       setSeed(seed0);
       setPaceIdx(paceIndex(pace0));
-      const world = loadWorld(seed0, pace0);
+      // The save file is the address bar. The verbs are read once, here, the
+      // way `?seed=` and `?t=` are; the walk is read when the founder is placed.
+      if (avatar) inputsRef.current = decodePlayLog(q.get('log')).inputs;
+      const world = loadWorld(seed0, pace0, avatar ? inputsRef.current : undefined);
       worldRef.current = world;
       setValley(world.map.valleyName);
 
@@ -559,7 +593,12 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
 
       snapRef.current = world.snapshotAt(world.map, world.timeline, t0);
       sceneRef.current = withTimelineFacts(
-        buildGenesisScene(world.map, dayFor(seed0), ghostOf(world.map, seed0)),
+        buildGenesisScene(
+          world.map,
+          dayFor(seed0),
+          ghostOf(world.map, seed0),
+          avatar ? playedFells(world.map, inputsRef.current) : undefined
+        ),
         world
       );
       ambRef.current = makeAmbient(pace0);
@@ -713,7 +752,10 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
         const av = avRef.current;
         if (!av) return;
         const url = new URL(window.location.href);
-        const s = encodePlayLog({ walk: { log: walkRef.current, end: av.tick } });
+        const s = encodePlayLog({
+          walk: { log: walkRef.current, end: av.tick },
+          inputs: inputsRef.current,
+        });
         if (s) url.searchParams.set('log', s);
         else url.searchParams.delete('log');
         window.history.replaceState(null, '', url.toString());
@@ -739,6 +781,9 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       accumRef.current = 0;
       presenceRef.current = '';
       setPresence(null);
+      offerRef.current = null;
+      setOffer(null);
+      swingAtRef.current = null;
       leadK = 0;
       // Snapped, not eased: there is nothing to ease from on the first frame.
       const cam = camRef.current;
@@ -863,6 +908,10 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       seedRef.current = s;
       paceRef.current = p;
       pending = null;
+      // A different valley is a different set of trees, and a different pace
+      // is rebuilt from scratch here too: the day's play goes out with it,
+      // the same way the walk does when the founder is put back on the step.
+      inputsRef.current = [];
       world = loadWorld(s, p);
       worldRef.current = world;
       scene = withTimelineFacts(
@@ -914,7 +963,9 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
       settleAmbient(scene, amb, snapRef.current);
       camRef.current = clampCam(fitCam());
       // Midnight moves the founder too: the valley they were standing in has
-      // gone, and tomorrow's first house is somewhere else entirely.
+      // gone, and tomorrow's first house is somewhere else entirely. So has
+      // the day's play.
+      inputsRef.current = [];
       placeAvatar();
 
       // The ledger starts over: yesterday's closing line goes out with the
@@ -932,8 +983,62 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
     const comingSeed = () =>
       modeRef.current === 'live' ? nextDaySeed() : stepSeed(seedRef.current, 1);
 
+    /* ---- the founder (additive: PLAY only): the first verb ----------------
+     * F takes the offer. The founder turns to the tree and swings for
+     * SWING_TICKS; when the swing lands, one `fell` goes into the log at the
+     * hour on the clock and the day is REBUILT from (seed, inputs) — the
+     * timeline is not patched and the snapshot is not nudged, so the world on
+     * screen is the world the link reproduces, by construction.
+     *
+     * The bake is the expensive half (a couple of hundred ms) and it is here
+     * for one reason: the trunk lying beside the stump needs a slot in the
+     * vegetation layer, and slots are allotted while the layer is built. */
+    const landFell = (target: string) => {
+      const av = avRef.current;
+      if (!av) return;
+      if (inputsRef.current.length >= INPUT_LOG_MAX) return;
+      const t = clamp(tRef.current, 0.02, 23.97);
+      const next = inputsRef.current.concat([{ t, kind: 'fell', target }]);
+      inputsRef.current = next;
+
+      world = { ...world, timeline: buildTimeline(world.map, 1, next) };
+      worldRef.current = world;
+      scene = withTimelineFacts(
+        buildGenesisScene(
+          world.map,
+          dayFor(seedRef.current),
+          ghostOf(world.map, seedRef.current),
+          playedFells(world.map, next)
+        ),
+        world
+      );
+      sceneRef.current = scene;
+      // The hour does not move and neither does the camera: the founder is
+      // standing where they were, looking at what they just did.
+      snapRef.current = world.snapshotAt(world.map, world.timeline, tRef.current);
+      resetAmbient(scene, amb, snapRef.current);
+      settleAmbient(scene, amb, snapRef.current);
+      logSigRef.current = LOG_FORCE;
+      pushLog();
+      dirtyRef.current = true;
+      syncWalk();
+    };
+    const fell = () => {
+      const av = avRef.current;
+      const o = offerRef.current;
+      if (!avatarOn.current || !av || !o || av.act > 0) return;
+      av.act = SWING_TICKS;
+      av.still = 0;
+      av.faceRight = isoX(o.gx, o.gy) >= isoX(av.gx, av.gy);
+      swingAtRef.current = o.target;
+      followRef.current = true;
+      dirtyRef.current = true;
+    };
+    /* ---- end the founder (additive) -------------------------------------- */
+
     api.current = {
       applyT,
+      fell,
       paint: () => {
         dirtyRef.current = true;
         if (reducedRef.current) paintOnce();
@@ -1018,9 +1123,11 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
         snapRef.current!,
         { ...cam, vw, vh, dpr },
         clock,
-        // Undefined on every world that never asked for a player, which is the
+        // Null on every world that never asked for a player, which is the
         // whole of what keeps a seed-only frame identical to the byte.
-        avatarOn.current ? avRef.current : null
+        avatarOn.current && avRef.current
+          ? { ...avRef.current, reach: REACH, offer: offerRef.current }
+          : null
       );
       dirtyRef.current = false;
       if (!perf) return;
@@ -1121,13 +1228,34 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
         let changed = false;
         while (accumRef.current >= TICK_DT) {
           accumRef.current -= TICK_DT;
+          const av = avRef.current;
+          // Mid-swing the keys are ignored, and the log says so: what the
+          // link says was held is what the walk used, swing included.
+          const keys = av.act > 0 ? NO_INPUT : keysRef.current;
           // The log is written by the tick that consumes the keys, before it
-          // does, so what the link says was held is what the walk used.
-          if (recordInput(walkRef.current, avRef.current.tick + 1, keysRef.current)) changed = true;
-          stepAvatar(world.map, snapRef.current!, avRef.current, keysRef.current);
+          // does.
+          if (recordInput(walkRef.current, av.tick + 1, keys)) changed = true;
+          const swinging = av.act > 0;
+          stepAvatar(world.map, snapRef.current!, av, keys);
           stepped++;
+          if (swinging) {
+            dirtyRef.current = true;
+            if (av.act === 0 && swingAtRef.current) {
+              const target = swingAtRef.current;
+              swingAtRef.current = null;
+              landFell(target);
+            }
+          }
         }
         if (stepped) {
+          // What could be done from here, re-read every tick like the presence
+          // line; the card only re-renders when the target changes.
+          const o = avRef.current.act > 0 ? null : offerAt(world.map, snapRef.current!, avRef.current);
+          if ((o ? o.target : '') !== (offerRef.current ? offerRef.current.target : '')) {
+            offerRef.current = o;
+            setOffer(o);
+            dirtyRef.current = true;
+          }
           if (followRef.current) followCam(avRef.current, stepped * TICK_DT);
           if (avRef.current.moving) dirtyRef.current = true;
           // A change of keys, or a founder still on the move: the address bar
@@ -1356,6 +1484,11 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
           followRef.current = true;
           return;
         }
+        if (e.key === 'f' || e.key === 'F') {
+          e.preventDefault();
+          if (!e.repeat) api.current?.fell();
+          return;
+        }
       }
       if (e.key === ' ') {
         e.preventDefault();
@@ -1423,6 +1556,12 @@ export default function TheGenesis({ embed = false, avatar = false }: GenesisPro
             The ledger noticing you, at the head of the ledger's own column and
             in the ledger's own voice — inverted, because this is the one line
             in the stack that is about the reader rather than about the day. */}
+        {avatar && offer ? (
+          <p className="gen-offer" key={offer.target}>
+            <span className="gen-stamp">{offer.key}</span>
+            {offer.text}
+          </p>
+        ) : null}
         {avatar && presence ? (
           <p className="gen-you" key={presence.key}>
             <span className="gen-stamp">You</span>
@@ -1906,6 +2045,28 @@ const CSS = `
   letter-spacing: 0.06em;
 }
 .gen-ticker.gen-hush p.gen-you { opacity: 0.86; }
+/* The offer: cream like the ledger, with the key as a mint keycap where the
+ * clock would be — so it reads as a line the day is waiting on, not a line it
+ * has written. */
+.gen-ticker p.gen-offer {
+  background: #fdf8ef;
+  border-color: #4fd0a4;
+  color: #413a55;
+  margin-bottom: 6px;
+  max-width: 330px;
+}
+.gen-ticker p.gen-offer .gen-stamp {
+  display: inline-block;
+  min-width: 1.1em;
+  padding: 0 0.3em;
+  border-radius: 3px;
+  background: #4fd0a4;
+  color: #fdf8ef;
+  text-align: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+.gen-ticker.gen-hush p.gen-offer { opacity: 0.86; }
 /* ---- end the founder (additive) ---- */
 .gen-ticker p[data-age='1'] { opacity: 0.72; }
 .gen-ticker p[data-age='2'] { opacity: 0.48; }

@@ -117,6 +117,7 @@ import {
   drawCraneLoad,
   /* ---- the founder (additive: PLAY only) ---- */
   drawFounder,
+  drawOfferMark,
   /* ---- end the founder (additive) ---- */
   /* ---- the prospector (additive) ---- */
   drawPanner,
@@ -469,6 +470,10 @@ const SAPLING_FROM = 18;
 /* ---- living details II (additive) ---- */
 /** Stand-in for a snapshot old enough not to have fell times at all. */
 const EMPTY_FELLED: Map<string, number> = new Map();
+/* ---- the input log (additive) ---- */
+/** A world nobody has played: the default for every seeded bake. */
+const EMPTY_PLAYED: ReadonlySet<string> = new Set<string>();
+/* ---- end the input log (additive) ---- */
 /* ---- end living details II (additive) ---- */
 
 /* ---- end living details (additive) -------------------------------------- */
@@ -902,6 +907,20 @@ export interface GenesisScene {
    * should see.
    */
   fest: number;
+  /* ---- the input log (additive) ----------------------------------------- *
+   * Trees the PLAYER's log fells (see `PlayerInput` in types.ts). Like `fest`
+   * and `chopDone`, this is a fact the bake cannot work out for itself: it is
+   * not in the map — a felled tree was on nobody's list — and the only caller
+   * that knows it is the one holding the log. Empty on every seeded world,
+   * which is every world the homepage and `/days` ever bake, and an empty set
+   * puts the bake back on exactly the path it took before any of this.
+   *
+   * It has to be known AT BAKE TIME rather than joined on afterwards, because
+   * what it buys the player's tree is a felled-log SLOT in the vegetation
+   * layer, and slots are allotted once, while the layer is being built.
+   * ------------------------------------------------------------------------ */
+  played: ReadonlySet<string>;
+  /* ---- end the input log (additive) -------------------------------------- */
   /* ---- the prospector (additive) ---------------------------------------- *
    * All four are pure functions of the MAP, decided once at bake time on
    * exactly the same terms as `stalls`, `market` and `fire` above — which is
@@ -1437,9 +1456,10 @@ function syncRoads(scene: GenesisScene, snap: WorldSnapshot): void {
 export function buildGenesisScene(
   map: GenesisMap,
   day: DayInfo = PLAIN_DAY,
-  ghost: RuinSpec | null = null
+  ghost: RuinSpec | null = null,
+  played: ReadonlySet<string> = EMPTY_PLAYED
 ): GenesisScene {
-  const steps = buildGenesisSceneSteps(map, day, ghost);
+  const steps = buildGenesisSceneSteps(map, day, ghost, played);
   for (;;) {
     const r = steps.next();
     if (r.done) return r.value;
@@ -1465,7 +1485,8 @@ export function buildGenesisScene(
 export function* buildGenesisSceneSteps(
   map: GenesisMap,
   day: DayInfo = PLAIN_DAY,
-  ghost: RuinSpec | null = null
+  ghost: RuinSpec | null = null,
+  played: ReadonlySet<string> = EMPTY_PLAYED
 ): Generator<void, GenesisScene, void> {
   const B = map.bounds;
   const x0 = B.u0 * (TW / 2);
@@ -1761,6 +1782,9 @@ export function* buildGenesisSceneSteps(
     // field's note. A bake on its own knows the wood, never the felling.
     chopDone: new Map<string, number>(),
     /* ---- end living details II (additive) ---- */
+    /* ---- the input log (additive) ---- */
+    played,
+    /* ---- end the input log (additive) ---- */
   };
   /* ---- the prospector (additive) ----------------------------------------- *
    * Rolled here rather than in the object literal because the gilt set is
@@ -1854,7 +1878,9 @@ function* buildVeg(
    * --------------------------------------------------------------------- */
   // (living details II: the same set, lifted verbatim into `living.ts` so the
   // timber yards below can be handed it too.)
-  const doomed = doomedTrees(scene.map);
+  // (the input log: plus whatever the player felled, which by definition is on
+  // neither of those two lists — see `doomedTrees` and `GenesisScene.played`.)
+  const doomed = doomedTrees(scene.map, scene.played);
   /* ---- end living details (additive) ----------------------------------- */
 
   const trees = scene.map.trees;
@@ -4195,6 +4221,12 @@ export interface AvatarDraw {
   phase: number;
   /** Seconds stood still; the idle reads it. Absent is a founder just stopped. */
   still?: number;
+  /** Ticks left of the axe swing; 0 or absent is no swing. See play.ts. */
+  act?: number;
+  /** Tiles the founder can act within, for the faint diamond on the ground. */
+  reach?: number;
+  /** What the founder could act on from here: the tree the mark goes beside. */
+  offer?: { gx: number; gy: number } | null;
 }
 /* ---- end the founder (additive) ----------------------------------------- */
 
@@ -4350,6 +4382,27 @@ export function renderGenesis(
 
   /* ---- the standing wood, the stumps and the dressing, off one layer ----- */
   g.drawImage(scene.veg.c, scene.lx, scene.ly);
+  /* ---- the founder (additive: PLAY only) --------------------------------
+   * The reach, as a faint dashed diamond on the ground under the boots — a
+   * diamond because a tile is one. It is ground, so it goes on after the
+   * wood and before the movers rather than into the sorted list: a mark this
+   * wide as a mover would ask the occlusion repair to repaint every sprite
+   * in front of it, which is the crowd's budget, not the ground's. */
+  if (avatar && avatar.reach) {
+    const ax = isoX(avatar.gx, avatar.gy);
+    const ay = isoY(avatar.gx, avatar.gy);
+    if (inView(ax, ay)) {
+      drawOfferMark(
+        g,
+        Math.round(ax),
+        Math.round(ay),
+        Math.round(avatar.reach * TW * 0.5),
+        Math.round(avatar.reach * TH * 0.5),
+        'reach'
+      );
+    }
+  }
+  /* ---- end the founder (additive) --------------------------------------- */
   if (P) lap('veg');
 
   /* ---- one depth-sorted pass over everything that is changing ---------- */
@@ -4746,17 +4799,41 @@ export function renderGenesis(
       const py = Math.round(y);
       const { faceRight, moving, phase } = avatar;
       const still = avatar.still ?? 0;
+      const act = avatar.act ?? 0;
       items.push({
         depth: y + 1,
         // The brim is the widest thing on the sprite, the crown the tallest,
         // and the satchel swaps sides with the turn; the box owns all three or
-        // a repair clips the founder's head or bag off.
-        bx: px - 7,
-        by: py - 22,
-        bw: 16,
-        bh: 24,
-        draw: (c) => drawFounder(c, px, py, faceRight, moving, phase, still),
+        // a repair clips the founder's head or bag off. Mid-swing the axe
+        // goes a hand above the hat, so the box grows with it.
+        bx: px - 8,
+        by: py - 26,
+        bw: 18,
+        bh: 28,
+        draw: (c) => drawFounder(c, px, py, faceRight, moving, phase, still, act),
       });
+    }
+    // The stake beside whatever is on offer: a solid diamond on its tile,
+    // cased in cream so it reads over the art, drawn before the tree so the
+    // trunk stands on it.
+    const offer = avatar.offer;
+    if (offer) {
+      const ox = isoX(offer.gx, offer.gy);
+      const oy = isoY(offer.gx, offer.gy);
+      if (inView(ox, oy)) {
+        const qx = Math.round(ox);
+        const qy = Math.round(oy);
+        const w = Math.round(TW * 0.5) + 2;
+        const h = Math.round(TH * 0.5) + 1;
+        items.push({
+          depth: oy - 8,
+          bx: qx - w - 1,
+          by: qy - h - 9,
+          bw: w * 2 + 3,
+          bh: h * 2 + 11,
+          draw: (c) => drawOfferMark(c, qx, qy, w, h, 'target'),
+        });
+      }
     }
   }
   /* ---- end the founder (additive) --------------------------------------- */
