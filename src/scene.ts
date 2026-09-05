@@ -4193,6 +4193,8 @@ export interface AvatarDraw {
   faceRight: boolean;
   moving: boolean;
   phase: number;
+  /** Seconds stood still; the idle reads it. Absent is a founder just stopped. */
+  still?: number;
 }
 /* ---- end the founder (additive) ----------------------------------------- */
 
@@ -4743,6 +4745,7 @@ export function renderGenesis(
       const px = Math.round(x);
       const py = Math.round(y);
       const { faceRight, moving, phase } = avatar;
+      const still = avatar.still ?? 0;
       items.push({
         depth: y + 1,
         // The brim is the widest thing on the sprite, the crown the tallest,
@@ -4752,7 +4755,7 @@ export function renderGenesis(
         by: py - 22,
         bw: 16,
         bh: 24,
-        draw: (c) => drawFounder(c, px, py, faceRight, moving, phase),
+        draw: (c) => drawFounder(c, px, py, faceRight, moving, phase, still),
       });
     }
   }

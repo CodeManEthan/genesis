@@ -2476,7 +2476,9 @@ export function drawFounder(
   y: number,
   faceRight: boolean,
   moving: boolean,
-  phase: number
+  phase: number,
+  /** Seconds stood still. Drives the idle; ignored while moving. */
+  still = 0
 ): void {
   const px = Math.round(x);
   const py = Math.round(y);
@@ -2493,87 +2495,108 @@ export function drawFounder(
 
   const step = moving ? Math.sin(phase * 9) : 0;
   const bob = step !== 0 && Math.abs(step) > 0.6 ? -1 : 0;
+
+  /* the idle. A stopped walk with the phase frozen is a figure caught between
+     steps, and it reads that way — poised, about to go. Standing is a
+     different thing: the weight goes onto one hip after a couple of seconds
+     and the rear boot steps out to take it, the arms hang, and the torso
+     lifts a pixel on a slow breath while the boots stay planted. Everything
+     is keyed on `still`, which is tick-derived, so a replayed founder breathes
+     on the same frames the live one did. */
+  const idle = !moving;
+  const breath = idle && Math.sin(still * 1.9) > 0.72 ? -1 : 0;
+  const settled = idle && still > 2.4;
+  /** The rear boot steps out on the side away from the camera. */
+  const stance = settled ? 1 : 0;
+  // The boots take `bob` (the walk) but not `breath` (the idle); the rest of
+  // the figure takes both, so a breath lifts the coat off the belt line.
   const top = py + bob;
+  const tor = top + breath;
 
   /* legs and boots — two pixels wide, same as everybody else's */
   ctx.fillStyle = PAL.ink;
-  ctx.fillRect(px - 2, top - 3, 2, 3 + (step > 0 ? -1 : 0));
-  ctx.fillRect(px + 1, top - 3, 2, 3 + (step < 0 ? -1 : 0));
+  ctx.fillRect(px - 2 - (faceRight ? stance : 0), top - 3, 2, 3 + (step > 0 ? -1 : 0));
+  ctx.fillRect(px + 1 + (faceRight ? 0 : stance), top - 3, 2, 3 + (step < 0 ? -1 : 0));
   ctx.fillStyle = PAL.woodDark;
-  ctx.fillRect(px - 2, top - 3, 2, 1);
-  ctx.fillRect(px + 1, top - 3, 2, 1);
+  ctx.fillRect(px - 2 - (faceRight ? stance : 0), top - 3, 2, 1);
+  ctx.fillRect(px + 1 + (faceRight ? 0 : stance), top - 3, 2, 1);
 
   /* the coat skirt — flared past the hip, and it swings a pixel on the step.
      Three rows, three values: the fold catching the light where it leaves the
      belt, the cloth, and a dark hem. Flat, it read as a slab of navy bolted to
      the waist; the hem is what makes it hang. */
-  const sway = step > 0.5 ? 1 : step < -0.5 ? -1 : 0;
+  // Settled, the skirt hangs a pixel toward the hip the weight is on — the
+  // camera-side hip, which is where the stepped-out boot is not.
+  const sway = step > 0.5 ? 1 : step < -0.5 ? -1 : settled ? s : 0;
   ctx.fillStyle = shade(coat, -0.44);
-  ctx.fillRect(px - 4 + sway, top - 4, 9, 1);
+  ctx.fillRect(px - 4 + sway, tor - 4, 9, 1);
   ctx.fillStyle = dark;
-  ctx.fillRect(px - 4 + sway, top - 5, 9, 1);
+  ctx.fillRect(px - 4 + sway, tor - 5, 9, 1);
   ctx.fillStyle = coat;
-  ctx.fillRect(px - 3, top - 6, 7, 1);
+  ctx.fillRect(px - 3, tor - 6, 7, 1);
   // The split up the skirt, on the side turned away from the camera.
   ctx.fillStyle = shade(coat, -0.44);
-  ctx.fillRect(px + (faceRight ? -4 : 3) + sway, top - 5, 1, 2);
+  ctx.fillRect(px + (faceRight ? -4 : 3) + sway, tor - 5, 1, 2);
 
   /* the belt */
   ctx.fillStyle = PAL.woodDark;
-  ctx.fillRect(px - 3, top - 7, 7, 1);
+  ctx.fillRect(px - 3, tor - 7, 7, 1);
   ctx.fillStyle = FOUNDER_TRIM;
-  ctx.fillRect(px + (faceRight ? 0 : -1), top - 7, 1, 1);
+  ctx.fillRect(px + (faceRight ? 0 : -1), tor - 7, 1, 1);
 
   /* the body of the coat */
   ctx.fillStyle = coat;
-  ctx.fillRect(px - 3, top - 12, 7, 5);
+  ctx.fillRect(px - 3, tor - 12, 7, 5);
   ctx.fillStyle = dark;
-  ctx.fillRect(px + (faceRight ? 3 : -3), top - 12, 1, 5);
+  ctx.fillRect(px + (faceRight ? 3 : -3), tor - 12, 1, 5);
   ctx.fillStyle = light;
-  ctx.fillRect(px + (faceRight ? -3 : 3), top - 12, 1, 3);
+  ctx.fillRect(px + (faceRight ? -3 : 3), tor - 12, 1, 3);
 
   /* the bag on the hip behind, then the strap that carries it */
   ctx.fillStyle = PAL.woodDark;
-  ctx.fillRect(px - s * 5, top - 9, 3, 4);
+  ctx.fillRect(px - s * 5, tor - 9, 3, 4);
   ctx.fillStyle = PAL.wood;
-  ctx.fillRect(px - s * 5, top - 9, 3, 1);
-  for (let i = 0; i < 4; i++) ctx.fillRect(px + s * 2 - s * i, top - 12 + i, 1, 1);
+  ctx.fillRect(px - s * 5, tor - 9, 3, 1);
+  for (let i = 0; i < 4; i++) ctx.fillRect(px + s * 2 - s * i, tor - 12 + i, 1, 1);
 
-  /* arms — one swings forward while the other goes back, cuffs in the trim */
+  /* arms — one swings forward while the other goes back, cuffs in the trim.
+     Standing, they hang: the near hand drops a pixel to rest on the belt line
+     once the weight has settled, and the far one stays on the satchel strap. */
+  const nearDrop = settled ? 1 : 0;
   ctx.fillStyle = shade(coat, -0.16);
-  ctx.fillRect(px - 4, top - 12 + (step > 0 ? 1 : 0), 1, 4);
-  ctx.fillRect(px + 4, top - 12 + (step < 0 ? 1 : 0), 1, 4);
+  ctx.fillRect(px - 4, tor - 12 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 4);
+  ctx.fillRect(px + 4, tor - 12 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 4);
   ctx.fillStyle = FOUNDER_TRIM;
-  ctx.fillRect(px - 4, top - 9 + (step > 0 ? 1 : 0), 1, 1);
-  ctx.fillRect(px + 4, top - 9 + (step < 0 ? 1 : 0), 1, 1);
+  ctx.fillRect(px - 4, tor - 9 + (step > 0 ? 1 : 0) + (faceRight ? 0 : nearDrop), 1, 1);
+  ctx.fillRect(px + 4, tor - 9 + (step < 0 ? 1 : 0) + (faceRight ? nearDrop : 0), 1, 1);
 
   /* the scarf, over the collar */
   ctx.fillStyle = FOUNDER_TRIM;
-  ctx.fillRect(px - 3, top - 13, 7, 1);
+  ctx.fillRect(px - 3, tor - 13, 7, 1);
   ctx.fillStyle = shade(FOUNDER_TRIM, -0.24);
-  ctx.fillRect(px - s * 3, top - 12, 1, 2);
+  ctx.fillRect(px - s * 3, tor - 12, 1, 2);
 
   /* the head */
   ctx.fillStyle = '#f7e2c8';
-  ctx.fillRect(px - 2, top - 18, 5, 5);
+  ctx.fillRect(px - 2, tor - 18, 5, 5);
   ctx.fillStyle = '#e8cba9';
-  ctx.fillRect(px + (faceRight ? 2 : -2), top - 18, 1, 5);
+  ctx.fillRect(px + (faceRight ? 2 : -2), tor - 18, 1, 5);
   ctx.fillStyle = PAL.ink;
-  ctx.fillRect(px + (faceRight ? 1 : -2), top - 16, 1, 1);
-  ctx.fillRect(px + (faceRight ? -1 : 0), top - 16, 1, 1);
+  ctx.fillRect(px + (faceRight ? 1 : -2), tor - 16, 1, 1);
+  ctx.fillRect(px + (faceRight ? -1 : 0), tor - 16, 1, 1);
 
   /* the hat: an 11px brim and a low crown — the widest horizontal on any
      figure in the valley, and what finds the founder in a busy yard */
   ctx.fillStyle = shade(coat, -0.44);
-  ctx.fillRect(px - 5, top - 19, 11, 1);
+  ctx.fillRect(px - 5, tor - 19, 11, 1);
   ctx.fillStyle = shade(coat, -0.36);
-  ctx.fillRect(px - 3, top - 21, 6, 2);
+  ctx.fillRect(px - 3, tor - 21, 6, 2);
   ctx.fillStyle = FOUNDER_TRIM;
-  ctx.fillRect(px - 3, top - 20, 6, 1);
+  ctx.fillRect(px - 3, tor - 20, 6, 1);
   // A pinch of light on the crown, on the side the sun is on in every other
   // sprite in this file.
   ctx.fillStyle = shade(coat, -0.08);
-  ctx.fillRect(px - 3, top - 21, 2, 1);
+  ctx.fillRect(px - 3, tor - 21, 2, 1);
 }
 /* ---- end the founder (additive) ----------------------------------------- */
 

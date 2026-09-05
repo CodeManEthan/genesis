@@ -100,6 +100,7 @@ const same = (a, b) =>
   a.gx === b.gx &&
   a.gy === b.gy &&
   a.tick === b.tick &&
+  a.still === b.still &&
   a.faceRight === b.faceRight &&
   a.phase === b.phase &&
   a.moving === b.moving &&
@@ -158,6 +159,9 @@ for (const [label, seed] of SEEDS) {
   for (let k = 0; k < 100; k++) stepAvatar(map, snap, idle, NO_INPUT);
   if (idle.gx !== replayed.gx || idle.gy !== replayed.gy) fails.push('idle ticks moved the founder');
   if (idle.moving) fails.push('idle founder reports moving');
+  if (Math.abs(idle.still - 100 * TICK_DT) > 1e-9) fails.push(`still after 100 idle ticks is ${idle.still}`);
+  stepAvatar(map, snap, idle, unpackInput(MASK_DOWN));
+  if (idle.still !== 0) fails.push('a step did not reset still');
 
   // Recording onto a replayed log carries on from where it left off.
   const cont = [...back.walk.log];
@@ -209,6 +213,129 @@ for (const [label, seed] of SEEDS) {
   if (!(AVATAR_ROAD_SPEED > AVATAR_SPEED)) fails.push('a road is not faster than open ground');
 
   check('the ground holds the founder up, and only where it should', fails);
+}
+
+/* -------------------------------------------------------------------------- */
+/* the deck is a strip, and the ledger knows the terrain                     */
+/* -------------------------------------------------------------------------- */
+
+/** The river's tangent and normal at a crossing, the way the renderer finds them. */
+function axisAt(map, gx, gy) {
+  let bi = 0;
+  let bd = Infinity;
+  const seg = (px, py, a, b) => {
+    const vx = b[0] - a[0];
+    const vy = b[1] - a[1];
+    let t = ((px - a[0]) * vx + (py - a[1]) * vy) / (vx * vx + vy * vy || 1);
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(px - a[0] - vx * t, py - a[1] - vy * t);
+  };
+  for (let i = 0; i + 1 < map.river.length; i++) {
+    const d = seg(gx, gy, map.river[i], map.river[i + 1]);
+    if (d < bd) {
+      bd = d;
+      bi = i;
+    }
+  }
+  const tx = map.river[bi + 1][0] - map.river[bi][0];
+  const ty = map.river[bi + 1][1] - map.river[bi][1];
+  const l = Math.hypot(tx, ty) || 1;
+  return { tx: tx / l, ty: ty / l, nx: -ty / l, ny: tx / l };
+}
+
+{
+  // Seed 1 has a bridge and a ford; the bridge is decked by late evening.
+  const map = generateMap(1);
+  const tl = buildTimeline(map);
+  const snap = snapshotAt(map, tl, 23.5);
+  const fails = [];
+  const walk = (x, y) => footingAt(map, snap, x, y).walkable;
+
+  for (const [kind, list, depth] of [
+    ['bridge', map.bridges, 1.15],
+    ['ford', map.fords ?? [], 1.5],
+  ]) {
+    for (const c of list) {
+      if (kind === 'bridge' && (snap.bridges.get(c.id) ?? 0) < 2) {
+        fails.push(`${c.id} not decked at 23:30`);
+        continue;
+      }
+      const ax = axisAt(map, c.gx, c.gy);
+      const at = (along, across) => [c.gx + ax.nx * along + ax.tx * across, c.gy + ax.ny * along + ax.ty * across];
+      const f = footingAt(map, snap, c.gx, c.gy);
+      if (!f.walkable) fails.push(`${c.id}: the middle of the deck is not walkable`);
+      if (kind === 'bridge' && f.bridgeId !== c.id) fails.push(`${c.id}: middle is not on the bridge`);
+      if (kind === 'ford' && f.fordId !== c.id) fails.push(`${c.id}: middle is not in the ford`);
+      // Along the deck to either end: on it.
+      for (const k of [-1, 1]) {
+        const [x, y] = at(k * c.span * 0.5, 0);
+        if (!walk(x, y)) fails.push(`${c.id}: the end of the deck (${k}) is not walkable`);
+      }
+      // Beside the deck, out in the current: water. The old disc said yes here.
+      for (const k of [-1, 1]) {
+        const [x, y] = at(0, k * (depth + 0.6));
+        const off = footingAt(map, snap, x, y);
+        if (off.walkable) fails.push(`${c.id}: ${(depth + 0.6).toFixed(2)} tiles ${k > 0 ? 'down' : 'up'}stream of the deck is walkable`);
+        if (off.bridgeId || off.fordId) fails.push(`${c.id}: off the deck still counts as the crossing`);
+      }
+      // Well past the end: whatever the bank is, not the crossing.
+      const [ex, ey] = at(c.span * 0.5 + 1.4, 0);
+      const past = footingAt(map, snap, ex, ey);
+      if (past.bridgeId === c.id || past.fordId === c.id) fails.push(`${c.id}: 1.4 tiles past the end still counts as the deck`);
+      console.log(`  ${c.id}: span ${c.span.toFixed(2)}, deck strip ${(c.span + 1.2).toFixed(2)} × ${(depth * 2).toFixed(2)} tiles`);
+    }
+  }
+  check('a crossing is a strip across the water, not a disc of it', fails);
+}
+
+{
+  const fails = [];
+  const lines = [];
+  const at = (map, snap, gx, gy) => {
+    const av = createAvatar(map, snap);
+    av.gx = gx;
+    av.gy = gy;
+    av.footing = footingAt(map, snap, gx, gy);
+    return presenceAt(map, snap, av);
+  };
+  const expect = (label, p, key) => {
+    if (!p) fails.push(`${label}: no presence`);
+    else if (!p.key.startsWith(key)) fails.push(`${label}: key ${p.key}, expected ${key}…`);
+    else lines.push(`  ${p.key}: ${p.text}`);
+  };
+
+  // Seed 1: stones, a ruin, an outcrop.
+  {
+    const map = generateMap(1);
+    const snap = snapshotAt(map, buildTimeline(map), 11);
+    const st = map.stones[0];
+    expect('stones', at(map, snap, st.gx, st.gy), `stones-${st.id}`);
+    const ru = map.ruins[0];
+    expect('ruin', at(map, snap, ru.gx, ru.gy), `ruin-${ru.id}`);
+    const oc = map.outcrops[0];
+    expect('outcrop', at(map, snap, oc.gx, oc.gy), `outcrop-${oc.id}`);
+  }
+  // Seed 4: a ferry, run by s0 once s0 is founded, and a circle with a fallen stone.
+  {
+    const map = generateMap(4);
+    const tl = buildTimeline(map);
+    const fy = map.ferry;
+    if (!fy) fails.push('seed 4 has no ferry');
+    else {
+      const early = snapshotAt(map, tl, 0);
+      const late = snapshotAt(map, tl, 23);
+      // The near stage is in the first town, which is founded at t=0, so the
+      // ferry is never idle here; only the far stage at midnight is pinned.
+      expect('ferry, near stage', at(map, early, fy.ax, fy.ay), `ferry-${fy.id}`);
+      expect('ferry, far stage', at(map, late, fy.bx, fy.by), `ferry-${fy.id}-run`);
+    }
+    const st = map.stones[0];
+    expect('circle', at(map, snapshotAt(map, tl, 11), st.gx, st.gy), `stones-${st.id}`);
+    const ru = map.ruins[0];
+    expect('corner', at(map, snapshotAt(map, tl, 11), ru.gx, ru.gy), `ruin-${ru.id}`);
+  }
+  for (const l of lines) console.log(l);
+  check('the ledger has a line for the ferry, the stones, a ruin and the rock', fails);
 }
 
 /* -------------------------------------------------------------------------- */

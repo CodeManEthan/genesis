@@ -28,6 +28,7 @@ import {
   type BuildingSpec,
   type GenesisMap,
   type SiteSpec,
+  type StoneSpec,
   type Vec2,
   type WorldSnapshot,
 } from './types.ts';
@@ -117,6 +118,76 @@ function arcOf(map: GenesisMap, id: string, pts: Vec2[]): number[] {
   return cum;
 }
 
+/**
+ * Which way a crossing lies, memoised per map: the river's tangent at the
+ * nearest segment and the normal across it, exactly as `drawBridge` and
+ * `drawFord` orient the deck they draw. The deck is the strip that runs along
+ * the normal for the span and along the tangent for its depth, and it is the
+ * same strip here so the founder walks on the planks that are painted and
+ * not on a circle of water around them.
+ */
+interface Axis {
+  nx: number;
+  ny: number;
+  tx: number;
+  ty: number;
+}
+const crossAxis = new WeakMap<GenesisMap, Map<string, Axis>>();
+
+function axisOf(map: GenesisMap, id: string, gx: number, gy: number): Axis {
+  let per = crossAxis.get(map);
+  if (!per) {
+    per = new Map();
+    crossAxis.set(map, per);
+  }
+  let ax = per.get(id);
+  if (!ax) {
+    const river = map.river;
+    let bi = 0;
+    let bd = Infinity;
+    for (let i = 0; i + 1 < river.length; i++) {
+      const d = segDist(gx, gy, river[i], river[i + 1]);
+      if (d < bd) {
+        bd = d;
+        bi = i;
+      }
+    }
+    const tx = river[bi + 1][0] - river[bi][0];
+    const ty = river[bi + 1][1] - river[bi][1];
+    const tl = Math.hypot(tx, ty) || 1;
+    ax = { nx: -ty / tl, ny: tx / tl, tx: tx / tl, ty: ty / tl };
+    per.set(id, ax);
+  }
+  return ax;
+}
+
+/** Half-depth of a bridge deck along the current, tiles: `drawBridge`'s. */
+const BRIDGE_DEPTH = 1.15;
+/** Half-width of a ford's trodden shallows along the current: `drawFord`'s. */
+const FORD_DEPTH = 1.5;
+/** How far past either end of the span the deck still counts, so the step
+ * off the bank onto the planks is never a step into the water. */
+const DECK_OVERRUN = 0.6;
+
+/** Is the tile on this crossing's deck strip? */
+function onDeck(
+  map: GenesisMap,
+  id: string,
+  cx: number,
+  cy: number,
+  span: number,
+  depth: number,
+  gx: number,
+  gy: number
+): boolean {
+  const ax = axisOf(map, id, cx, cy);
+  const dx = gx - cx;
+  const dy = gy - cy;
+  const along = dx * ax.nx + dy * ax.ny;
+  const across = dx * ax.tx + dy * ax.ty;
+  return Math.abs(along) < span * 0.5 + DECK_OVERRUN && Math.abs(across) < depth;
+}
+
 /* --------------------------------- terrain ------------------------------- */
 
 /** What the ground under a tile is, as far as a walker cares. */
@@ -172,12 +243,12 @@ export function footingAt(map: GenesisMap, snap: WorldSnapshot, gx: number, gy: 
   /* ---- a crossing beats everything, including the water under it ------- */
   for (const br of map.bridges) {
     if ((snap.bridges.get(br.id) ?? 0) < 2) continue;
-    if (Math.hypot(gx - br.gx, gy - br.gy) < br.span * 0.5 + 0.6) {
+    if (onDeck(map, br.id, br.gx, br.gy, br.span, BRIDGE_DEPTH, gx, gy)) {
       return { walkable: true, speed: AVATAR_ROAD_SPEED, bridgeId: br.id, roadId: br.roadId };
     }
   }
   for (const fd of map.fords ?? []) {
-    if (Math.hypot(gx - fd.gx, gy - fd.gy) < fd.span * 0.5 + 0.6) {
+    if (onDeck(map, fd.id, fd.gx, fd.gy, fd.span, FORD_DEPTH, gx, gy)) {
       // Knee-deep and stony: passable, and not quick.
       return { walkable: true, speed: AVATAR_SPEED * 0.7, fordId: fd.id, roadId: fd.roadId };
     }
@@ -244,6 +315,10 @@ export interface AvatarState {
    * standing founder stands still rather than marching on the spot. */
   phase: number;
   moving: boolean;
+  /** Seconds stood still, for the idle: breath, and a shift of the weight
+   * after a while. Zero the moment a step is taken. Tick-derived, so a replay
+   * stands exactly as long as the walk did. */
+  still: number;
   /** Ticks since the avatar was made — the index a future input log keys on. */
   tick: number;
   /** Last heading in screen-aligned u/v, for the camera's lead. */
@@ -272,6 +347,7 @@ export function createAvatar(map: GenesisMap, snap: WorldSnapshot): AvatarState 
     faceRight: true,
     phase: 0,
     moving: false,
+    still: 0,
     tick: 0,
     lu: 0,
     lv: 1,
@@ -302,9 +378,11 @@ export function stepAvatar(
   let v = (input.down ? 1 : 0) - (input.up ? 1 : 0);
   if (u === 0 && v === 0) {
     av.moving = false;
+    av.still += TICK_DT;
     av.footing = footingAt(map, snap, av.gx, av.gy);
     return;
   }
+  av.still = 0;
   const len = Math.hypot(u, v);
   u /= len;
   v /= len;
@@ -362,6 +440,18 @@ export interface Presence {
 
 const pct = (p: number) => `${Math.round(p * 100)}%`;
 
+function stonesLine(st: StoneSpec): string {
+  const named = st.townName ? ` ${st.townName} is named for them, whatever anybody there says.` : '';
+  if (st.kind === 'dolmen') {
+    return `Two uprights and a capstone on ${st.where}: a door with nothing behind it.${named}`;
+  }
+  if (st.kind === 'row') {
+    return `${st.count} stones in a row on ${st.where}, evenly spaced, all marching one way.${named}`;
+  }
+  const down = st.fallen >= 0 ? `, one of them down in the heather` : '';
+  return `A ring of ${st.count} stones on ${st.where}${down}.${named}`;
+}
+
 export function presenceAt(
   map: GenesisMap,
   snap: WorldSnapshot,
@@ -401,6 +491,53 @@ export function presenceAt(
     return {
       key: `ford-${av.footing.fordId}`,
       text: 'You are in the ford. Flat stones, knee-deep, and the track picks up on the far bank.',
+    };
+  }
+
+  /* ---- terrain with a name ----------------------------------------------
+   * A ferry, the stones, a ruin, the bare rock. All of it is on the map from
+   * t=0 and none of it is built, so the only fact the snapshot adds is whether
+   * the town that would run the ferry exists yet. These come before the town
+   * because their reach is a few tiles and a town's is its whole radius: a
+   * ruin in somebody's yard is the rarer fact, and a ferry stage is always in
+   * the town that runs it. */
+  const ferry = map.ferry;
+  if (ferry) {
+    const dA = Math.hypot(gx - ferry.ax, gy - ferry.ay);
+    const dB = Math.hypot(gx - ferry.bx, gy - ferry.by);
+    if (Math.min(dA, dB) < 2.4) {
+      const site = map.sites.find((s) => s.id === ferry.siteId);
+      const run = site && snap.founded.has(site.id);
+      return {
+        key: `ferry-${ferry.id}-${run ? 'run' : 'idle'}`,
+        text: run
+          ? `The ${site.name} ferry stage. The punt is out; you would wait, and so would everybody.`
+          : 'A landing stage, a punt tied off, and nobody yet whose job it is to pole it.',
+      };
+    }
+  }
+  for (const st of map.stones ?? []) {
+    if (Math.hypot(gx - st.gx, gy - st.gy) > 3.4) continue;
+    return { key: `stones-${st.id}`, text: stonesLine(st) };
+  }
+  for (const ru of map.ruins ?? []) {
+    if (Math.hypot(gx - ru.gx, gy - ru.gy) > 3) continue;
+    const what =
+      ru.kind === 'tower'
+        ? 'the stump of a tower, taller once than anything for a day\'s walk'
+        : ru.kind === 'corner'
+          ? `a corner of something${ru.floors > 1 ? ` that had ${ru.floors} floors` : ''}, four courses of it, and moss on the rest`
+          : 'a footing line under the moss and a spill of dressed stone somebody has been taking away for years';
+    return { key: `ruin-${ru.id}`, text: `Out in ${ru.where}: ${what}. Nobody in the valley built it.` };
+  }
+  for (const oc of map.outcrops) {
+    // The outcrop's radius is quoted in screen-aligned u/v, so measure in it.
+    const du = gx - gy - (oc.gx - oc.gy);
+    const dv = gx + gy - (oc.gx + oc.gy);
+    if (Math.hypot(du, dv) > oc.radius + 1.2) continue;
+    return {
+      key: `outcrop-${oc.id}`,
+      text: 'Bare rock underfoot, and a lot of it. This is where a stone town gets its stone.',
     };
   }
 

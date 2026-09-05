@@ -1003,7 +1003,7 @@ const COVERAGE: { head: string; body: string }[] = [
   {
     head: 'The founder is the only sprite no generator emits',
     body:
-      'drawFounder is the player, and the player only exists on /play, where TheGenesis is mounted with avatar. No GenesisMap, timeline or ambient crowd ever produces one, so nothing on the homepage or in the archive can draw it and no seeded frame changes because it exists. It is separated from a villager by silhouette rather than by colour — 21px against 17, a coat skirt that flares past the belt and swings on the step, an 11px hat brim, and a satchel that swaps hips with the turn — because at the fitted overview colour is the first thing to go. What it has no art for yet: an idle that is not simply the walk with the phase frozen, and any pose for a verb, which is the next slice.',
+      'drawFounder is the player, and the player only exists on /play, where TheGenesis is mounted with avatar. No GenesisMap, timeline or ambient crowd ever produces one, so nothing on the homepage or in the archive can draw it and no seeded frame changes because it exists. It is separated from a villager by silhouette rather than by colour — 21px against 17, a coat skirt that flares past the belt and swings on the step, an 11px hat brim, and a satchel that swaps hips with the turn — because at the fitted overview colour is the first thing to go. Standing, it is not the walk with the phase frozen: the torso lifts a pixel on a slow breath while the boots stay planted, and after two and a half seconds the weight goes onto one hip, the rear boot steps out and the near hand drops to the belt — all keyed on seconds stood still, which is tick-derived, so a replayed founder breathes on the same frames. What it has no art for yet: any pose for a verb, which is the next slice.',
   },
   /* ---- end the founder (additive) ---- */
   {
@@ -1551,12 +1551,22 @@ export default function Catalog() {
     list.push({
       key: 'founder-stand',
       label: 'founder · standing (left)',
-      sub: 'moving = false',
+      sub: 'moving = false — the breath, and the weight settling after 2.4s',
       w: 22,
       h: 31,
       ox: 11,
       oy: 27,
-      draw: (ctx) => drawFounder(ctx, 0, 0, false, false, 0),
+      draw: (ctx, t) => drawFounder(ctx, 0, 0, false, false, 0, t),
+    });
+    list.push({
+      key: 'founder-settled',
+      label: 'founder · settled (right)',
+      sub: 'still = 3: weight on the hip, rear boot out, hand on the belt',
+      w: 22,
+      h: 31,
+      ox: 11,
+      oy: 27,
+      draw: (ctx) => drawFounder(ctx, 0, 0, true, false, 0, 3),
     });
     /* ---- end the founder (additive) ---------------------------------------- */
     list.push({
